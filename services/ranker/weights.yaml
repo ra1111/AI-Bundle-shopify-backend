@@ -1,0 +1,149 @@
+# Enhanced Ranking Weights Configuration (PR-5)
+# Human-readable weights for multi-objective bundle ranking
+
+# Default weights (baseline for all objectives)
+default_weights:
+  confidence: 0.35          # Statistical confidence in association
+  lift: 0.25               # Revenue/conversion lift potential  
+  objective_fit: 0.20      # How well bundle aligns with business objective
+  inventory_term: 0.10     # Inventory considerations (stock levels, turnover)
+  price_sanity: 0.10       # Pricing reasonableness and margin protection
+  novelty_penalty: -0.10   # Penalty for overused anchor products (subtracted)
+
+# Objective-specific weight overrides
+objective_weights:
+  
+  # Clear slow-moving inventory
+  clear_slow_movers:
+    confidence: 0.25
+    lift: 0.20
+    objective_fit: 0.35     # Higher weight - focus on moving slow inventory
+    inventory_term: 0.15    # Higher weight - inventory is critical
+    price_sanity: 0.05      # Lower weight - willing to sacrifice some margin
+    novelty_penalty: -0.05
+    
+  # Protect margins while bundling
+  margin_guard:
+    confidence: 0.30
+    lift: 0.25
+    objective_fit: 0.15
+    inventory_term: 0.05    # Lower weight - inventory less critical
+    price_sanity: 0.25      # Higher weight - margin protection is key
+    novelty_penalty: -0.10
+    
+  # Increase average order value
+  increase_aov:
+    confidence: 0.40        # Higher weight - need statistical confidence
+    lift: 0.30             # Higher weight - revenue lift is primary goal
+    objective_fit: 0.15
+    inventory_term: 0.10
+    price_sanity: 0.05      # Lower weight - willing to discount for volume
+    novelty_penalty: -0.05
+    
+  # Launch new products
+  new_launch:
+    confidence: 0.20        # Lower weight - less historical data available
+    lift: 0.30
+    objective_fit: 0.30     # Higher weight - must align with launch strategy
+    inventory_term: 0.15    # Higher weight - manage new inventory carefully
+    price_sanity: 0.05
+    novelty_penalty: 0.00   # No penalty - want to promote new products
+    
+  # Seasonal promotions
+  seasonal_promo:
+    confidence: 0.25
+    lift: 0.35             # Higher weight - seasonal windows are time-sensitive
+    objective_fit: 0.25
+    inventory_term: 0.10
+    price_sanity: 0.05     # Lower weight - promotional pricing expected
+    novelty_penalty: -0.05
+    
+  # Category-specific bundling
+  category_bundle:
+    confidence: 0.30
+    lift: 0.25
+    objective_fit: 0.25
+    inventory_term: 0.12
+    price_sanity: 0.08
+    novelty_penalty: -0.08
+    
+  # Gift box assemblies
+  gift_box:
+    confidence: 0.20        # Lower weight - gift preferences vary widely
+    lift: 0.25
+    objective_fit: 0.35     # Higher weight - must create compelling gift story
+    inventory_term: 0.10
+    price_sanity: 0.10      # Moderate weight - premium pricing acceptable
+    novelty_penalty: 0.00   # No penalty - want diverse gift options
+    
+  # Subscription upselling
+  subscription_push:
+    confidence: 0.35        # Higher weight - need proven subscription affinity
+    lift: 0.20
+    objective_fit: 0.30     # Higher weight - must align with subscription model
+    inventory_term: 0.08
+    price_sanity: 0.07
+    novelty_penalty: -0.12  # Higher penalty - avoid subscription fatigue
+
+# Feature normalization methods per feature
+feature_normalization:
+  confidence: "robust"      # Robust scaling (median + IQR) - handles outliers well
+  lift: "robust"           # Robust scaling - lift can have extreme outliers
+  objective_fit: "min_max"  # Min-max scaling - scores are already bounded
+  inventory_term: "robust"  # Robust scaling - inventory levels vary widely
+  price_sanity: "min_max"   # Min-max scaling - sanity scores are bounded
+  novelty_penalty: "z_score" # Z-score + sigmoid - normal distribution expected
+
+# Advanced ranking parameters
+advanced_params:
+  
+  # Diversity enforcement
+  diversity:
+    max_anchor_usage: 3     # Maximum times an anchor product can appear
+    category_spread_bonus: 0.05  # Bonus for cross-category bundles
+    brand_spread_bonus: 0.03     # Bonus for cross-brand bundles
+    
+  # Quality thresholds
+  quality_gates:
+    min_confidence: 0.15    # Minimum confidence threshold
+    min_lift: 1.05         # Minimum lift threshold (5% improvement)
+    max_price_ratio: 3.0   # Maximum bundle:individual price ratio
+    
+  # Ranking stability
+  stability:
+    score_smoothing: 0.1    # Smoothing factor for score changes
+    tie_breaking: "confidence"  # Tie-breaking criteria
+    deterministic_sort: true    # Ensure consistent ordering
+    
+# Monitoring and alerts
+monitoring:
+  
+  # Score distribution tracking
+  score_distribution:
+    track_percentiles: [25, 50, 75, 90, 95]
+    alert_skewness: 2.0     # Alert if score distribution is too skewed
+    
+  # Weight effectiveness
+  weight_analysis:
+    correlation_threshold: 0.8  # Alert if weights are highly correlated
+    feature_importance_tracking: true
+    
+  # Performance tracking  
+  performance:
+    ranking_time_budget_ms: 5000   # Maximum time for ranking phase
+    memory_budget_mb: 512          # Maximum memory for ranking
+    
+# Validation rules
+validation:
+  
+  # Weight constraints
+  weight_sum_tolerance: 0.05  # Allow 5% deviation from sum=1.0
+  negative_weight_allowed: ["novelty_penalty"]  # Which weights can be negative
+  
+  # Feature validation
+  feature_range_checks: true   # Validate normalized features are in [0,1]
+  nan_handling: "zero"        # How to handle NaN values: "zero", "median", "skip"
+  
+  # Objective validation
+  required_objectives: ["increase_aov", "clear_slow_movers", "margin_guard"]
+  custom_objective_weights: "inherit_default"  # How to handle unknown objectives
