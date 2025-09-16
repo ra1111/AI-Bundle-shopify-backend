@@ -1,0 +1,1 @@
+postgresql+asyncpg://bundleuser:165587@/bundles?host=/cloudsql/foresight-club:us-central1:bundle-db

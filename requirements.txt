@@ -29,3 +29,5 @@ itsdangerous==2.2.0
 
 # Development
 requests==2.32.3
+
+aiosqlite

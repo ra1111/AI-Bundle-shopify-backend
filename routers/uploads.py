@@ -18,6 +18,29 @@ from services.bundle_generator import BundleGenerator
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+from sqlalchemy import text
+async def process_csv_background(csv_content: str, upload_id: str, csv_type: str = "auto"):
+    req = f"bg:{upload_id}"
+    logger.info(f"[{req}] Begin processing csvType={csv_type}")
+    try:
+        processor = CSVProcessor()
+        await processor.process_csv(csv_content, upload_id, csv_type)
+        logger.info(f"[{req}] Processing completed")
+    except Exception as e:
+        logger.exception(f"[{req}] Background processing error")
+        from database import AsyncSessionLocal
+        from sqlalchemy import update
+        async with AsyncSessionLocal() as db:
+            try:
+                await db.execute(
+                    update(CsvUpload).where(CsvUpload.id == upload_id)
+                    .values(status="failed", error_message=str(e))
+                )
+                await db.commit()
+                logger.info(f"[{req}] Marked as failed in DB")
+            except Exception:
+                logger.exception(f"[{req}] Failed to write failure state to DB")
+
 @router.post("/upload-csv")
 async def upload_csv(
     background_tasks: BackgroundTasks,
@@ -25,27 +48,45 @@ async def upload_csv(
     csvType: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """Upload and process CSV file"""
+    request_id = str(uuid.uuid4())
     try:
-        logger.info(f"Upload attempt - filename: {file.filename}, csvType: {csvType}")
-        # Validate file
-        if not file.filename or not file.filename.endswith('.csv'):
+        logger.info(f"[{request_id}] Upload attempt filename={file.filename!r} csvType={csvType!r} content_type={file.content_type!r}")
+
+        if not file.filename or not file.filename.lower().endswith(".csv"):
+            logger.warning(f"[{request_id}] Reject non-CSV filename={file.filename!r}")
             raise HTTPException(status_code=400, detail="Only CSV files are allowed")
-        
-        # Check file size (50MB limit)
+
         content = await file.read()
-        if len(content) > 50 * 1024 * 1024:  # 50MB
+        size = len(content or b"")
+        logger.info(f"[{request_id}] Received payload size={size} bytes")
+
+        if size == 0:
+            raise HTTPException(status_code=400, detail="Empty file")
+
+        if size > 50 * 1024 * 1024:
             raise HTTPException(status_code=400, detail="File too large. Maximum size is 50MB")
-        
-        # Validate CSV type if provided
+
+        # Light peek at the first line for diagnostics
+        try:
+            head_preview = content[:200].decode("utf-8", errors="replace")
+            first_line = head_preview.splitlines()[0] if head_preview else ""
+            logger.info(f"[{request_id}] CSV preview firstLine={first_line!r}")
+        except Exception:
+            logger.exception(f"[{request_id}] Could not decode CSV preview")
+
         valid_csv_types = ['orders', 'products', 'inventory_levels', 'variants']
         if csvType and csvType not in valid_csv_types:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Invalid CSV type. Must be one of: {', '.join(valid_csv_types)}"
-            )
-        
-        # Create upload record
+            logger.warning(f"[{request_id}] Invalid csvType={csvType!r}")
+            raise HTTPException(status_code=400, detail=f"Invalid CSV type. Must be one of: {', '.join(valid_csv_types)}")
+
+        # Quick DB smoke test (fast, safe)
+        try:
+            await db.execute(text("SELECT 1"))
+            logger.info(f"[{request_id}] DB session OK")
+        except Exception:
+            logger.exception(f"[{request_id}] DB session not OK")
+            raise HTTPException(status_code=500, detail="Database unavailable")
+
         upload_id = str(uuid.uuid4())
         csv_upload = CsvUpload(
             id=upload_id,
@@ -56,22 +97,25 @@ async def upload_csv(
             status="processing",
             error_message=None
         )
-        
         db.add(csv_upload)
         await db.commit()
-        
-        # Process CSV in background
-        csv_content = content.decode('utf-8')
+        logger.info(f"[{request_id}] Created CsvUpload id={upload_id}")
+
+        # hand off to background
+        csv_content = content.decode('utf-8', errors="replace")
         background_tasks.add_task(process_csv_background, csv_content, upload_id, csvType or "auto")
-        
-        return {"uploadId": upload_id, "status": "processing"}
-        
+        logger.info(f"[{request_id}] Background task scheduled for id={upload_id}")
+
+        return {"uploadId": upload_id, "status": "processing", "requestId": request_id}
+
     except HTTPException as he:
-        logger.error(f"HTTP Exception during upload: {he.status_code} - {he.detail}")
+        logger.error(f"[{request_id}] HTTP {he.status_code} during upload: {he.detail}")
         raise
     except Exception as e:
-        logger.error(f"Upload error: {e}")
-        raise HTTPException(status_code=500, detail="Upload failed")
+        logger.exception(f"[{request_id}] Upload error")
+        # Return the message to caller during debugging; change to generic later
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
 
 @router.get("/upload-status/{upload_id}")
 async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
