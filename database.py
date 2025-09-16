@@ -192,7 +192,7 @@ class OrderLine(Base):
     material: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 3), nullable=True)
     weight_kg: Mapped[Decimal | None] = mapped_column(Numeric(10, 3), nullable=True)
     tags: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -293,9 +293,9 @@ class AssociationRule(Base):
 
     antecedent: Mapped[dict] = mapped_column(JSONB, nullable=False)
     consequent: Mapped[dict] = mapped_column(JSONB, nullable=False)
-    support: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
-    confidence: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
-    lift: Mapped[Decimal] = mapped_column(Numeric(8, 6), nullable=False)
+    support: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    lift: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
 
@@ -329,11 +329,11 @@ class BundleRecommendation(Base):
     pricing: Mapped[dict] = mapped_column(JSONB, nullable=False)
     ai_copy: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
-    confidence: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
-    predicted_lift: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)
-    support: Mapped[Decimal | None] = mapped_column(Numeric(8, 6), nullable=True)
-    lift: Mapped[Decimal | None] = mapped_column(Numeric(8, 6), nullable=True)
-    ranking_score: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    predicted_lift: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
+    support: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    lift: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    ranking_score: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
 
     discount_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
