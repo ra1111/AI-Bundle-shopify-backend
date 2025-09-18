@@ -57,6 +57,34 @@ class CSVProcessor:
         self.schema_version = "v2.0"
         self.valid_types = {"orders", "variants", "inventory_levels", "catalog_joined"}
 
+        self.header_aliases = {
+            "variantid": "variant_id",
+            "variant_id": "variant_id",
+            "variant_id_": "variant_id",
+            "variant_title": "variant_title",
+            "varianttitle": "variant_title",
+            "variant_price": "price",
+            "price": "price",
+            "variant_compare_at_price": "compare_at_price",
+            "compare_at_price": "compare_at_price",
+            "variant_sku": "sku",
+            "sku": "sku",
+            "productid": "product_id",
+            "product_id": "product_id",
+            "inventory_item_id": "inventory_item_id",
+            "inventoryitemid": "inventory_item_id",
+            "inventory_item_created_at": "inventory_item_created_at",
+            "inventoryitemcreatedat": "inventory_item_created_at",
+            "product_title": "product_title",
+            "producttitle": "product_title",
+            "product_type": "product_type",
+            "producttype": "product_type",
+            "status": "product_status",
+            "product_status": "product_status",
+            "available_total": "available_total",
+            "last_inventory_update": "last_inventory_update",
+        }
+
         # Required columns per canonical type (kept minimal to avoid false negatives)
         self.required_columns = {
             'orders': {'createdAt', 'lineItemQuantity', 'originalUnitPrice'},
@@ -128,7 +156,10 @@ class CSVProcessor:
 
             # Parse CSV
             csv_reader = csv.DictReader(io.StringIO(csv_content))
-            rows = list(csv_reader)
+            headers = [h or "" for h in (csv_reader.fieldnames or [])]
+            raw_rows = list(csv_reader)
+
+            rows = [self._normalize_row_keys(row) for row in raw_rows]
             if not rows:
                 raise ValueError("CSV file is empty")
 
@@ -153,14 +184,14 @@ class CSVProcessor:
 
             # Detect when requested
             if csv_type == "auto":
-                csv_type = self.detect_csv_type(list(rows[0].keys()))
+                csv_type = self.detect_csv_type(headers)
 
             # Persist detected type for observability
             await storage.update_csv_upload(upload_id, {"csv_type": csv_type})
             logger.info(f"Processing CSV type: {csv_type}")
 
             # Validate schema + sample datatypes
-            await self.validate_csv_schema(csv_type, list(rows[0].keys()), upload_id)
+            await self.validate_csv_schema(csv_type, headers, upload_id)
             await self.validate_sample_rows(csv_type, rows[:5], upload_id)
 
             # Dispatch
@@ -210,11 +241,16 @@ class CSVProcessor:
 
         required_cols = self.required_columns.get(csv_type, set())
         headers_set = {h.strip() for h in headers}
-        missing_cols = required_cols - headers_set
+        headers_canonical = {self._canonicalize_header(h) for h in headers_set}
+        missing_cols = {
+            col for col in required_cols
+            if self._canonicalize_header(col) not in headers_canonical
+        }
 
         one_of_failures = []
         for grp in self.required_one_of.get(csv_type, []):
-            if headers_set.isdisjoint(grp):
+            grp_canonical = {self._canonicalize_header(opt) for opt in grp}
+            if headers_canonical.isdisjoint(grp_canonical):
                 one_of_failures.append(grp)
 
         if missing_cols or one_of_failures:
@@ -561,6 +597,37 @@ class CSVProcessor:
             "csv_upload_id"
         }
         return {k: v for k, v in d.items() if k in allowed}
+
+    # ---------- Header normalization helpers ----------
+
+    def _normalize_row_keys(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """Add canonical key variants so downstream lookups succeed."""
+        normalized: Dict[str, Any] = {}
+        for key, value in (row or {}).items():
+            if key is None:
+                continue
+            clean_key = key.strip()
+            if clean_key and clean_key not in normalized:
+                normalized[clean_key] = value
+
+            canonical = self._canonicalize_header(clean_key)
+            if canonical and canonical not in normalized:
+                normalized[canonical] = value
+
+        return normalized
+
+    def _canonicalize_header(self, header: str) -> str:
+        """Convert header variants (spaces, camelCase, hyphens) to snake_case."""
+        if not header:
+            return ""
+        h = header.strip().replace("\ufeff", "")
+        h = re.sub(r"[\s\-\/]+", "_", h)
+        h = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", h)
+        h = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", h)
+        h = re.sub(r"__+", "_", h)
+        h = h.strip("_")
+        base = h.lower()
+        return self.header_aliases.get(base, base)
 
     # ---------- Misc helpers ----------
 
