@@ -1,0 +1,5 @@
+inventory_item_id,available,updated_at,admin_graphql_api_id,sku,tracked,requires_shipping,country_code_of_origin,province_code_of_origin,harmonized_system_code,created_at,country_harmonized_system_codes,mid_code
+30001,50,2025-09-14 12:26:39,gid://shopify/InventoryItem/30001,sku-main-a,True,True,US,CA,6109,2025-09-14 12:26:39,,
+30002,50,2025-09-14 12:26:39,gid://shopify/InventoryItem/30002,sku-main-b,True,True,US,CA,6109,2025-09-14 12:26:39,,
+30003,50,2025-09-14 12:26:39,gid://shopify/InventoryItem/30003,sku-main-c,True,True,US,CA,6109,2025-09-14 12:26:39,,
+30004,50,2025-09-14 12:26:39,gid://shopify/InventoryItem/30004,sku-main-d,True,True,US,CA,6109,2025-09-14 12:26:39,,
