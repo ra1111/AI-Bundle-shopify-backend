@@ -433,6 +433,24 @@ class CSVProcessor:
                     except (ValueError, TypeError):
                         available_total_int = None
 
+                is_slow_mover = False
+                is_new_launch = False
+                is_seasonal = False
+                is_high_margin = False
+
+                snap_product_created = self.parse_datetime(row.get('product_created_at'))
+                if snap_product_created:
+                    is_new_launch = (datetime.now() - snap_product_created).days <= 30
+                tags_lower = (row.get('tags') or '').lower()
+                seasonal_keywords = ['holiday', 'festive', 'gift', 'christmas', 'halloween', 'valentine']
+                if any(kw in tags_lower for kw in seasonal_keywords):
+                    is_seasonal = True
+                compare_at_price = Decimal(str(row.get('compare_at_price', '0') or '0'))
+                price = Decimal(str(row.get('price', '0') or '0'))
+                if compare_at_price > 0 and price > 0:
+                    margin = (compare_at_price - price) / compare_at_price
+                    is_high_margin = margin > Decimal('0.3')
+
                 snap = {
                     "product_id": pid,
                     "csv_upload_id": upload_id,
@@ -452,6 +470,10 @@ class CSVProcessor:
                     "inventory_item_created_at": self.parse_datetime(row.get('inventory_item_created_at')),
                     "available_total": available_total_int,
                     "last_inventory_update": self.parse_datetime(row.get('last_inventory_update')),
+                    "is_slow_mover": is_slow_mover,
+                    "is_new_launch": is_new_launch,
+                    "is_seasonal": is_seasonal,
+                    "is_high_margin": is_high_margin,
                 }
 
                 snaps.append(self._filter_snapshot_fields(snap))
@@ -594,7 +616,7 @@ class CSVProcessor:
             "vendor", "product_created_at", "product_published_at", "variant_id", "sku",
             "variant_title", "price", "compare_at_price", "inventory_item_id",
             "inventory_item_created_at", "available_total", "last_inventory_update",
-            "csv_upload_id"
+            "csv_upload_id", "is_slow_mover", "is_new_launch", "is_seasonal", "is_high_margin"
         }
         return {k: v for k, v in d.items() if k in allowed}
 

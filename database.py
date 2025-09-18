@@ -280,6 +280,11 @@ class CatalogSnapshot(Base):
     available_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_inventory_update: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    is_slow_mover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_new_launch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_seasonal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_high_margin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
