@@ -5,6 +5,7 @@ Handles file uploads and processing
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import text
 from typing import List, Optional
 import logging
 import uuid
@@ -17,29 +18,6 @@ from services.bundle_generator import BundleGenerator
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-from sqlalchemy import text
-async def process_csv_background(csv_content: str, upload_id: str, csv_type: str = "auto"):
-    req = f"bg:{upload_id}"
-    logger.info(f"[{req}] Begin processing csvType={csv_type}")
-    try:
-        processor = CSVProcessor()
-        await processor.process_csv(csv_content, upload_id, csv_type)
-        logger.info(f"[{req}] Processing completed")
-    except Exception as e:
-        logger.exception(f"[{req}] Background processing error")
-        from database import AsyncSessionLocal
-        from sqlalchemy import update
-        async with AsyncSessionLocal() as db:
-            try:
-                await db.execute(
-                    update(CsvUpload).where(CsvUpload.id == upload_id)
-                    .values(status="failed", error_message=str(e))
-                )
-                await db.commit()
-                logger.info(f"[{req}] Marked as failed in DB")
-            except Exception:
-                logger.exception(f"[{req}] Failed to write failure state to DB")
 
 @router.post("/upload-csv")
 async def upload_csv(
@@ -74,9 +52,25 @@ async def upload_csv(
         except Exception:
             logger.exception(f"[{request_id}] Could not decode CSV preview")
 
-        valid_csv_types = ['orders', 'products', 'inventory_levels', 'variants']
-        if csvType and csvType not in valid_csv_types:
-            logger.warning(f"[{request_id}] Invalid csvType={csvType!r}")
+
+        # AFTER (add catalog_joined; keep products→products_variants alias)
+        valid_csv_types = ['orders', 'products', 'inventory_levels', 'variants', 'catalog_joined']
+
+        alias_map = {
+            # Keep both so older clients continue working
+            'products': 'catalog_joined',
+            'products_variants': 'variants',
+            'variants': 'variants',
+            'catalog': 'catalog_joined',       # optional helper
+            'catalog_joined': 'catalog_joined',
+            'orders': 'orders',
+            'inventory_levels': 'inventory_levels',
+            None: 'auto',
+        }
+ 
+        normalized_type = alias_map.get(csvType, csvType)
+        if csvType and normalized_type not in valid_csv_types and normalized_type != "auto":
+            logger.warning(f"[{request_id}] Invalid csvType={csvType!r} (normalized={normalized_type!r})")
             raise HTTPException(status_code=400, detail=f"Invalid CSV type. Must be one of: {', '.join(valid_csv_types)}")
 
         # Quick DB smoke test (fast, safe)
@@ -91,7 +85,7 @@ async def upload_csv(
         csv_upload = CsvUpload(
             id=upload_id,
             filename=file.filename,
-            csv_type=csvType,
+            csv_type=normalized_type,
             total_rows=0,
             processed_rows=0,
             status="processing",
@@ -101,9 +95,9 @@ async def upload_csv(
         await db.commit()
         logger.info(f"[{request_id}] Created CsvUpload id={upload_id}")
 
-        # hand off to background
+        # hand off to background (use the normalized type exactly once)
         csv_content = content.decode('utf-8', errors="replace")
-        background_tasks.add_task(process_csv_background, csv_content, upload_id, csvType or "auto")
+        background_tasks.add_task(process_csv_background, csv_content, upload_id, normalized_type)
         logger.info(f"[{request_id}] Background task scheduled for id={upload_id}")
 
         return {"uploadId": upload_id, "status": "processing", "requestId": request_id}
