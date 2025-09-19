@@ -92,8 +92,12 @@ class CandidateGenerator:
     async def get_valid_skus_for_csv(self, csv_upload_id: str) -> Set[str]:
         """Get all valid SKUs for the given CSV upload ID"""
         try:
-            # Get all catalog entries for this CSV (using correct method name)
-            catalog_entries = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+            # Resolve run_id to aggregate across all related uploads
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            if run_id:
+                catalog_entries = await storage.get_catalog_snapshots_by_run(run_id)
+            else:
+                catalog_entries = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
             valid_skus = {entry.sku for entry in catalog_entries if entry.sku}
             
             # CRITICAL FIX: Remove placeholder and invalid SKUs including gid:// identifiers

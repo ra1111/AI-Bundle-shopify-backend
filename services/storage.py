@@ -119,6 +119,16 @@ class StorageService:
     def get_session(self):
         """Get database session context manager"""
         return AsyncSessionLocal()
+
+    # ---------------- Run helpers ----------------
+    async def get_run_id_for_upload(self, csv_upload_id: str) -> Optional[str]:
+        try:
+            async with self.get_session() as session:
+                from database import CsvUpload
+                cu = await session.get(CsvUpload, csv_upload_id)
+                return cu.run_id if cu else None
+        except Exception:
+            return None
     
     def _overwrite_all_columns(self, table, stmt):
         """Helper to update all columns except primary key(s) in UPSERT operations"""
@@ -457,6 +467,30 @@ class StorageService:
             query = select(Variant).where(Variant.csv_upload_id == csv_upload_id)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_variant_by_sku_run(self, sku: str, run_id: str) -> Optional[Variant]:
+        if not sku or not run_id:
+            return None
+        async with self.get_session() as session:
+            query = (
+                select(Variant)
+                .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
+                .where(and_(Variant.sku == sku, CsvUpload.run_id == run_id))
+            )
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
+
+    async def get_variant_by_id_run(self, variant_id: str, run_id: str) -> Optional[Variant]:
+        if not variant_id or not run_id:
+            return None
+        async with self.get_session() as session:
+            query = (
+                select(Variant)
+                .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
+                .where(and_(Variant.variant_id == variant_id, CsvUpload.run_id == run_id))
+            )
+            result = await session.execute(query)
+            return result.scalar_one_or_none()
     
     # Inventory Level operations
     async def create_inventory_levels(self, inventory_data: List[Dict[str, Any]]) -> List[InventoryLevel]:
@@ -481,6 +515,18 @@ class StorageService:
             query = select(InventoryLevel).where(InventoryLevel.csv_upload_id == csv_upload_id)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_inventory_levels_by_item_id_run(self, inventory_item_id: str, run_id: str) -> List[InventoryLevel]:
+        if not inventory_item_id or not run_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(InventoryLevel)
+                .join(CsvUpload, InventoryLevel.csv_upload_id == CsvUpload.id)
+                .where(and_(InventoryLevel.inventory_item_id == inventory_item_id, CsvUpload.run_id == run_id))
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
     
     # Catalog Snapshot operations
     async def create_catalog_snapshots(self, catalog_data: List[Dict[str, Any]]) -> List[CatalogSnapshot]:
@@ -503,6 +549,18 @@ class StorageService:
             raise ValueError("csv_upload_id is required")
         async with self.get_session() as session:
             query = select(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_catalog_snapshots_by_run(self, run_id: str) -> List[CatalogSnapshot]:
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(CatalogSnapshot)
+                .join(CsvUpload, CatalogSnapshot.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
             result = await session.execute(query)
             return list(result.scalars().all())
     
@@ -806,6 +864,55 @@ class StorageService:
             result = await session.execute(query)
             snapshots = list(result.scalars().all())
             return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku is not None}
+
+    async def get_catalog_snapshots_map_by_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
+        async with self.get_session() as session:
+            query = (
+                select(CatalogSnapshot)
+                .join(CsvUpload, CatalogSnapshot.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            result = await session.execute(query)
+            snapshots = list(result.scalars().all())
+            return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku}
+
+    async def get_order_lines_by_run(self, run_id: str) -> List[OrderLine]:
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            # Join OrderLine -> Order -> CsvUpload(run_id)
+            query = (
+                select(OrderLine)
+                .join(Order, OrderLine.order_id == Order.order_id)
+                .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_variant_sales_data_run(self, variant_id: str, run_id: str, days: int = 60) -> List[OrderLine]:
+        if not variant_id or not run_id:
+            return []
+        async with self.get_session() as session:
+            # Find the variant's SKU for this run
+            vq = (
+                select(Variant.sku)
+                .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
+                .where(and_(Variant.variant_id == variant_id, CsvUpload.run_id == run_id))
+            )
+            vres = await session.execute(vq)
+            sku = vres.scalar_one_or_none()
+            if not sku:
+                return []
+            cutoff_date = datetime.now() - timedelta(days=days)
+            query = (
+                select(OrderLine)
+                .join(Order, OrderLine.order_id == Order.order_id)
+                .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
+                .where(and_(CsvUpload.run_id == run_id, Order.created_at >= cutoff_date, OrderLine.sku == sku))
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
     
     # Deduplication methods
     async def get_bundle_recommendations_hashes(self, csv_upload_id: str) -> List[BundleRecommendation]:

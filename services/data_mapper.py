@@ -49,8 +49,13 @@ class DataMapper:
         }
         
         try:
-            # Get all order lines for this upload
-            order_lines = await storage.get_order_lines_by_upload(csv_upload_id)
+            # Resolve run_id to correlate across files
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            # Get all order lines for this upload (or entire run if available)
+            if run_id:
+                order_lines = await storage.get_order_lines_by_run(run_id)
+            else:
+                order_lines = await storage.get_order_lines_by_upload(csv_upload_id)
             metrics["total_order_lines"] = len(order_lines)
             
             enriched_lines = []
@@ -64,13 +69,52 @@ class DataMapper:
                     continue
                 
                 # Resolve variant_id
-                variant_id = await self.resolve_variant_from_sku(sku, csv_upload_id)
+                # Resolve variant_id by SKU within the same run when possible
+                if run_id:
+                    v = await storage.get_variant_by_sku_run(sku, run_id)
+                    variant_id = v.variant_id if v else None
+                else:
+                    variant_id = await self.resolve_variant_from_sku(sku, csv_upload_id)
                 if variant_id:
                     metrics["resolved_variants"] += 1
                     
                     # Get product and inventory data
                     product_data = await self.get_product_data_for_variant(variant_id, csv_upload_id)
-                    inventory_data = await self.get_inventory_data_for_variant(variant_id, csv_upload_id)
+                    if run_id and not product_data:
+                        # Try run-scoped catalog map
+                        try:
+                            catalog_map = await storage.get_catalog_snapshots_map_by_run(run_id)
+                            # Need SKU to lookup
+                            if sku and sku in catalog_map:
+                                pd = catalog_map[sku]
+                                product_data = {
+                                    "product_id": pd.product_id,
+                                    "product_title": pd.product_title,
+                                    "product_type": pd.product_type,
+                                    "vendor": pd.vendor,
+                                    "tags": pd.tags,
+                                    "product_status": pd.product_status,
+                                    "created_at": pd.product_created_at,
+                                    "published_at": pd.product_published_at,
+                                    "variant_title": pd.variant_title,
+                                    "price": pd.price,
+                                    "compare_at_price": pd.compare_at_price,
+                                }
+                        except Exception:
+                            pass
+
+                    if run_id:
+                        inv_levels = await storage.get_inventory_levels_by_item_id_run(
+                            (v.inventory_item_id if (v := await storage.get_variant_by_id_run(variant_id, run_id)) else None) or "",
+                            run_id,
+                        )
+                        if inv_levels:
+                            total_available = sum(l.available for l in inv_levels)
+                            inventory_data = {"available_total": total_available, "location_count": len(inv_levels)}
+                        else:
+                            inventory_data = {"available_total": -1, "location_count": 0}
+                    else:
+                        inventory_data = await self.get_inventory_data_for_variant(variant_id, csv_upload_id)
                     
                     # Create enriched line
                     enriched_line = {

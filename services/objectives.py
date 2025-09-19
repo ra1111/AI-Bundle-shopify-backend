@@ -37,8 +37,12 @@ class ObjectiveScorer:
         }
         
         try:
-            # Get all catalog snapshots for this upload
-            catalog_items = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+            # Get all catalog snapshots for this run (preferred), fallback to single upload
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            if run_id:
+                catalog_items = await storage.get_catalog_snapshots_by_run(run_id)
+            else:
+                catalog_items = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
             metrics["total_items"] = len(catalog_items)
             
             updated_items = []
@@ -133,8 +137,12 @@ class ObjectiveScorer:
     async def compute_velocity(self, variant_id: str, csv_upload_id: str) -> Decimal:
         """Compute sales velocity (units sold per day) for variant"""
         try:
-            # Get order lines for this variant in last 60 days
-            sales_data = await storage.get_variant_sales_data(variant_id, csv_upload_id, days=60)
+            # Get order lines for this variant in last 60 days (run-scoped if available)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            if run_id:
+                sales_data = await storage.get_variant_sales_data_run(variant_id, run_id, days=60)
+            else:
+                sales_data = await storage.get_variant_sales_data(variant_id, csv_upload_id, days=60)
             if not sales_data:
                 return Decimal('0')
             
@@ -158,8 +166,11 @@ class ObjectiveScorer:
     async def compute_historical_discount(self, variant_id: str, csv_upload_id: str) -> Decimal:
         """Compute average historical discount percentage for variant"""
         try:
-            # Get historical order lines for this variant
-            sales_data = await storage.get_variant_sales_data(variant_id, csv_upload_id, days=180)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            if run_id:
+                sales_data = await storage.get_variant_sales_data_run(variant_id, run_id, days=180)
+            else:
+                sales_data = await storage.get_variant_sales_data(variant_id, csv_upload_id, days=180)
             if not sales_data:
                 return Decimal('0')
             

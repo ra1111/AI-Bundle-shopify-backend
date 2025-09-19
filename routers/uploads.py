@@ -24,6 +24,7 @@ async def upload_csv(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     csvType: Optional[str] = Form(None),
+    runId: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
     request_id = str(uuid.uuid4())
@@ -82,10 +83,13 @@ async def upload_csv(
             raise HTTPException(status_code=500, detail="Database unavailable")
 
         upload_id = str(uuid.uuid4())
+        # Use provided runId to correlate multi-file ingests; generate if absent
+        effective_run_id = (runId or str(uuid.uuid4())).strip()
         csv_upload = CsvUpload(
             id=upload_id,
             filename=file.filename,
             csv_type=normalized_type,
+            run_id=effective_run_id,
             total_rows=0,
             processed_rows=0,
             status="processing",
@@ -100,7 +104,7 @@ async def upload_csv(
         background_tasks.add_task(process_csv_background, csv_content, upload_id, normalized_type)
         logger.info(f"[{request_id}] Background task scheduled for id={upload_id}")
 
-        return {"uploadId": upload_id, "status": "processing", "requestId": request_id}
+        return {"uploadId": upload_id, "runId": effective_run_id, "status": "processing", "requestId": request_id}
 
     except HTTPException as he:
         logger.error(f"[{request_id}] HTTP {he.status_code} during upload: {he.detail}")
@@ -123,6 +127,7 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
             "id": result.id,
             "filename": result.filename,
             "csvType": result.csv_type,
+            "runId": result.run_id,
             "status": result.status,
             "totalRows": result.total_rows,
             "processedRows": result.processed_rows,
