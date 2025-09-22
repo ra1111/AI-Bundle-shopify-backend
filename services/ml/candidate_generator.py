@@ -35,8 +35,9 @@ class CandidateGenerator:
         }
         
         try:
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
             # CRITICAL FIX: Preload valid SKUs to prevent infinite loop
-            logger.info(f"Preloading valid SKUs for csv_upload_id: {csv_upload_id}")
+            logger.info(f"Preloading valid SKUs for scope: run_id={run_id} csv_upload_id={csv_upload_id}")
             valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
             logger.info(f"Found {len(valid_skus)} valid SKUs for prefiltering")
             
@@ -46,7 +47,10 @@ class CandidateGenerator:
             fpgrowth_candidates = []
             
             # 1. Traditional Apriori rules (existing)
-            association_rules = await storage.get_association_rules(csv_upload_id)
+            association_rules = (
+                await storage.get_association_rules_by_run(run_id)
+                if run_id else await storage.get_association_rules(csv_upload_id)
+            )
             apriori_candidates = self.convert_rules_to_candidates(association_rules, bundle_type)
             metrics["apriori_candidates"] = len(apriori_candidates)
             
@@ -385,15 +389,24 @@ class CandidateGenerator:
     async def get_transactions_for_mining(self, csv_upload_id: str) -> List[Set[str]]:
         """Get transaction data for pattern mining"""
         try:
-            orders = await storage.get_orders_with_lines(csv_upload_id)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            orders = (
+                await storage.get_orders_with_lines_by_run(run_id)
+                if run_id else await storage.get_orders_with_lines(csv_upload_id)
+            )
             transactions = []
             
             for order in orders:
                 # Get all variant_ids (or SKUs) in this order
                 order_items = set()
                 for line in order.order_lines:
-                    if line.sku:  # Use SKU or variant_id
-                        order_items.add(line.sku)
+                    key = None
+                    if getattr(line, 'sku', None):
+                        key = line.sku
+                    elif getattr(line, 'variant_id', None):
+                        key = line.variant_id
+                    if key:
+                        order_items.add(key)
                 
                 if len(order_items) >= 2:  # Only multi-item orders
                     transactions.append(order_items)
@@ -407,14 +420,23 @@ class CandidateGenerator:
     async def get_purchase_sequences(self, csv_upload_id: str) -> List[List[str]]:
         """Get purchase sequences for embedding training"""
         try:
-            orders = await storage.get_orders_with_lines(csv_upload_id)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            orders = (
+                await storage.get_orders_with_lines_by_run(run_id)
+                if run_id else await storage.get_orders_with_lines(csv_upload_id)
+            )
             sequences = []
             
             for order in orders:
                 sequence = []
                 for line in order.order_lines:
-                    if line.sku:
-                        sequence.append(line.sku)
+                    key = None
+                    if getattr(line, 'sku', None):
+                        key = line.sku
+                    elif getattr(line, 'variant_id', None):
+                        key = line.variant_id
+                    if key:
+                        sequence.append(key)
                 
                 if len(sequence) >= 2:
                     sequences.append(sequence)
@@ -428,7 +450,11 @@ class CandidateGenerator:
     async def get_anchor_products_for_objective(self, csv_upload_id: str, objective: str) -> List[str]:
         """Get anchor products based on objective"""
         try:
-            catalog_items = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            catalog_items = (
+                await storage.get_catalog_snapshots_by_run(run_id)
+                if run_id else await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+            )
             anchors = []
             
             for item in catalog_items:

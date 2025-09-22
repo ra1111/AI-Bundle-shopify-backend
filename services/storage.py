@@ -369,6 +369,21 @@ class StorageService:
             query = query.order_by(desc(AssociationRule.lift)).limit(limit)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_association_rules_by_run(self, run_id: str, limit: int = 100) -> List[AssociationRule]:
+        """Get association rules for a whole run (any upload in the run)."""
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(AssociationRule)
+                .join(CsvUpload, AssociationRule.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+                .order_by(desc(AssociationRule.lift))
+                .limit(limit)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
     
     async def clear_association_rules(self, csv_upload_id: str) -> None:
         """Clear association rules for a specific CSV upload"""
@@ -849,6 +864,31 @@ class StorageService:
             for order in orders:
                 order.order_lines = lines_by_order.get(order.order_id, [])
             
+            return orders
+
+    async def get_orders_with_lines_by_run(self, run_id: str) -> List[Order]:
+        """Get all orders and their lines for a run (join via CsvUpload.run_id)."""
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            orders_query = (
+                select(Order)
+                .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            orders_result = await session.execute(orders_query)
+            orders = list(orders_result.scalars().all())
+            if not orders:
+                return orders
+            order_ids = [o.order_id for o in orders]
+            lines_query = select(OrderLine).where(OrderLine.order_id.in_(order_ids))
+            lines_result = await session.execute(lines_query)
+            all_lines = list(lines_result.scalars().all())
+            lines_by_order = {}
+            for line in all_lines:
+                lines_by_order.setdefault(line.order_id, []).append(line)
+            for order in orders:
+                order.order_lines = lines_by_order.get(order.order_id, [])
             return orders
     
     async def get_variant_embeddings(self, csv_upload_id: str) -> Optional[str]:
