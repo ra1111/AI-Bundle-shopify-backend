@@ -535,6 +535,16 @@ class StorageService:
             return []
         # Filter to valid table columns to avoid 'unconsumed column names' errors
         catalog_data = self._filter_columns(CatalogSnapshot.__table__, catalog_data)
+        # Deduplicate within the same batch to avoid ON CONFLICT affecting the same row twice
+        # Key = (csv_upload_id, variant_id)
+        dedup: Dict[tuple, Dict[str, Any]] = {}
+        for row in catalog_data:
+            key = (row.get("csv_upload_id"), row.get("variant_id"))
+            if not key[0] or not key[1]:
+                # Skip rows missing the conflict key
+                continue
+            dedup[key] = row  # keep last occurrence
+        catalog_data = list(dedup.values())
         async with self.get_session() as session:
             stmt = pg_insert(CatalogSnapshot).values(catalog_data)
             upsert = stmt.on_conflict_do_update(
