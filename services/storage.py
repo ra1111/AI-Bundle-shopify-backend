@@ -533,6 +533,8 @@ class StorageService:
         """Bulk upsert catalog snapshots - overwrite existing snapshots with same (csv_upload_id, variant_id)"""
         if not catalog_data:
             return []
+        # Filter to valid table columns to avoid 'unconsumed column names' errors
+        catalog_data = self._filter_columns(CatalogSnapshot.__table__, catalog_data)
         async with self.get_session() as session:
             stmt = pg_insert(CatalogSnapshot).values(catalog_data)
             upsert = stmt.on_conflict_do_update(

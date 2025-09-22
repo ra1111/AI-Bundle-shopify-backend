@@ -131,10 +131,14 @@ class DataMapper:
                     if inv_tmp:
                         inventory_data = inv_tmp
 
+                # Carry inventory_item_id forward if available for persistence
+                inv_item_id = getattr(resolved_variant_obj, 'inventory_item_id', None) if resolved_variant_obj else None
+
                 enriched_line = {
                     "order_line_id": line.id,
                     "sku": sku,
                     "variant_id": resolved_variant_id,
+                    "inventory_item_id": inv_item_id,
                     "product_data": product_data,
                     "inventory_data": inventory_data,
                     "line_data": {
@@ -265,18 +269,15 @@ class DataMapper:
                         "vendor": product_data["vendor"],
                         "tags": product_data["tags"],
                         "product_status": product_data["product_status"],
-                        "created_at": product_data["created_at"],
-                        "published_at": product_data["published_at"],
+                        "product_created_at": product_data.get("created_at"),
+                        "product_published_at": product_data.get("published_at"),
                         "variant_title": product_data["variant_title"],
                         "price": product_data["price"],
                         "compare_at_price": product_data["compare_at_price"],
+                        "inventory_item_id": line.get("inventory_item_id") or "",
                         "available_total": inventory_data.get("available_total", -1),
                         "last_inventory_update": datetime.now(),
-                        "velocity": velocity,
-                        # Initialize objective flags
-                        "is_gift_card": "gift" in product_data.get("tags", "").lower(),
-                        "is_bundle": "bundle" in product_data.get("tags", "").lower(),
-                        "is_active": product_data.get("product_status", "").upper() == "ACTIVE"
+                        # Note: objective flags and velocity are computed/updated elsewhere
                     }
                     
                     catalog_entries.append(catalog_entry)
