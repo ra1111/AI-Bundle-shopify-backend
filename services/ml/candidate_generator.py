@@ -39,6 +39,8 @@ class CandidateGenerator:
             # CRITICAL FIX: Preload valid SKUs to prevent infinite loop
             logger.info(f"Preloading valid SKUs for scope: run_id={run_id} csv_upload_id={csv_upload_id}")
             valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
+            # Map variant_id -> sku so rule products expressed as variant_ids can be validated against catalog
+            varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
             logger.info(f"Found {len(valid_skus)} valid SKUs for prefiltering")
             
             # Generate candidates from multiple sources
@@ -68,9 +70,9 @@ class CandidateGenerator:
                 apriori_candidates, fpgrowth_candidates, item2vec_candidates
             )
             
-            # CRITICAL FIX: Filter out candidates with invalid SKUs
+            # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
             original_count = len(all_candidates)
-            all_candidates = self.filter_candidates_by_valid_skus(all_candidates, valid_skus)
+            all_candidates = self.filter_candidates_by_valid_skus(all_candidates, valid_skus, varid_to_sku)
             invalid_filtered = original_count - len(all_candidates)
             metrics["invalid_sku_candidates_filtered"] = invalid_filtered
             metrics["total_unique_candidates"] = len(all_candidates)
@@ -92,6 +94,25 @@ class CandidateGenerator:
         except Exception as e:
             logger.error(f"Error generating candidates: {e}")
             return {"candidates": [], "metrics": metrics}
+
+    async def get_variantid_to_sku_map(self, csv_upload_id: str) -> Dict[str, str]:
+        """Build a mapping from variant_id to sku using catalog snapshots (run-aware)."""
+        try:
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            if run_id:
+                snapshots = await storage.get_catalog_snapshots_by_run(run_id)
+            else:
+                snapshots = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+            mapping = {}
+            for s in snapshots:
+                vid = getattr(s, 'variant_id', None)
+                sku = getattr(s, 'sku', None)
+                if vid and sku:
+                    mapping[str(vid)] = str(sku)
+            return mapping
+        except Exception as e:
+            logger.warning(f"Error building variant_id→sku map: {e}")
+            return {}
     
     async def get_valid_skus_for_csv(self, csv_upload_id: str) -> Set[str]:
         """Get all valid SKUs for the given CSV upload ID"""
@@ -121,8 +142,10 @@ class CandidateGenerator:
             logger.warning(f"Error getting valid SKUs for {csv_upload_id}: {e}")
             return set()
     
-    def filter_candidates_by_valid_skus(self, candidates: List[Dict[str, Any]], valid_skus: Set[str]) -> List[Dict[str, Any]]:
-        """Filter out candidates containing invalid SKUs"""
+    def filter_candidates_by_valid_skus(self, candidates: List[Dict[str, Any]], valid_skus: Set[str], varid_to_sku: Dict[str, str]) -> List[Dict[str, Any]]:
+        """Filter out candidates containing invalid products.
+        Accept either SKU directly or variant_id that can be mapped to a SKU via varid_to_sku.
+        """
         if not valid_skus:
             logger.warning("No valid SKUs available for filtering")
             return candidates
@@ -131,13 +154,25 @@ class CandidateGenerator:
         for candidate in candidates:
             products = candidate.get("products", [])
             if isinstance(products, list) and len(products) >= 2:
-                # Check if all products have valid SKUs
-                all_valid = all(sku in valid_skus for sku in products if sku)
+                # Normalize products to SKUs for validation
+                normalized = []
+                all_valid = True
+                for p in products:
+                    if p is None:
+                        all_valid = False
+                        break
+                    p_str = str(p)
+                    if p_str in valid_skus:
+                        normalized.append(p_str)
+                    elif p_str in varid_to_sku and varid_to_sku[p_str] in valid_skus:
+                        normalized.append(varid_to_sku[p_str])
+                    else:
+                        all_valid = False
+                        break
                 if all_valid:
                     filtered_candidates.append(candidate)
                 else:
-                    invalid_skus = [sku for sku in products if sku not in valid_skus]
-                    logger.debug(f"Filtered candidate with invalid SKUs: {invalid_skus}")
+                    logger.debug(f"Filtered candidate with invalid products: {products}")
         
         return filtered_candidates
     
