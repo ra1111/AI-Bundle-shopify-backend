@@ -170,6 +170,11 @@ class CandidateGenerator:
                         all_valid = False
                         break
                 if all_valid:
+                    # Overwrite products with normalized SKUs so downstream pricing/selection sees valid SKUs
+                    try:
+                        candidate["products"] = normalized
+                    except Exception:
+                        pass
                     filtered_candidates.append(candidate)
                 else:
                     logger.debug(f"Filtered candidate with invalid products: {products}")
