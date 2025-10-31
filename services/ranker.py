@@ -8,6 +8,7 @@ from decimal import Decimal
 import math
 
 from services.storage import storage
+from services.feature_flags import feature_flags
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,23 @@ class WeightedLinearRanker:
             
             # Assign rank positions and apply novelty penalty
             final_candidates = self.apply_novelty_penalty_and_rank(scored_candidates)
+
+            max_per_type = feature_flags.get_flag("bundling.max_per_bundle_type", 15)
+            try:
+                max_per_type = int(max_per_type)
+            except (TypeError, ValueError):
+                max_per_type = 15
+
+            if max_per_type > 0:
+                type_counts: Dict[str, int] = {}
+                limited_candidates = []
+                for candidate in final_candidates:
+                    bundle_type = candidate.get("bundle_type", "UNKNOWN")
+                    if type_counts.get(bundle_type, 0) >= max_per_type:
+                        continue
+                    type_counts[bundle_type] = type_counts.get(bundle_type, 0) + 1
+                    limited_candidates.append(candidate)
+                final_candidates = limited_candidates
             
             logger.info(f"Ranked {len(final_candidates)} candidates for objective: {objective}")
             return final_candidates

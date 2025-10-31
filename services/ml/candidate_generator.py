@@ -7,6 +7,7 @@ import logging
 import numpy as np
 from decimal import Decimal
 from collections import defaultdict
+from itertools import combinations
 import hashlib
 import json
 
@@ -29,6 +30,7 @@ class CandidateGenerator:
             "apriori_candidates": 0,
             "item2vec_candidates": 0,
             "fpgrowth_candidates": 0,
+            "top_pair_candidates": 0,
             "total_unique_candidates": 0,
             "generation_method": "hybrid",
             "invalid_sku_candidates_filtered": 0
@@ -65,11 +67,15 @@ class CandidateGenerator:
             item2vec_candidates = await self.generate_item2vec_candidates(csv_upload_id, bundle_type, objective)
             metrics["item2vec_candidates"] = len(item2vec_candidates)
             
-            # 4. Combine and deduplicate candidates
+            # 4. Deterministic top-pair mining to guarantee strongest co-purchases make it through
+            top_pair_candidates = await self.generate_top_pair_candidates(csv_upload_id, bundle_type)
+            metrics["top_pair_candidates"] = len(top_pair_candidates)
+
+            # 5. Combine and deduplicate candidates
             all_candidates = self.combine_candidates(
-                apriori_candidates, fpgrowth_candidates, item2vec_candidates
+                apriori_candidates, fpgrowth_candidates, item2vec_candidates, top_pair_candidates
             )
-            
+
             # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
             original_count = len(all_candidates)
             all_candidates = self.filter_candidates_by_valid_skus(all_candidates, valid_skus, varid_to_sku)
@@ -78,14 +84,24 @@ class CandidateGenerator:
             metrics["total_unique_candidates"] = len(all_candidates)
             
             if invalid_filtered > 0:
-                logger.warning(f"Filtered out {invalid_filtered} candidates with invalid SKUs")
+                logger.warning(f"Candidates: filtered_invalid={invalid_filtered} remaining={len(all_candidates)} valid_skus={len(valid_skus)} varid_map={len(varid_to_sku)}")
+
+            logger.info(
+                f"Candidates: scope upload_id={csv_upload_id} run_id={run_id} "
+                f"apriori={len(apriori_candidates)} fpgrowth={len(fpgrowth_candidates)} item2vec={len(item2vec_candidates)} "
+                f"unique_after_filter={len(all_candidates)}"
+            )
             
-            # 5. Add source information for explainability
+            # 6. Add source information for explainability
             for candidate in all_candidates:
                 candidate["generation_sources"] = self.identify_sources(
-                    candidate, apriori_candidates, fpgrowth_candidates, item2vec_candidates
+                    candidate,
+                    apriori_candidates,
+                    fpgrowth_candidates,
+                    item2vec_candidates,
+                    top_pair_candidates
                 )
-            
+
             return {
                 "candidates": all_candidates,
                 "metrics": metrics
@@ -141,6 +157,82 @@ class CandidateGenerator:
         except Exception as e:
             logger.warning(f"Error getting valid SKUs for {csv_upload_id}: {e}")
             return set()
+
+    async def generate_top_pair_candidates(self, csv_upload_id: str, bundle_type: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Ensure the strongest SKU pairs are always available as candidates."""
+        try:
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+        except Exception:
+            run_id = None
+
+        if run_id:
+            order_lines = await storage.get_order_lines_by_run(run_id)
+        else:
+            order_lines = await storage.get_order_lines(csv_upload_id)
+
+        order_sku_map: Dict[str, Set[str]] = defaultdict(set)
+        for line in order_lines:
+            order_id = getattr(line, "order_id", None)
+            sku = getattr(line, "sku", None)
+            if not order_id or not sku:
+                continue
+            sku = str(sku).strip()
+            if not sku or sku.startswith("gid://") or sku.startswith("no-sku-"):
+                continue
+            order_sku_map[order_id].add(sku)
+
+        transactions = [skus for skus in order_sku_map.values() if len(skus) >= 2]
+        transaction_count = len(transactions)
+        if transaction_count == 0:
+            logger.info(f"Top pair mining skipped for {csv_upload_id}: no multi-item transactions")
+            return []
+
+        item_counts: Dict[str, int] = defaultdict(int)
+        pair_counts: Dict[Tuple[str, str], int] = defaultdict(int)
+
+        for skus in transactions:
+            for sku in skus:
+                item_counts[sku] += 1
+            for a, b in combinations(sorted(skus), 2):
+                pair_counts[(a, b)] += 1
+
+        if not pair_counts:
+            logger.info(f"Top pair mining found no frequent pairs for {csv_upload_id}")
+            return []
+
+        candidates: List[Dict[str, Any]] = []
+        for (sku_a, sku_b), pair_count in sorted(pair_counts.items(), key=lambda item: item[1], reverse=True):
+            item_count_a = item_counts.get(sku_a, 0)
+            item_count_b = item_counts.get(sku_b, 0)
+            if item_count_a == 0 or item_count_b == 0:
+                continue
+
+            support = pair_count / transaction_count
+            confidence = max(pair_count / item_count_a, pair_count / item_count_b)
+            support_a = item_count_a / transaction_count
+            support_b = item_count_b / transaction_count
+            expected_support = support_a * support_b if support_a > 0 and support_b > 0 else 0
+            lift = support / expected_support if expected_support > 0 else 1.0
+
+            candidate = {
+                "products": [sku_a, sku_b],
+                "support": float(support),
+                "confidence": float(confidence),
+                "lift": float(lift),
+                "bundle_type": bundle_type,
+                "generation_method": "top_pair_mining",
+                "generation_sources": ["top_pair_mining"],
+            }
+            candidates.append(candidate)
+
+            if len(candidates) >= limit:
+                break
+
+        logger.info(
+            f"Top pair mining for {csv_upload_id}: transactions={transaction_count} "
+            f"pairs_considered={len(pair_counts)} returned={len(candidates)}"
+        )
+        return candidates
     
     def filter_candidates_by_valid_skus(self, candidates: List[Dict[str, Any]], valid_skus: Set[str], varid_to_sku: Dict[str, str]) -> List[Dict[str, Any]]:
         """Filter out candidates containing invalid products.
@@ -577,28 +669,35 @@ class CandidateGenerator:
         
         return all_candidates
     
-    def identify_sources(self, candidate: Dict[str, Any], apriori_candidates: List, 
-                        fpgrowth_candidates: List, item2vec_candidates: List) -> List[str]:
+    def identify_sources(
+        self,
+        candidate: Dict[str, Any],
+        apriori_candidates: List,
+        fpgrowth_candidates: List,
+        item2vec_candidates: List,
+        top_pair_candidates: List
+    ) -> List[str]:
         """Identify which generation methods produced this candidate"""
         sources = []
-        
+
         candidate_products = sorted(candidate.get("products", []))
         candidate_type = candidate.get("bundle_type", "")
-        
+
         # Check each source
         for source_name, source_candidates in [
             ("apriori", apriori_candidates),
             ("fpgrowth", fpgrowth_candidates), 
-            ("item2vec", item2vec_candidates)
+            ("item2vec", item2vec_candidates),
+            ("top_pair_mining", top_pair_candidates)
         ]:
             for source_candidate in source_candidates:
                 source_products = sorted(source_candidate.get("products", []))
                 source_type = source_candidate.get("bundle_type", "")
-                
+
                 if candidate_products == source_products and candidate_type == source_type:
                     sources.append(source_name)
                     break
-        
+
         return sources
     
     def serialize_embeddings(self, embeddings: Dict[str, np.ndarray]) -> str:

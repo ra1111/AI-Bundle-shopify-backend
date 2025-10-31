@@ -9,8 +9,8 @@ asyncpg==0.30.0
 alembic==1.16.5
 
 # Data processing
-pandas==2.3.2
-numpy==2.3.3
+pandas>=2.0.0
+numpy>=1.24.0
 
 # AI Integration
 openai==1.107.1

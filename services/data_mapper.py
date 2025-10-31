@@ -7,6 +7,8 @@ import logging
 from decimal import Decimal
 from datetime import datetime, timedelta
 
+from services.feature_flags import feature_flags
+
 from services.storage import storage
 
 logger = logging.getLogger(__name__)
@@ -16,28 +18,38 @@ class DataMapper:
     
     def __init__(self):
         self.resolved_variant_cache: Dict[str, str] = {}
-        self.unresolved_sku_cache: set = set()
-    
+        self.unresolved_sku_cache: Dict[str, datetime] = {}
+        self._last_unresolved_log_at: Optional[datetime] = None
+
     async def resolve_variant_from_sku(self, sku: str, csv_upload_id: str) -> Optional[str]:
         """Resolve variant_id from SKU with caching"""
         if sku in self.resolved_variant_cache:
             return self.resolved_variant_cache[sku]
-        
-        if sku in self.unresolved_sku_cache:
-            return None
-        
+
+        ttl_seconds = feature_flags.get_flag("data_mapping.unresolved_cache_ttl_seconds", 600) or 0
+        cached_at = self.unresolved_sku_cache.get(sku)
+        if cached_at:
+            if ttl_seconds > 0:
+                age = (datetime.utcnow() - cached_at).total_seconds()
+                if age > ttl_seconds:
+                    self.unresolved_sku_cache.pop(sku, None)
+                else:
+                    return None
+            else:
+                return None
+
         # Try to find variant by SKU
         variant = await storage.get_variant_by_sku(sku, csv_upload_id)
         if variant:
             variant_id = variant.variant_id
             self.resolved_variant_cache[sku] = variant_id
             return variant_id
-        
+
         # Cache unresolved SKUs to avoid repeated lookups
-        self.unresolved_sku_cache.add(sku)
+        self.unresolved_sku_cache[sku] = datetime.utcnow()
         logger.warning(f"Could not resolve variant_id for SKU: {sku}")
         return None
-    
+
     async def enrich_order_lines_with_variants(self, csv_upload_id: str) -> Dict[str, Any]:
         """Enrich order lines with variant mappings and compute metrics"""
         metrics = {
@@ -47,6 +59,8 @@ class DataMapper:
             "missing_inventory": 0,
             "enriched_lines": 0
         }
+
+        unresolved_samples: List[str] = []
         
         try:
             # Resolve run_id to correlate across files
@@ -72,6 +86,11 @@ class DataMapper:
                         resolved_variant_obj = await storage.get_variant_by_sku_run(sku, run_id)
                     if not resolved_variant_obj and line_vid:
                         resolved_variant_obj = await storage.get_variant_by_id_run(line_vid, run_id)
+                    if feature_flags.get_flag("data_mapping.enable_run_scope_fallback", True) and not resolved_variant_obj:
+                        if sku:
+                            resolved_variant_obj = await storage.get_variant_by_sku(sku, csv_upload_id)
+                        if not resolved_variant_obj and line_vid:
+                            resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
                 else:
                     if sku:
                         vid = await self.resolve_variant_from_sku(sku, csv_upload_id)
@@ -87,6 +106,8 @@ class DataMapper:
 
                 if not resolved_variant_id:
                     metrics["unresolved_skus"] += 1
+                    if sku and len(unresolved_samples) < 10:
+                        unresolved_samples.append(sku)
                     continue
 
                 metrics["resolved_variants"] += 1
@@ -163,6 +184,9 @@ class DataMapper:
             # Store enriched data for later use
             await self.persist_enriched_mappings(csv_upload_id, enriched_lines)
             
+            if metrics["unresolved_skus"]:
+                self._log_unresolved_summary(csv_upload_id, metrics["unresolved_skus"], unresolved_samples)
+
             logger.info(f"Data mapping completed: {metrics}")
             return {
                 "metrics": metrics,
@@ -172,6 +196,27 @@ class DataMapper:
         except Exception as e:
             logger.error(f"Error in data mapping: {e}")
             raise
+
+    def reset_unresolved_cache(self) -> None:
+        """Clear cached unresolved SKUs so new catalog data can be re-evaluated."""
+        self.unresolved_sku_cache.clear()
+
+    def reset_resolved_cache(self) -> None:
+        """Clear resolved cache, typically when catalog variants are refreshed."""
+        self.resolved_variant_cache.clear()
+
+    def _log_unresolved_summary(self, upload_id: str, count: int, samples: List[str]) -> None:
+        now = datetime.utcnow()
+        if self._last_unresolved_log_at and (now - self._last_unresolved_log_at).total_seconds() < 30:
+            return
+        self._last_unresolved_log_at = now
+        sample_preview = ", ".join(samples) if samples else "(none captured)"
+        logger.warning(
+            "DataMapper unresolved SKUs remain after enrichment: upload=%s count=%s sample=%s",
+            upload_id,
+            count,
+            sample_preview
+        )
     
     async def get_product_data_for_variant(self, variant_id: str, csv_upload_id: str) -> Optional[Dict[str, Any]]:
         """Get product data for a variant"""

@@ -25,7 +25,8 @@ from routers import (
     bundle_recommendations,
     bundles,
     analytics,
-    export
+    export,
+    shopify_upload,
 )
 
 from database import init_db
@@ -88,9 +89,13 @@ app.add_middleware(
     https_only=os.getenv("NODE_ENV") == "production"
 )
 
+cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://localhost:5000")
+cors_origins = [origin.strip() for origin in cors_origins_raw.split(",") if origin.strip()]
+if not cors_origins:
+    cors_origins = ["http://localhost:3000"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5000"],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -165,6 +170,7 @@ app.include_router(bundle_recommendations.router, prefix="/api", tags=["bundle-r
 app.include_router(bundles.router, prefix="/api", tags=["bundles"])
 app.include_router(analytics.router, prefix="/api", tags=["analytics"])
 app.include_router(export.router, prefix="/api", tags=["export"])
+app.include_router(shopify_upload.router)
 app.include_router(admin_router, prefix="/api", tags=["admin"])
 
 # --- Startup/shutdown ---

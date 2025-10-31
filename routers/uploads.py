@@ -5,8 +5,8 @@ Handles file uploads and processing
 from fastapi import APIRouter, UploadFile, File, HTTPException, BackgroundTasks, Depends, Form
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import text
-from typing import List, Optional
+from sqlalchemy import text, select, desc
+from typing import List, Optional, Tuple
 import logging
 import uuid
 from datetime import datetime
@@ -15,6 +15,9 @@ from database import get_db, CsvUpload
 from services.csv_processor import CSVProcessor
 from services.association_rules_engine import AssociationRulesEngine
 from services.bundle_generator import BundleGenerator
+from services.data_mapper import DataMapper
+from services.storage import storage
+from settings import resolve_shop_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -25,6 +28,8 @@ async def upload_csv(
     file: UploadFile = File(...),
     csvType: Optional[str] = Form(None),
     runId: Optional[str] = Form(None),
+    shopId: Optional[str] = Form(None),
+    shopDomain: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
     request_id = str(uuid.uuid4())
@@ -85,11 +90,14 @@ async def upload_csv(
         upload_id = str(uuid.uuid4())
         # Use provided runId to correlate multi-file ingests; generate if absent
         effective_run_id = (runId or str(uuid.uuid4())).strip()
+        resolved_shop_id = resolve_shop_id(shopId, shopDomain)
+
         csv_upload = CsvUpload(
             id=upload_id,
             filename=file.filename,
             csv_type=normalized_type,
             run_id=effective_run_id,
+            shop_id=resolved_shop_id,
             total_rows=0,
             processed_rows=0,
             status="processing",
@@ -104,7 +112,13 @@ async def upload_csv(
         background_tasks.add_task(process_csv_background, csv_content, upload_id, normalized_type)
         logger.info(f"[{request_id}] Background task scheduled for id={upload_id}")
 
-        return {"uploadId": upload_id, "runId": effective_run_id, "status": "processing", "requestId": request_id}
+        return {
+            "uploadId": upload_id,
+            "runId": effective_run_id,
+            "status": "processing",
+            "shopId": resolved_shop_id,
+            "requestId": request_id
+        }
 
     except HTTPException as he:
         logger.error(f"[{request_id}] HTTP {he.status_code} during upload: {he.detail}")
@@ -189,6 +203,88 @@ async def process_csv_background(csv_content: str, upload_id: str, csv_type: str
                 )
                 await db.commit()
 
+
+async def _resolve_orders_upload(csv_upload_id: str, db: AsyncSession) -> Tuple[str, Optional[str], CsvUpload]:
+    upload = await db.get(CsvUpload, csv_upload_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    if upload.csv_type == 'orders':
+        return upload.id, upload.run_id, upload
+
+    if not upload.run_id:
+        raise HTTPException(status_code=400, detail="Run ID required to resolve associated orders upload")
+
+    query = (
+        select(CsvUpload)
+        .where(CsvUpload.run_id == upload.run_id, CsvUpload.csv_type == 'orders')
+        .order_by(desc(CsvUpload.created_at))
+    )
+    result = await db.execute(query)
+    orders_upload = result.scalars().first()
+    if not orders_upload:
+        raise HTTPException(status_code=400, detail="No orders upload found for the provided run")
+
+    return orders_upload.id, upload.run_id, upload
+
+
+async def _get_run_upload(db: AsyncSession, run_id: Optional[str], csv_type: str) -> Optional[CsvUpload]:
+    if not run_id:
+        return None
+    query = (
+        select(CsvUpload)
+        .where(CsvUpload.run_id == run_id, CsvUpload.csv_type == csv_type)
+        .order_by(desc(CsvUpload.created_at))
+    )
+    result = await db.execute(query)
+    return result.scalars().first()
+
+
+async def _ensure_data_ready(orders_upload_id: str, run_id: Optional[str], db: AsyncSession) -> None:
+    mapper = DataMapper()
+    enrichment = await mapper.enrich_order_lines_with_variants(orders_upload_id)
+    metrics = enrichment.get("metrics", {})
+
+    if not metrics.get("resolved_variants"):
+        raise HTTPException(status_code=400, detail="No order lines resolved; verify dataset completeness before continuing")
+
+    if not run_id:
+        return
+
+    variant_upload = await _get_run_upload(db, run_id, 'variants')
+    catalog_upload = await _get_run_upload(db, run_id, 'catalog_joined')
+
+    if not variant_upload or variant_upload.status != 'completed':
+        raise HTTPException(status_code=400, detail="Variants upload missing or incomplete for this run")
+    if not catalog_upload or catalog_upload.status != 'completed':
+        raise HTTPException(status_code=400, detail="Catalog upload missing or incomplete for this run")
+
+    order_lines = await storage.get_order_lines_by_run(run_id)
+    order_skus = {str(getattr(line, 'sku', '')).strip() for line in order_lines if getattr(line, 'sku', None)}
+
+    variant_rows = await storage.get_variants(variant_upload.id)
+    variant_skus = {getattr(v, 'sku') for v in variant_rows if getattr(v, 'sku', None)}
+
+    catalog_map = await storage.get_catalog_snapshots_map(catalog_upload.id)
+    catalog_skus = set(catalog_map.keys())
+
+    missing_variant_skus = sorted(sku for sku in order_skus if sku not in variant_skus)
+    missing_catalog_skus = sorted(sku for sku in order_skus if sku not in catalog_skus)
+
+    if missing_variant_skus:
+        sample = ", ".join(missing_variant_skus[:5])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Variants missing for SKUs: {sample} (total {len(missing_variant_skus)})"
+        )
+
+    if missing_catalog_skus:
+        sample = ", ".join(missing_catalog_skus[:5])
+        raise HTTPException(
+            status_code=400,
+            detail=f"Catalog entries missing for SKUs: {sample} (total {len(missing_catalog_skus)})"
+        )
+
 @router.post("/generate-rules")
 async def generate_rules(request: dict, db: AsyncSession = Depends(get_db)):
     """Generate association rules from uploaded data"""
@@ -196,13 +292,14 @@ async def generate_rules(request: dict, db: AsyncSession = Depends(get_db)):
         csv_upload_id = request.get("csvUploadId")
         if not csv_upload_id:
             raise HTTPException(status_code=400, detail="csvUploadId is required")
-            
+        orders_upload_id, run_id, _ = await _resolve_orders_upload(csv_upload_id, db)
+        await _ensure_data_ready(orders_upload_id, run_id, db)
+
         # Initialize services
         association_engine = AssociationRulesEngine()
-        
         # Generate association rules
-        logger.info(f"Starting association rules generation for upload: {csv_upload_id}")
-        await association_engine.generate_association_rules(csv_upload_id)
+        logger.info(f"Starting association rules generation for upload: {orders_upload_id}")
+        await association_engine.generate_association_rules(orders_upload_id)
         
         logger.info("Association rules generation completed")
         return {
@@ -221,19 +318,22 @@ async def generate_bundles(request: dict, db: AsyncSession = Depends(get_db)):
         csv_upload_id = request.get("csvUploadId")
         if not csv_upload_id:
             raise HTTPException(status_code=400, detail="csvUploadId is required")
-            
+        orders_upload_id, run_id, source_upload = await _resolve_orders_upload(csv_upload_id, db)
+        await _ensure_data_ready(orders_upload_id, run_id, db)
+
         # Initialize services
         association_engine = AssociationRulesEngine()
         bundle_generator = BundleGenerator()
         
         # Step 1: Generate association rules first
-        logger.info(f"Starting association rules generation for upload: {csv_upload_id}")
-        await association_engine.generate_association_rules(csv_upload_id)
+        logger.info(f"Starting association rules generation for upload: {orders_upload_id}")
+        await association_engine.generate_association_rules(orders_upload_id)
         logger.info("Association rules generation completed")
         
         # Step 2: Generate bundle recommendations
-        logger.info(f"Starting bundle recommendations generation for upload: {csv_upload_id}")
-        result = await bundle_generator.generate_bundle_recommendations(csv_upload_id)
+        target_upload_id = orders_upload_id if source_upload.csv_type != 'orders' else csv_upload_id
+        logger.info(f"Starting bundle recommendations generation for upload: {target_upload_id}")
+        result = await bundle_generator.generate_bundle_recommendations(target_upload_id)
         logger.info("Bundle recommendations generation completed")
         
         return {

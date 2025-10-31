@@ -9,6 +9,7 @@ from decimal import Decimal
 from datetime import datetime, timedelta
 import random
 import time
+from collections import defaultdict
 
 from services.storage import storage
 from services.ai_copy_generator import AICopyGenerator
@@ -70,9 +71,14 @@ class BundleGenerator:
         }
         
         # Bundle generation thresholds
-        self.min_confidence = 0.3
-        self.min_lift = 1.2
-        self.min_support = 0.05
+        self.base_min_support = 0.05
+        self.base_min_confidence = 0.3
+        self.base_min_lift = 1.2
+        self.min_support = self.base_min_support
+        self.min_confidence = self.base_min_confidence
+        self.min_lift = self.base_min_lift
+        self._last_threshold_signature: Optional[tuple] = None
+        self._refresh_thresholds()
         
         # v2 feature flags
         self.enable_v2_pipeline = True  # Enable comprehensive v2 features
@@ -114,6 +120,10 @@ class BundleGenerator:
         self.max_consecutive_failures = 10  # Stop after 10 consecutive failures
         self.circuit_breaker_active = False
 
+        # New caps for optimization and diversity safeguards
+        self.min_candidates_for_optimization = 5
+        self.max_bundles_per_pair = 2
+
     def _check_circuit_breaker(self, operation_name: str, success: bool) -> bool:
         """ARCHITECT FIX: Circuit-breaker to detect consecutive failures and stop runaway behavior"""
         if success:
@@ -130,6 +140,113 @@ class BundleGenerator:
             else:
                 logger.warning(f"Consecutive failure #{self.consecutive_failures} in {operation_name}")
                 return False  # Continue operation
+
+    def _refresh_thresholds(self) -> None:
+        """Pull threshold overrides from feature flags with safe fallbacks."""
+        use_relaxed = feature_flags.get_flag("bundling.relaxed_thresholds", True)
+
+        def _safe_numeric(flag_key: str, default: float) -> float:
+            value = feature_flags.get_flag(flag_key, default)
+            if isinstance(value, (int, float)):
+                return float(value)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return float(default)
+
+        if use_relaxed:
+            self.min_support = max(0.0, _safe_numeric("bundling.relaxed_min_support", self.base_min_support))
+            self.min_confidence = max(0.0, _safe_numeric("bundling.relaxed_min_confidence", self.base_min_confidence))
+            self.min_lift = max(0.0, _safe_numeric("bundling.relaxed_min_lift", self.base_min_lift))
+        else:
+            self.min_support = self.base_min_support
+            self.min_confidence = self.base_min_confidence
+            self.min_lift = self.base_min_lift
+
+        signature = (round(self.min_support, 4), round(self.min_confidence, 4), round(self.min_lift, 4), bool(use_relaxed))
+        if signature != self._last_threshold_signature:
+            logger.info(
+                "Bundle thresholds updated: support=%.3f confidence=%.3f lift=%.3f (relaxed=%s)",
+                self.min_support,
+                self.min_confidence,
+                self.min_lift,
+                use_relaxed
+            )
+            self._last_threshold_signature = signature
+
+    async def _apply_forced_pair_fallbacks(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> List[Dict[str, Any]]:
+        """Inject top association rule pairs when coverage is too low."""
+        if not feature_flags.get_flag("bundling.fallback_force_top_pairs", True):
+            return recommendations
+
+        target_total = feature_flags.get_flag("bundling.fallback_force_pair_limit", 12)
+        try:
+            target_total = int(target_total)
+        except (TypeError, ValueError):
+            target_total = 12
+
+        if target_total <= 0 or len(recommendations) >= target_total:
+            return recommendations
+
+        needed = target_total - len(recommendations)
+        if needed <= 0:
+            return recommendations
+
+        try:
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            rule_limit = max(needed * 3, 20)
+            if run_id:
+                rules = await storage.get_association_rules_by_run(run_id, limit=rule_limit)
+            else:
+                rules = await storage.get_association_rules(csv_upload_id, limit=rule_limit)
+        except Exception as exc:
+            logger.warning(f"Forced pair fallback skipped: unable to load rules ({exc})")
+            return recommendations
+
+        existing_signatures = {
+            tuple(sorted(rec.get("products", [])))
+            for rec in recommendations
+            if rec.get("products")
+        }
+
+        injected = []
+        for rule in rules:
+            antecedent = rule.antecedent if isinstance(rule.antecedent, list) else [rule.antecedent]
+            consequent = rule.consequent if isinstance(rule.consequent, list) else [rule.consequent]
+            products = [p for p in (antecedent + consequent) if p]
+            if len(products) != 2:
+                continue
+            signature = tuple(sorted(products))
+            if signature in existing_signatures:
+                continue
+
+            fallback_rec = {
+                "id": str(uuid.uuid4()),
+                "csv_upload_id": csv_upload_id,
+                "bundle_type": "FBT",
+                "objective": "increase_aov",
+                "products": products,
+                "confidence": float(getattr(rule, "confidence", 0.0) or 0.0),
+                "lift": float(getattr(rule, "lift", 1.0) or 1.0),
+                "support": float(getattr(rule, "support", 0.0) or 0.0),
+                "generation_sources": ["association_rule_fallback"],
+                "generation_method": "forced_top_pair",
+                "is_fallback": True,
+                "fallback_reason": "top_pair_injection"
+            }
+            # Provide a baseline ranking score so downstream ordering remains deterministic
+            fallback_rec["ranking_score"] = fallback_rec["confidence"] * max(fallback_rec["lift"], 1.0)
+            injected.append(fallback_rec)
+            existing_signatures.add(signature)
+            if len(injected) >= needed:
+                break
+
+        if injected:
+            recommendations.extend(injected)
+            recommendations.sort(key=lambda rec: rec.get("ranking_score", 0), reverse=True)
+            logger.info(f"Forced pair fallback injected {len(injected)} bundles to reach minimum coverage")
+
+        return recommendations
     
     def _safe_decimal(self, value, default=None):
         """Safely convert value to Decimal for database storage"""
@@ -191,6 +308,7 @@ class BundleGenerator:
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
         logger.info(f"Starting v2 bundle generation for upload: {csv_upload_id}")
+        self._refresh_thresholds()
         
         # Initialize loop prevention tracking
         self.seen_sku_combinations.clear()
@@ -349,6 +467,9 @@ class BundleGenerator:
                 metrics["global_enterprise_optimization"] = {"enabled": False}
                 metrics["weighted_ranking"] = {"enabled": False}
             
+            # Phase 5c: Ensure minimum pair coverage via forced fallbacks
+            all_recommendations = await self._apply_forced_pair_fallbacks(all_recommendations, csv_upload_id)
+
             # Phase 6: Explainability
             if self.enable_explainability and all_recommendations:
                 logger.info("Phase 6: Adding explanations")
@@ -588,7 +709,8 @@ class BundleGenerator:
                     break
             
             # Phase 4: Enterprise Optimization (PR-4)
-            if self.enable_enterprise_optimization and recommendations:
+            if (self.enable_enterprise_optimization and recommendations and
+                    len(recommendations) >= self.min_candidates_for_optimization):
                 logger.info(f"Phase 4: Enterprise optimization for {objective}/{bundle_type}")
                 opt_start_time = time.time()
                 
@@ -670,6 +792,12 @@ class BundleGenerator:
                         await self.performance_monitor.finish_operation_monitoring(
                             operation_id, len(recommendations), False, str(e)
                         )
+            elif self.enable_enterprise_optimization and recommendations:
+                metrics[f"enterprise_optimization_{bundle_type}"] = {
+                    "enabled": False,
+                    "reason": "not_enough_candidates",
+                    "candidate_count": len(recommendations)
+                }
             
             # Log stats for this objective/bundle type
             logger.info(f"Completed {objective_type_key}: {len(recommendations)} recommendations, {attempts_for_this_combo} attempts")
@@ -687,7 +815,13 @@ class BundleGenerator:
             final_recommendations = []
             
             # Limit recommendations per objective/type to avoid overwhelming merchants
-            max_per_type = 20
+            max_per_type_flag = feature_flags.get_flag("bundling.max_per_bundle_type", 15)
+            try:
+                max_per_type = int(max_per_type_flag)
+            except (TypeError, ValueError):
+                max_per_type = 15
+            if max_per_type <= 0:
+                max_per_type = float('inf')
             recommendations_by_type = {}
             
             for rec in recommendations:
@@ -698,9 +832,30 @@ class BundleGenerator:
                 if len(recommendations_by_type[key]) < max_per_type:
                     recommendations_by_type[key].append(rec)
             
-            # Flatten back to single list
+            # Flatten back to single list while limiting bundles per SKU pair
+            pair_cap_flag = feature_flags.get_flag("bundling.max_per_pair", self.max_bundles_per_pair)
+            try:
+                pair_cap = int(pair_cap_flag)
+            except (TypeError, ValueError):
+                pair_cap = self.max_bundles_per_pair
+            if pair_cap <= 0:
+                pair_cap = float('inf')
+
+            pair_usage = defaultdict(int)
+
             for type_recs in recommendations_by_type.values():
-                final_recommendations.extend(type_recs)
+                for rec in type_recs:
+                    products = rec.get("products", [])
+                    if isinstance(products, list) and products:
+                        pair_key = tuple(sorted(products))
+                    else:
+                        pair_key = (rec.get("id"),)
+
+                    if pair_usage[pair_key] >= pair_cap:
+                        continue
+
+                    pair_usage[pair_key] += 1
+                    final_recommendations.append(rec)
             
             # Add AI-generated copy if available
             if final_recommendations:

@@ -4,7 +4,7 @@ Dynamic pricing based on historical data with category priors and objective-base
 """
 from typing import List, Dict, Any, Optional
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime, timedelta
 from collections import defaultdict
 
@@ -363,15 +363,21 @@ class BayesianPricingEngine:
             # Ensure reasonable pricing
             bundle_price = max(bundle_price, original_total * Decimal('0.3'))  # Min 30% of original
             discount_amount = original_total - bundle_price
-            
+
             # Round to nice endings (.99, .95, .00)
             bundle_price = self.round_to_nice_ending(bundle_price)
             discount_amount = original_total - bundle_price
-            
+
+            product_details, bundle_price, discount_amount = self._reconcile_product_details(
+                original_total,
+                bundle_price,
+                product_details,
+            )
+
             total_discount_pct = Decimal('0')
             if original_total > 0:
                 total_discount_pct = (discount_amount / original_total) * Decimal('100')
-            
+
             return {
                 "original_total": original_total,
                 "bundle_price": bundle_price,
@@ -391,6 +397,93 @@ class BayesianPricingEngine:
                 "product_details": [],
                 "error": str(e)
             }
+
+    def _reconcile_product_details(
+        self,
+        original_total: Decimal,
+        bundle_price: Decimal,
+        product_details: List[Dict[str, Any]],
+    ) -> tuple[List[Dict[str, Any]], Decimal, Decimal]:
+        """Scale line level discounts so they reconcile with header totals."""
+
+        if not product_details:
+            discount_amount = original_total - bundle_price
+            return product_details, bundle_price, discount_amount
+
+        two_places = Decimal("0.01")
+        four_places = Decimal("0.0001")
+
+        target_discount = (original_total - bundle_price).quantize(two_places, rounding=ROUND_HALF_UP)
+
+        # Gather baseline values.
+        line_base_discounts = []
+        line_original_totals = []
+        for detail in product_details:
+            base_discount = detail.get("discount_amount")
+            if base_discount is None:
+                base_discount = Decimal('0')
+            if not isinstance(base_discount, Decimal):
+                base_discount = Decimal(str(base_discount))
+            original_price = detail.get("original_price") or Decimal('0')
+            if not isinstance(original_price, Decimal):
+                original_price = Decimal(str(original_price))
+            line_base_discounts.append(base_discount)
+            line_original_totals.append(original_price)
+
+        sum_line_discounts = sum(line_base_discounts)
+        sum_line_discounts = sum_line_discounts.quantize(four_places, rounding=ROUND_HALF_UP)
+
+        # Prepare adjusted discounts.
+        adjusted_discounts: List[Decimal] = []
+        running_total = Decimal('0')
+
+        if sum_line_discounts == 0 and target_discount > 0:
+            # Allocate proportionally to original prices if there was no baseline.
+            total_original = sum(line_original_totals)
+            total_original = total_original if total_original > 0 else Decimal('1')
+            for idx, (orig_price) in enumerate(line_original_totals):
+                if idx < len(product_details) - 1:
+                    portion = (target_discount * (orig_price / total_original)).quantize(two_places, rounding=ROUND_HALF_UP)
+                    running_total += portion
+                    adjusted_discounts.append(portion)
+                else:
+                    adjusted = (target_discount - running_total).quantize(two_places, rounding=ROUND_HALF_UP)
+                    adjusted_discounts.append(max(adjusted, Decimal('0')))
+        elif sum_line_discounts == 0:
+            adjusted_discounts = [Decimal('0') for _ in product_details]
+        else:
+            factor = target_discount / sum_line_discounts if sum_line_discounts != 0 else Decimal('0')
+            for idx, base_discount in enumerate(line_base_discounts):
+                if idx < len(product_details) - 1:
+                    adjusted = (base_discount * factor).quantize(two_places, rounding=ROUND_HALF_UP)
+                    running_total += adjusted
+                    adjusted_discounts.append(max(adjusted, Decimal('0')))
+                else:
+                    remainder = (target_discount - running_total).quantize(two_places, rounding=ROUND_HALF_UP)
+                    adjusted_discounts.append(max(remainder, Decimal('0')))
+
+        # Ensure discounts don't exceed original price and recompute prices.
+        for idx, detail in enumerate(product_details):
+            orig_price = line_original_totals[idx]
+            new_discount = min(adjusted_discounts[idx], orig_price)
+            new_discount = new_discount.quantize(two_places, rounding=ROUND_HALF_UP)
+            discounted_price = (orig_price - new_discount).quantize(two_places, rounding=ROUND_HALF_UP)
+
+            detail["discount_amount"] = new_discount
+            detail["discounted_price"] = discounted_price
+            if orig_price > 0:
+                detail["discount_pct"] = ((new_discount / orig_price) * Decimal('100')).quantize(
+                    four_places, rounding=ROUND_HALF_UP
+                )
+            else:
+                detail["discount_pct"] = Decimal('0')
+
+        # Recompute header totals from reconciled lines.
+        bundle_price = sum((detail.get("discounted_price") or Decimal('0')) for detail in product_details)
+        bundle_price = bundle_price.quantize(two_places, rounding=ROUND_HALF_UP)
+        discount_amount = (original_total - bundle_price).quantize(two_places, rounding=ROUND_HALF_UP)
+
+        return product_details, bundle_price, discount_amount
     
     def round_to_nice_ending(self, price: Decimal) -> Decimal:
         """Round price to nice psychological endings (.99, .95, .00)"""

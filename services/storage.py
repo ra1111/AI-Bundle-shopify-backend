@@ -3,7 +3,7 @@ Storage Service Layer
 Provides database operations matching the TypeScript storage interface
 """
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func, desc, and_, or_
+from sqlalchemy import select, delete, func, desc, and_, or_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from typing import List, Optional, Dict, Any
 import logging
@@ -13,8 +13,9 @@ from decimal import Decimal
 from database import (
     AsyncSessionLocal, User, CsvUpload, Order, OrderLine, Product, 
     Variant, InventoryLevel, CatalogSnapshot,
-    AssociationRule, Bundle, BundleRecommendation
+    AssociationRule, Bundle, BundleRecommendation, ShopSyncStatus
 )
+from settings import resolve_shop_id, sanitize_shop_id, DEFAULT_SHOP_ID
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +73,7 @@ class StorageService:
             row["returned"] = False
         return row
 
-    def _sanitize_order_line(self, line: dict) -> dict | None:
+    def _sanitize_order_line(self, line: dict) -> Optional[dict]:
         """
         Fill defaults for NOT NULL columns. Skip if we truly can't make a valid line.
         DB is complaining about NULLs in: sku, subcategory, color, material, etc.
@@ -130,6 +131,15 @@ class StorageService:
         except Exception:
             return None
     
+    async def get_shop_id_for_upload(self, csv_upload_id: str) -> str:
+        """Resolve the shop identifier for a CSV upload (defaults applied)."""
+        async with self.get_session() as session:
+            result = await session.execute(
+                select(CsvUpload.shop_id).where(CsvUpload.id == csv_upload_id)
+            )
+            value = result.scalar()
+            return resolve_shop_id(value)
+    
     def _overwrite_all_columns(self, table, stmt):
         """Helper to update all columns except primary key(s) in UPSERT operations"""
         pks = {c.name for c in table.primary_key.columns}
@@ -143,7 +153,9 @@ class StorageService:
     async def create_csv_upload(self, upload_data: Dict[str, Any]) -> CsvUpload:
         """Create new CSV upload record"""
         async with self.get_session() as session:
-            upload = CsvUpload(**upload_data)
+            payload = dict(upload_data)
+            payload["shop_id"] = resolve_shop_id(payload.get("shop_id"))
+            upload = CsvUpload(**payload)
             session.add(upload)
             await session.commit()
             await session.refresh(upload)
@@ -159,7 +171,13 @@ class StorageService:
         async with self.get_session() as session:
             upload = await session.get(CsvUpload, upload_id)
             if upload:
-                for key, value in updates.items():
+                change_set = dict(updates)
+                if "shop_id" in change_set:
+                    change_set["shop_id"] = resolve_shop_id(
+                        change_set.get("shop_id"),
+                        upload.shop_id
+                    )
+                for key, value in change_set.items():
                     setattr(upload, key, value)
                 await session.commit()
                 await session.refresh(upload)
@@ -397,28 +415,117 @@ class StorageService:
     # Bundle Recommendations operations
     async def create_bundle_recommendations(self, recommendations_data: List[Dict[str, Any]]) -> List[BundleRecommendation]:
         """Bulk create bundle recommendations"""
+        if not recommendations_data:
+            return []
+
         async with self.get_session() as session:
-            recommendations = [BundleRecommendation(**rec_data) for rec_data in recommendations_data]
+            # Ensure each recommendation carries the owning shop_id
+            upload_ids = {
+                rec.get("csv_upload_id")
+                for rec in recommendations_data
+                if rec.get("csv_upload_id")
+            }
+            shop_by_upload: Dict[str, Optional[str]] = {}
+            if upload_ids:
+                result = await session.execute(
+                    select(CsvUpload.id, CsvUpload.shop_id).where(CsvUpload.id.in_(upload_ids))
+                )
+                shop_by_upload = {row.id: row.shop_id for row in result.all()}
+
+            normalized_rows: List[Dict[str, Any]] = []
+            defaulted_uploads: set[str] = set()
+            missing_upload_refs: set[str] = set()
+            for rec in recommendations_data:
+                row = rec.copy()
+                upload_id = row.get("csv_upload_id")
+                explicit_shop = sanitize_shop_id(row.get("shop_id"))
+                fallback_shop = sanitize_shop_id(shop_by_upload.get(upload_id)) if upload_id else None
+                resolved_shop = resolve_shop_id(explicit_shop, fallback_shop)
+                if not explicit_shop and not fallback_shop and upload_id:
+                    defaulted_uploads.add(upload_id)
+                if not upload_id:
+                    missing_upload_refs.add(str(row.get("id", "")))
+                row["shop_id"] = resolved_shop
+                normalized_rows.append(row)
+
+            if missing_upload_refs:
+                logger.warning(
+                    "Bundle recommendations missing csv_upload_id; rec_ids=%s",
+                    sorted(r for r in missing_upload_refs if r)
+                )
+            if defaulted_uploads:
+                logger.info(
+                    "Defaulted bundle recommendation shop scope to '%s' for uploads=%s",
+                    DEFAULT_SHOP_ID,
+                    sorted(defaulted_uploads)
+                )
+
+            filtered_rows = self._filter_columns(BundleRecommendation.__table__, normalized_rows)
+            recommendations = [BundleRecommendation(**row) for row in filtered_rows]
             session.add_all(recommendations)
             await session.commit()
+
+            for rec in recommendations:
+                await session.refresh(rec)
             return recommendations
     
-    async def get_bundle_recommendations(self, csv_upload_id: str) -> List[BundleRecommendation]:
-        """Get bundle recommendations for a specific CSV upload"""
+    async def get_bundle_recommendations_by_upload(
+        self,
+        csv_upload_id: str,
+        shop_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[BundleRecommendation]:
+        """Get bundle recommendations for a specific CSV upload with shop scoping."""
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
+
         async with self.get_session() as session:
             query = select(BundleRecommendation).where(BundleRecommendation.csv_upload_id == csv_upload_id)
-            
-            # Per-upload scoped query: Use persistent rank_position with NULLS LAST
+
+            shop_filter = sanitize_shop_id(shop_id)
+            if shop_filter:
+                query = query.where(BundleRecommendation.shop_id == shop_filter)
+            else:
+                query = query.join(CsvUpload, BundleRecommendation.csv_upload_id == CsvUpload.id)
+                query = query.where(BundleRecommendation.shop_id == CsvUpload.shop_id)
+
             query = query.order_by(
-                BundleRecommendation.rank_position.asc().nulls_last(),  # Persistent ranking for this upload
-                desc(BundleRecommendation.ranking_score),  # Fallback for any records without rank_position
+                BundleRecommendation.rank_position.asc().nulls_last(),
+                desc(BundleRecommendation.ranking_score),
                 desc(BundleRecommendation.confidence),
                 desc(BundleRecommendation.created_at)
-            )
-            
-            query = query.limit(50)
+            ).limit(limit)
+
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_bundle_recommendations(
+        self,
+        shop_id: str,
+        csv_upload_id: Optional[str] = None,
+        limit: int = 50
+    ) -> List[BundleRecommendation]:
+        """Get bundle recommendations scoped to a shop, optionally filtered by upload."""
+        normalized_shop_id = resolve_shop_id(shop_id)
+
+        async with self.get_session() as session:
+            query = select(BundleRecommendation).where(BundleRecommendation.shop_id == normalized_shop_id)
+            if csv_upload_id:
+                query = query.where(BundleRecommendation.csv_upload_id == csv_upload_id)
+                query = query.order_by(
+                    BundleRecommendation.rank_position.asc().nulls_last(),
+                    desc(BundleRecommendation.ranking_score),
+                    desc(BundleRecommendation.confidence),
+                    desc(BundleRecommendation.created_at)
+                )
+            else:
+                query = query.order_by(
+                    desc(BundleRecommendation.ranking_score),
+                    desc(BundleRecommendation.confidence),
+                    desc(BundleRecommendation.created_at)
+                )
+
+            query = query.limit(limit)
             result = await session.execute(query)
             return list(result.scalars().all())
     
@@ -433,12 +540,15 @@ class StorageService:
                 await session.refresh(recommendation)
             return recommendation
     
-    async def clear_bundle_recommendations(self, csv_upload_id: str) -> None:
+    async def clear_bundle_recommendations(self, csv_upload_id: str, shop_id: Optional[str] = None) -> None:
         """Clear bundle recommendations for a specific CSV upload"""
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
         async with self.get_session() as session:
             query = delete(BundleRecommendation).where(BundleRecommendation.csv_upload_id == csv_upload_id)
+            resolved_shop = sanitize_shop_id(shop_id)
+            if resolved_shop:
+                query = query.where(BundleRecommendation.shop_id == resolved_shop)
             await session.execute(query)
             await session.commit()
     
@@ -458,6 +568,73 @@ class StorageService:
             query = select(Bundle).order_by(desc(Bundle.created_at))
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    # Shop sync status operations
+    async def get_shop_sync_status(self, shop_id: str) -> Optional[ShopSyncStatus]:
+        """Retrieve sync status for a shop."""
+        normalized_shop_id = resolve_shop_id(shop_id)
+        async with self.get_session() as session:
+            return await session.get(ShopSyncStatus, normalized_shop_id)
+
+    async def mark_shop_sync_started(self, shop_id: str) -> ShopSyncStatus:
+        """Upsert sync status when ingestion begins."""
+        normalized_shop_id = resolve_shop_id(shop_id)
+        async with self.get_session() as session:
+            status = await session.get(ShopSyncStatus, normalized_shop_id)
+            now = datetime.utcnow()
+            if not status:
+                status = ShopSyncStatus(
+                    shop_id=normalized_shop_id,
+                    initial_sync_completed=False,
+                    last_sync_started_at=now,
+                    last_sync_completed_at=None,
+                )
+                session.add(status)
+            else:
+                status.last_sync_started_at = now
+                status.initial_sync_completed = False
+            await session.commit()
+            await session.refresh(status)
+            return status
+
+    async def mark_shop_sync_completed(self, shop_id: str) -> ShopSyncStatus:
+        """Mark the initial ingestion as complete for a shop."""
+        normalized_shop_id = resolve_shop_id(shop_id)
+        async with self.get_session() as session:
+            status = await session.get(ShopSyncStatus, normalized_shop_id)
+            now = datetime.utcnow()
+            if not status:
+                status = ShopSyncStatus(
+                    shop_id=normalized_shop_id,
+                    initial_sync_completed=True,
+                    last_sync_started_at=None,
+                    last_sync_completed_at=now,
+                )
+                session.add(status)
+            else:
+                status.initial_sync_completed = True
+                status.last_sync_completed_at = now
+            await session.commit()
+            await session.refresh(status)
+            return status
+
+    async def backfill_bundle_recommendation_shop_ids(self) -> int:
+        """Populate missing bundle_recommendations.shop_id values from their CSV uploads."""
+        async with self.get_session() as session:
+            result = await session.execute(
+                text(
+                    """
+                    UPDATE bundle_recommendations br
+                    SET shop_id = cu.shop_id
+                    FROM csv_uploads cu
+                    WHERE br.csv_upload_id = cu.id
+                      AND br.shop_id IS NULL
+                      AND cu.shop_id IS NOT NULL
+                    """
+                )
+            )
+            await session.commit()
+            return result.rowcount or 0
     
     # Variant operations
     async def create_variants(self, variants_data: List[Dict[str, Any]]) -> List[Variant]:
@@ -553,13 +730,22 @@ class StorageService:
         # Deduplicate within the same batch to avoid ON CONFLICT affecting the same row twice
         # Key = (csv_upload_id, variant_id)
         dedup: Dict[tuple, Dict[str, Any]] = {}
+        dropped_missing_key = 0
         for row in catalog_data:
             key = (row.get("csv_upload_id"), row.get("variant_id"))
             if not key[0] or not key[1]:
-                # Skip rows missing the conflict key
+                dropped_missing_key += 1
                 continue
             dedup[key] = row  # keep last occurrence
         catalog_data = list(dedup.values())
+        try:
+            run_id = await self.get_run_id_for_upload(catalog_data[0]["csv_upload_id"]) if catalog_data else None
+        except Exception:
+            run_id = None
+        logger.info(
+            f"Storage: create_catalog_snapshots upload_id={catalog_data[0]['csv_upload_id'] if catalog_data else 'n/a'} "
+            f"run_id={run_id} rows_filtered={len(catalog_data)} dropped_missing_key={dropped_missing_key}"
+        )
         async with self.get_session() as session:
             stmt = pg_insert(CatalogSnapshot).values(catalog_data)
             upsert = stmt.on_conflict_do_update(
@@ -967,12 +1153,22 @@ class StorageService:
             return list(result.scalars().all())
     
     # Deduplication methods
-    async def get_bundle_recommendations_hashes(self, csv_upload_id: str) -> List[BundleRecommendation]:
+    async def get_bundle_recommendations_hashes(
+        self,
+        csv_upload_id: str,
+        shop_id: Optional[str] = None
+    ) -> List[BundleRecommendation]:
         """Get bundle recommendation hashes for deduplication"""
         async with self.get_session() as session:
             query = select(BundleRecommendation).where(
                 BundleRecommendation.csv_upload_id == csv_upload_id
             )
+            shop_filter = sanitize_shop_id(shop_id)
+            if shop_filter:
+                query = query.where(BundleRecommendation.shop_id == shop_filter)
+            else:
+                query = query.join(CsvUpload, BundleRecommendation.csv_upload_id == CsvUpload.id)
+                query = query.where(BundleRecommendation.shop_id == CsvUpload.shop_id)
             result = await session.execute(query)
             return list(result.scalars().all())
     

@@ -5,6 +5,7 @@ Handles parsing and processing of uploaded CSV files
 import csv
 import io
 import re
+import time
 from typing import List, Dict, Any, Optional
 import logging
 import uuid
@@ -12,8 +13,11 @@ from datetime import datetime
 from decimal import Decimal
 
 from .storage import storage
+from services.data_mapper import DataMapper
+from services.feature_flags import feature_flags
 from database import AsyncSessionLocal  # kept for parity; storage handles inserts
 from sqlalchemy.exc import IntegrityError
+from settings import resolve_shop_id, infer_shop_id_from_rows, sanitize_shop_id
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +60,8 @@ class CSVProcessor:
     def __init__(self):
         self.schema_version = "v2.0"
         self.valid_types = {"orders", "variants", "inventory_levels", "catalog_joined"}
+        self.data_mapper = DataMapper()
+        self._last_enrichment: Dict[str, datetime] = {}
 
         self.header_aliases = {
             "variantid": "variant_id",
@@ -152,7 +158,9 @@ class CSVProcessor:
     async def process_csv(self, csv_content: str, upload_id: str, csv_type: str = "auto") -> None:
         """Process CSV content into DB tables based on canonical type."""
         try:
-            logger.info(f"Starting CSV processing for upload {upload_id}, type: {csv_type}")
+            t0 = time.time()
+            run_id = await storage.get_run_id_for_upload(upload_id)
+            logger.info(f"CSV: start upload_id={upload_id} run_id={run_id} type_hint={csv_type}")
 
             # Parse CSV
             csv_reader = csv.DictReader(io.StringIO(csv_content))
@@ -162,6 +170,27 @@ class CSVProcessor:
             rows = [self._normalize_row_keys(row) for row in raw_rows]
             if not rows:
                 raise ValueError("CSV file is empty")
+
+            upload_record = await storage.get_csv_upload(upload_id)
+            existing_shop_id = sanitize_shop_id(getattr(upload_record, "shop_id", None)) if upload_record else None
+            inferred_shop_id = infer_shop_id_from_rows(rows)
+            final_shop_id = resolve_shop_id(inferred_shop_id, existing_shop_id)
+
+            if inferred_shop_id and inferred_shop_id != existing_shop_id:
+                logger.info(
+                    "CSV: inferred shop_id=%s from file upload_id=%s",
+                    final_shop_id,
+                    upload_id
+                )
+            elif not existing_shop_id:
+                logger.info(
+                    "CSV: defaulting shop_id=%s for upload_id=%s",
+                    final_shop_id,
+                    upload_id
+                )
+
+            if existing_shop_id != final_shop_id:
+                await storage.update_csv_upload(upload_id, {"shop_id": final_shop_id})
 
             # Track row counts early
             await storage.update_csv_upload(upload_id, {
@@ -188,7 +217,7 @@ class CSVProcessor:
 
             # Persist detected type for observability
             await storage.update_csv_upload(upload_id, {"csv_type": csv_type})
-            logger.info(f"Processing CSV type: {csv_type}")
+            logger.info(f"CSV: detected type={csv_type} upload_id={upload_id} rows={len(rows)}")
 
             # Validate schema + sample datatypes
             await self.validate_csv_schema(csv_type, headers, upload_id)
@@ -206,15 +235,18 @@ class CSVProcessor:
             else:
                 await self.process_legacy_format(rows, upload_id)
 
+            await self._post_ingest_hooks(csv_type, upload_id, len(rows))
+
             # Done
             await storage.update_csv_upload(upload_id, {
                 "status": "completed",
                 "processed_rows": len(rows)
             })
-            logger.info(f"CSV processing completed for upload {upload_id}")
+            dur_ms = int((time.time() - t0) * 1000)
+            logger.info(f"CSV: completed upload_id={upload_id} run_id={run_id} rows={len(rows)} durMs={dur_ms}")
 
         except Exception as e:
-            logger.error(f"CSV processing error: {e}")
+            logger.error(f"CSV: error upload_id={upload_id}: {e}")
             await storage.update_csv_upload(upload_id, {"status": "failed", "error_message": str(e)})
             raise
 
@@ -341,6 +373,8 @@ class CSVProcessor:
     async def process_variants_csv(self, rows: List[Dict[str, str]], upload_id: str) -> None:
         """Insert rows into `variants`."""
         variants: List[Dict[str, Any]] = []
+        run_id = await storage.get_run_id_for_upload(upload_id)
+        t0 = time.time()
         for r in rows:
             try:
                 vid = (r.get("variant_id") or "").strip()
@@ -366,14 +400,18 @@ class CSVProcessor:
                 logger.warning(f"Error processing variants row: {e}")
                 continue
 
+        logger.info(f"CSV: variants prepared upload_id={upload_id} run_id={run_id} count={len(variants)}")
         if variants:
             await storage.create_variants(variants)
-            logger.info(f"Created {len(variants)} variants")
+            dur_ms = int((time.time() - t0) * 1000)
+            logger.info(f"CSV: variants created upload_id={upload_id} run_id={run_id} count={len(variants)} durMs={dur_ms}")
 
     # ---------- Inventory ----------
 
     async def process_inventory_levels_csv(self, rows: List[Dict[str, str]], upload_id: str) -> None:
         inventory_levels = []
+        run_id = await storage.get_run_id_for_upload(upload_id)
+        t0 = time.time()
         for row in rows:
             try:
                 raw_available = (row.get('available', '') or '').strip()
@@ -398,15 +436,20 @@ class CSVProcessor:
                 logger.warning(f"Error processing inventory row: {e}")
                 continue
 
+        logger.info(f"CSV: inventory prepared upload_id={upload_id} run_id={run_id} count={len(inventory_levels)}")
         if inventory_levels:
             await storage.create_inventory_levels(inventory_levels)
-            logger.info(f"Created {len(inventory_levels)} inventory level records")
+            dur_ms = int((time.time() - t0) * 1000)
+            logger.info(f"CSV: inventory created upload_id={upload_id} run_id={run_id} count={len(inventory_levels)} durMs={dur_ms}")
 
     # ---------- Catalog snapshot ----------
 
     async def process_catalog_joined_csv(self, rows: List[Dict[str, str]], upload_id: str) -> None:
         """Insert rows into `catalog_snapshot` (wide product+variant view)."""
         snaps: List[Dict[str, Any]] = []
+        run_id = await storage.get_run_id_for_upload(upload_id)
+        t0 = time.time()
+        pre_filtered = 0
 
         for row in rows:
             try:
@@ -417,6 +460,7 @@ class CSVProcessor:
 
                 product_status = (row.get('product_status') or '').upper()
                 if product_status in {'ARCHIVED', 'DRAFT'}:
+                    pre_filtered += 1
                     continue
 
                 price = Decimal(str(row.get('price', '0') or '0'))
@@ -482,14 +526,65 @@ class CSVProcessor:
                 logger.warning(f"Error processing catalog row: {e}")
                 continue
 
+        logger.info(f"CSV: catalog prepared upload_id={upload_id} run_id={run_id} count={len(snaps)} skipped_status={pre_filtered}")
         if snaps:
             await storage.create_catalog_snapshots(snaps)
-            logger.info(f"Created {len(snaps)} catalog snapshot records")
+            dur_ms = int((time.time() - t0) * 1000)
+            logger.info(f"CSV: catalog created upload_id={upload_id} run_id={run_id} count={len(snaps)} durMs={dur_ms}")
             # Best-effort post-computation; non-fatal if it fails
             try:
                 await storage.recompute_catalog_objectives(upload_id)
             except Exception as e:
                 logger.error(f"Objective recompute failed for {upload_id}: {e}")
+
+    async def _post_ingest_hooks(self, csv_type: str, upload_id: str, row_count: int) -> None:
+        """Apply post-processing hooks such as cache resets and data enrichment."""
+        if row_count <= 0:
+            return
+
+        if feature_flags.get_flag("data_mapping.reset_cache_on_new_data", True):
+            if csv_type in {"variants", "catalog_joined"}:
+                self.data_mapper.reset_unresolved_cache()
+                self.data_mapper.reset_resolved_cache()
+            elif csv_type == "inventory_levels":
+                self.data_mapper.reset_unresolved_cache()
+
+        if csv_type in {"orders", "variants", "inventory_levels", "catalog_joined"}:
+            await self._maybe_trigger_enrichment(upload_id, f"{csv_type}_ingest", True)
+
+    async def _maybe_trigger_enrichment(self, upload_id: str, reason: str, has_new_records: bool) -> None:
+        if not has_new_records:
+            return
+        if not feature_flags.get_flag("phase.data_mapping", True):
+            return
+        if not feature_flags.get_flag("data_mapping.auto_reenrich_on_csv", True):
+            return
+
+        now = datetime.utcnow()
+        last = self._last_enrichment.get(upload_id)
+        cooldown_seconds = 5
+        if last and (now - last).total_seconds() < cooldown_seconds:
+            return
+
+        try:
+            enrichment_result = await self.data_mapper.enrich_order_lines_with_variants(upload_id)
+            self._last_enrichment[upload_id] = now
+            metrics = enrichment_result.get("metrics") if enrichment_result else None
+            if metrics:
+                logger.info(
+                    "Auto enrichment completed (%s): total=%s resolved=%s unresolved=%s",
+                    reason,
+                    metrics.get("total_order_lines"),
+                    metrics.get("resolved_variants"),
+                    metrics.get("unresolved_skus")
+                )
+        except Exception as exc:
+            logger.warning(
+                "Auto enrichment failed for upload=%s reason=%s error=%s",
+                upload_id,
+                reason,
+                exc
+            )
 
     # ---------- Legacy fallback ----------
 

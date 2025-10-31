@@ -11,6 +11,8 @@ from datetime import datetime
 
 from database import get_db, BundleRecommendation
 from services.bundle_generator import BundleGenerator
+from routers.uploads import _resolve_orders_upload, _ensure_data_ready
+from settings import resolve_shop_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -30,11 +32,18 @@ async def generate_bundles(
     """Generate bundle recommendations"""
     try:
         csv_upload_id = request.csvUploadId
-        
+        if not csv_upload_id:
+            raise HTTPException(status_code=400, detail="csvUploadId is required")
+
+        orders_upload_id, run_id, source_upload = await _resolve_orders_upload(csv_upload_id, db)
+        await _ensure_data_ready(orders_upload_id, run_id, db)
+
+        target_upload_id = orders_upload_id if source_upload.csv_type != 'orders' else csv_upload_id
+
         # Start background task to generate bundles
-        background_tasks.add_task(generate_bundles_background, csv_upload_id)
+        background_tasks.add_task(generate_bundles_background, target_upload_id)
         
-        scope = f"for CSV upload {csv_upload_id}" if csv_upload_id else "overall"
+        scope = f"for CSV upload {target_upload_id}" if target_upload_id else "overall"
         return {"success": True, "message": f"Bundle recommendations generation started {scope}"}
         
     except Exception as e:
@@ -43,14 +52,16 @@ async def generate_bundles(
 
 @router.get("/bundle-recommendations")
 async def get_bundle_recommendations(
+    shopId: Optional[str] = None,
     uploadId: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Get bundle recommendations with optional CSV filtering"""
     try:
+        shop_id = resolve_shop_id(shopId)
         from sqlalchemy import select
         
-        query = select(BundleRecommendation)
+        query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)
         if uploadId:
             query = query.where(BundleRecommendation.csv_upload_id == uploadId)
         
@@ -79,6 +90,7 @@ async def get_bundle_recommendations(
             {
                 "id": rec.id,
                 "csvUploadId": rec.csv_upload_id,
+                "shopId": rec.shop_id,
                 "bundleType": rec.bundle_type,
                 "objective": rec.objective,
                 "products": rec.products,
@@ -205,7 +217,8 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                         from database import BundleRecommendation
                         async with get_db() as db:
                             query = select(BundleRecommendation).where(
-                                BundleRecommendation.csv_upload_id == csv_upload_id
+                                BundleRecommendation.csv_upload_id == csv_upload_id,
+                                BundleRecommendation.shop_id == shop_id
                             )
                             result = await db.execute(query)
                             partial_recommendations = result.scalars().all()

@@ -12,6 +12,7 @@ import io
 from datetime import datetime
 
 from database import get_db, Bundle, BundleRecommendation
+from settings import resolve_shop_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -59,14 +60,16 @@ async def export_bundles(db: AsyncSession = Depends(get_db)):
 
 @router.get("/export/recommendations")
 async def export_recommendations(
+    shopId: Optional[str] = None,
     uploadId: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Export recommendations as JSON"""
     try:
+        shop_id = resolve_shop_id(shopId)
         from sqlalchemy import select
         
-        query = select(BundleRecommendation)
+        query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)
         if uploadId:
             query = query.where(BundleRecommendation.csv_upload_id == uploadId)
         
@@ -76,6 +79,7 @@ async def export_recommendations(
         export_data = {
             "exportDate": datetime.now().isoformat(),
             "uploadId": uploadId,
+            "shopId": shop_id,
             "recommendationCount": len(recommendations),
             "recommendations": [
                 {
@@ -112,15 +116,18 @@ async def export_recommendations(
 @router.get("/recommendations/{upload_id}/export")
 async def export_csv_recommendations(
     upload_id: str,
+    shopId: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Export CSV-specific recommendations as CSV format"""
     try:
+        shop_id = resolve_shop_id(shopId)
         from sqlalchemy import select
         
         query = select(BundleRecommendation).where(
-            BundleRecommendation.csv_upload_id == upload_id
+            BundleRecommendation.csv_upload_id == upload_id,
         )
+        query = query.where(BundleRecommendation.shop_id == shop_id)
         result = await db.execute(query)
         recommendations = result.scalars().all()
         

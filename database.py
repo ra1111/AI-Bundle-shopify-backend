@@ -6,26 +6,45 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import (
     String, Text, Integer, Numeric, DateTime, Boolean,
-    ForeignKey, func, Index
+    ForeignKey, func, Index, event
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.pool import StaticPool
 from sqlalchemy import text
 from datetime import datetime
 from decimal import Decimal
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 import logging, os, uuid
+import json
+
+# Load environment variables early (before reading DATABASE_URL)
+from dotenv import load_dotenv
+load_dotenv()
 
 # -------------------------------------------------------------------
-# Engine / Session (unchanged except for the log + probe helpers)
+# Engine / Session (CockroachDB compatible)
 # -------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 if DATABASE_URL:
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://")
-    for needle in ("?sslmode=", "&sslmode="):
-        if needle in DATABASE_URL:
-            DATABASE_URL = DATABASE_URL.split(needle)[0]
+    # CockroachDB requires SSL; preserve sslmode parameter for asyncpg
+    # asyncpg uses 'ssl' parameter, not 'sslmode', so we convert it
+    if "sslmode=verify-full" in DATABASE_URL:
+        # For CockroachDB, asyncpg needs ssl='require' or we handle SSL via connect_args
+        # Keep the URL clean and handle SSL in connect_args if needed
+        DATABASE_URL = DATABASE_URL.replace("?sslmode=verify-full", "")
+        DATABASE_URL = DATABASE_URL.replace("&sslmode=verify-full", "")
+
+    # CockroachDB-optimized connection settings
+    # CockroachDB is PostgreSQL-compatible but has some differences
+    # Most importantly: CockroachDB doesn't have the 'json' type, only 'jsonb'
+    async def _setup_asyncpg_connection(conn):
+        """Custom connection setup that avoids JSON codec issues with CockroachDB"""
+        # Don't set up JSON codecs - CockroachDB doesn't have the 'json' type
+        # We only use JSONB in our models anyway
+        pass
+
     engine = create_async_engine(
         DATABASE_URL,
         echo=os.getenv("NODE_ENV") == "development",
@@ -34,7 +53,64 @@ if DATABASE_URL:
         pool_pre_ping=True,
         pool_recycle=3600,
         pool_timeout=30,
+        # CockroachDB compatibility settings
+        connect_args={
+            "ssl": "require",  # CockroachDB requires SSL
+            "server_settings": {
+                "application_name": "ai_bundle_creator",
+            },
+        },
+        use_insertmanyvalues=True,  # CockroachDB supports this
     )
+
+    # Monkey-patch the asyncpg dialect for CockroachDB compatibility
+    from sqlalchemy.dialects.postgresql.asyncpg import PGDialect_asyncpg
+    from sqlalchemy.dialects.postgresql.base import PGDialect
+
+    # Fix 1: JSON codec setup (CockroachDB doesn't have 'json' type)
+    original_setup_asyncpg_json_codec = PGDialect_asyncpg.setup_asyncpg_json_codec
+
+    async def patched_setup_asyncpg_json_codec(self, conn):
+        """Patched version that skips JSON codec (CockroachDB doesn't have 'json' type)"""
+        try:
+            # Try to setup JSONB codec only (skip JSON)
+            import asyncpg
+            await conn.set_type_codec(
+                'jsonb',
+                encoder=json.dumps,
+                decoder=json.loads,
+                schema='pg_catalog',
+                format='text',
+            )
+        except Exception:
+            # If even JSONB fails, just skip codec setup entirely
+            # SQLAlchemy will handle JSON encoding/decoding in Python
+            pass
+
+    PGDialect_asyncpg.setup_asyncpg_json_codec = patched_setup_asyncpg_json_codec
+
+    # Fix 2: Version string parsing (CockroachDB has different version format)
+    original_get_server_version_info = PGDialect._get_server_version_info
+
+    def patched_get_server_version_info(self, connection):
+        """Patched version that handles CockroachDB version strings"""
+        import re
+        version_str = connection.scalar(text("SELECT version()"))
+
+        # Check if this is CockroachDB
+        if "CockroachDB" in version_str:
+            # Parse CockroachDB version: "CockroachDB CCL v25.2.6 ..."
+            match = re.search(r'v(\d+)\.(\d+)\.(\d+)', version_str)
+            if match:
+                # CockroachDB is PostgreSQL-compatible
+                # Return a PostgreSQL version tuple that SQLAlchemy can work with
+                # CockroachDB v25.x is compatible with PostgreSQL 13+
+                return (13, 0)  # Report as PostgreSQL 13
+
+        # For regular PostgreSQL, use original logic
+        return original_get_server_version_info(self, connection)
+
+    PGDialect._get_server_version_info = patched_get_server_version_info
 else:
     DB_USER = os.getenv("DB_USER", "postgres")
     DB_NAME = os.getenv("DB_NAME", "bundles")
@@ -107,25 +183,27 @@ class CsvUpload(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     # Can be absent on first upload; keep unique when present
-    run_id: Mapped[str | None] = mapped_column(String, unique=True, index=True, nullable=True)
-    shop_id: Mapped[str | None] = mapped_column(String, index=True, nullable=True)
+    # Multiple uploads (orders, variants, inventory, catalog) belong to the same run_id
+    # Remove unique=True so all four CSVs can share a single run_id
+    run_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
+    shop_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
 
     filename: Mapped[str] = mapped_column(Text, nullable=False)
-    csv_type: Mapped[str | None] = mapped_column(String, nullable=True)
+    csv_type: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     total_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     processed_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    bundle_generation_metrics: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    bundle_generation_metrics: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     code_version: Mapped[str] = mapped_column(String, default="1.0.0", nullable=False)
-    processing_params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    processing_params: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     schema_version: Mapped[str] = mapped_column(String, default="1.0", nullable=False)
 
-    time_window_start: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    time_window_end: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    time_window_start: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    time_window_end: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
@@ -143,31 +221,31 @@ class Order(Base):
     # Always present in your CSVs
     order_id: Mapped[str] = mapped_column(String, primary_key=True)
 
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
-    customer_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    customer_email: Mapped[str | None] = mapped_column(Text, nullable=True)
-    customer_country: Mapped[str | None] = mapped_column(Text, nullable=True)
-    customer_currency: Mapped[str | None] = mapped_column(Text, nullable=True)
-    clv_band: Mapped[str | None] = mapped_column(Text, nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    customer_email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    customer_country: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    customer_currency: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    clv_band: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)  # present in CSVs
-    channel: Mapped[str | None] = mapped_column(Text, nullable=True)
-    device: Mapped[str | None] = mapped_column(Text, nullable=True)
+    channel: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    device: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    subtotal: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    discount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    discount_code: Mapped[str | None] = mapped_column(Text, nullable=True)
-    shipping: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    taxes: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    total: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    subtotal: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    discount: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    discount_code: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    shipping: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    taxes: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    total: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
 
-    financial_status: Mapped[str | None] = mapped_column(Text, nullable=True)
-    fulfillment_status: Mapped[str | None] = mapped_column(Text, nullable=True)
-    returned: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    financial_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    fulfillment_status: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    returned: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
 
-    basket_item_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    basket_line_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    basket_value: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    basket_item_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    basket_line_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    basket_value: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
 
     # Relationships
     csv_upload = relationship("CsvUpload", back_populates="orders")
@@ -178,33 +256,33 @@ class OrderLine(Base):
     __tablename__ = "order_lines"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     # required: must point to an existing order
     order_id: Mapped[str] = mapped_column(String, ForeignKey("orders.order_id"), nullable=False)
 
-    sku: Mapped[str | None] = mapped_column(Text, nullable=True)        # can be blank in Shopify
-    name: Mapped[str | None] = mapped_column(Text, nullable=True)
-    brand: Mapped[str | None] = mapped_column(Text, nullable=True)
-    category: Mapped[str | None] = mapped_column(Text, nullable=True)
-    subcategory: Mapped[str | None] = mapped_column(Text, nullable=True)
-    color: Mapped[str | None] = mapped_column(Text, nullable=True)
-    material: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sku: Mapped[Optional[str]] = mapped_column(Text, nullable=True)        # can be blank in Shopify
+    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    brand: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    subcategory: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    color: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    material: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    cost: Mapped[Decimal | None] = mapped_column(Numeric(12, 3), nullable=True)
-    weight_kg: Mapped[Decimal | None] = mapped_column(Numeric(10, 3), nullable=True)
-    tags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 3), nullable=True)
+    weight_kg: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 3), nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    quantity: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    unit_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    line_total: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    hist_views: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    hist_adds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    quantity: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    unit_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    line_total: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    hist_views: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    hist_adds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
-    variant_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    line_item_id: Mapped[str | None] = mapped_column(String, nullable=True)
-    line_discount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    variant_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    line_item_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    line_discount: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
 
     # Relationships
     csv_upload = relationship("CsvUpload", back_populates="order_lines")
@@ -215,16 +293,16 @@ class Product(Base):
     __tablename__ = "products"
 
     sku: Mapped[str] = mapped_column(Text, primary_key=True)
-    name: Mapped[str | None] = mapped_column(Text, nullable=True)
-    brand: Mapped[str | None] = mapped_column(Text, nullable=True)
-    category: Mapped[str | None] = mapped_column(Text, nullable=True)
-    subcategory: Mapped[str | None] = mapped_column(Text, nullable=True)
-    color: Mapped[str | None] = mapped_column(Text, nullable=True)
-    material: Mapped[str | None] = mapped_column(Text, nullable=True)
-    price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    cost: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
-    weight_kg: Mapped[Decimal | None] = mapped_column(Numeric(8, 2), nullable=True)
-    tags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    brand: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    category: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    subcategory: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    color: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    material: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    cost: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
+    weight_kg: Mapped[Optional[Decimal]] = mapped_column(Numeric(8, 2), nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class Variant(Base):
@@ -232,13 +310,13 @@ class Variant(Base):
 
     variant_id: Mapped[str] = mapped_column(String, primary_key=True)
     product_id: Mapped[str] = mapped_column(String, nullable=False)
-    sku: Mapped[str | None] = mapped_column(Text, nullable=True)              # often missing
+    sku: Mapped[Optional[str]] = mapped_column(Text, nullable=True)              # often missing
     variant_title: Mapped[str] = mapped_column(Text, nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    compare_at_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    compare_at_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     inventory_item_id: Mapped[str] = mapped_column(String, nullable=False)
-    inventory_item_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    inventory_item_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -251,7 +329,7 @@ class InventoryLevel(Base):
     location_id: Mapped[str] = mapped_column(String, nullable=False)
     available: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -262,30 +340,30 @@ class CatalogSnapshot(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     product_id: Mapped[str] = mapped_column(String, nullable=False)
     product_title: Mapped[str] = mapped_column(Text, nullable=False)
-    product_type: Mapped[str | None] = mapped_column(Text, nullable=True)
-    tags: Mapped[str | None] = mapped_column(Text, nullable=True)
+    product_type: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tags: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     product_status: Mapped[str] = mapped_column(Text, nullable=False)
-    vendor: Mapped[str | None] = mapped_column(Text, nullable=True)
-    product_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    product_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    vendor: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    product_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    product_published_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     variant_id: Mapped[str] = mapped_column(String, nullable=False)
-    sku: Mapped[str | None] = mapped_column(Text, nullable=True)
+    sku: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     variant_title: Mapped[str] = mapped_column(Text, nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
-    compare_at_price: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    compare_at_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     inventory_item_id: Mapped[str] = mapped_column(String, nullable=False)
-    inventory_item_created_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    inventory_item_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
-    available_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    last_inventory_update: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    available_total: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_inventory_update: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     is_slow_mover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_new_launch: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_seasonal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_high_margin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -294,7 +372,7 @@ class AssociationRule(Base):
     __tablename__ = "association_rules"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
 
     antecedent: Mapped[dict] = mapped_column(JSONB, nullable=False)
     consequent: Mapped[dict] = mapped_column(JSONB, nullable=False)
@@ -312,7 +390,7 @@ class Bundle(Base):
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     name: Mapped[str] = mapped_column(Text, nullable=False)
-    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     bundle_type: Mapped[str] = mapped_column(Text, nullable=False)
     products: Mapped[dict] = mapped_column(JSONB, nullable=False)
     pricing: Mapped[dict] = mapped_column(JSONB, nullable=False)
@@ -325,7 +403,8 @@ class BundleRecommendation(Base):
     __tablename__ = "bundle_recommendations"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    csv_upload_id: Mapped[str | None] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    shop_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
 
     bundle_type: Mapped[str] = mapped_column(Text, nullable=False)
     objective: Mapped[str] = mapped_column(Text, nullable=False)
@@ -336,18 +415,29 @@ class BundleRecommendation(Base):
 
     confidence: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
     predicted_lift: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
-    support: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
-    lift: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
+    support: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6), nullable=True)
+    lift: Mapped[Optional[Decimal]] = mapped_column(Numeric(12, 6), nullable=True)
     ranking_score: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
 
-    discount_reference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discount_reference: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     is_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_used: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    rank_position: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    rank_position: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
 
     csv_upload = relationship("CsvUpload", back_populates="bundle_recommendations")
+
+
+class ShopSyncStatus(Base):
+    __tablename__ = "shop_sync_status"
+
+    shop_id: Mapped[str] = mapped_column(String, primary_key=True)
+    initial_sync_completed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_sync_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_sync_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
 # -------------------------------------------------------------------
 # Indexes (unchanged, still valid)
@@ -370,6 +460,7 @@ Index('uq_inventory_levels_item_location',
 Index('uq_catalog_snapshots_upload_variant',
       CatalogSnapshot.csv_upload_id, CatalogSnapshot.variant_id,
       unique=True)
+Index('ix_bundle_recommendations_shop', BundleRecommendation.shop_id)
 
 # -------------------------------------------------------------------
 # DI + init helpers

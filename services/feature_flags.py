@@ -43,7 +43,7 @@ class FeatureFlagsManager:
             "phase.weighted_ranking": True,
             "phase.deduplication": True,
             "phase.explainability": True,
-            
+
             # Advanced features (PR implementations)
             "advanced.pareto_optimization": True,
             "advanced.constraint_management": True,
@@ -51,7 +51,22 @@ class FeatureFlagsManager:
             "advanced.normalized_ranking": True,
             "advanced.cold_start_coverage": True,
             "advanced.metadata_similarity": True,
-            
+
+            # Data mapping controls
+            "data_mapping.auto_reenrich_on_csv": True,
+            "data_mapping.reset_cache_on_new_data": True,
+            "data_mapping.unresolved_cache_ttl_seconds": 600,
+            "data_mapping.enable_run_scope_fallback": True,
+
+            # Bundling threshold + fallback tuning
+            "bundling.relaxed_thresholds": True,
+            "bundling.relaxed_min_support": 0.02,
+            "bundling.relaxed_min_confidence": 0.18,
+            "bundling.relaxed_min_lift": 1.1,
+            "bundling.max_per_bundle_type": 15,
+            "bundling.fallback_force_top_pairs": True,
+            "bundling.fallback_force_pair_limit": 12,
+
             # Analytics and insights
             "analytics.insights_engine": True,
             "analytics.predictive_models": True,

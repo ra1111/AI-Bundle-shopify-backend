@@ -5,33 +5,44 @@ Handles dashboard statistics and analytics
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, distinct
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import logging
 
 from database import (
     get_db, Bundle, BundleRecommendation, AssociationRule, 
-    Order, Product
+    Order, Product, CsvUpload
 )
+from settings import resolve_shop_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.get("/dashboard-stats")
-async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
+async def get_dashboard_stats(
+    shopId: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Get dashboard KPI statistics"""
     try:
+        shop_id = resolve_shop_id(shopId)
+
         # Get bundles
         bundles_query = select(Bundle)
         bundles_result = await db.execute(bundles_query)
         bundles = bundles_result.scalars().all()
         
         # Get recommendations
-        recommendations_query = select(BundleRecommendation)
+        recommendations_query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)
         recommendations_result = await db.execute(recommendations_query)
         recommendations = recommendations_result.scalars().all()
         
         # Get orders (limit to recent 1000)
-        orders_query = select(Order).limit(1000)
+        orders_query = (
+            select(Order)
+            .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
+            .where(CsvUpload.shop_id == shop_id)
+            .limit(1000)
+        )
         orders_result = await db.execute(orders_query)
         orders = orders_result.scalars().all()
         
@@ -82,16 +93,27 @@ async def get_dashboard_stats(db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to get dashboard stats")
 
 @router.get("/analytics")
-async def get_analytics(db: AsyncSession = Depends(get_db)):
+async def get_analytics(
+    shopId: Optional[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
     """Get analytics data for charts"""
     try:
+        shop_id = resolve_shop_id(shopId)
+
         # Get recommendations for bundle performance
-        recommendations_query = select(BundleRecommendation)
+        recommendations_query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)
         recommendations_result = await db.execute(recommendations_query)
         recommendations = recommendations_result.scalars().all()
         
         # Get association rules for co-purchase analysis
-        rules_query = select(AssociationRule).order_by(AssociationRule.lift.desc()).limit(5)
+        rules_query = (
+            select(AssociationRule)
+            .join(CsvUpload, AssociationRule.csv_upload_id == CsvUpload.id)
+            .where(CsvUpload.shop_id == shop_id)
+            .order_by(AssociationRule.lift.desc())
+            .limit(5)
+        )
         rules_result = await db.execute(rules_query)
         rules = rules_result.scalars().all()
         

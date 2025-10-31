@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import AsyncSession, AsyncConnection
 from sqlalchemy import text, update, select
 from database import AsyncSessionLocal, CsvUpload, engine
+from settings import resolve_shop_id
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +49,7 @@ class ConcurrencyController:
                 select(CsvUpload.shop_id).where(CsvUpload.id == csv_upload_id)
             )
             shop_id = result.scalar()
-            return shop_id
+            return resolve_shop_id(shop_id)
         except Exception as e:
             logger.error(f"Failed to get shop_id for CSV upload {csv_upload_id}: {e}")
             return None
