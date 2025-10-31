@@ -307,8 +307,8 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             except Exception as e:
                 # Bundle generation failed - update status atomically
                 generation_time = time.time() - start_time
-                logger.error(f"Bundle generation failed for shop {shop_id} after {generation_time:.2f}s: {e}")
-                
+                logger.exception(f"Bundle generation failed for shop {shop_id} after {generation_time:.2f}s: {e}")
+
                 # Log additional details if this was a timeout or infinite loop issue
                 if "timeout" in str(e).lower() or generation_time > 300:
                     logger.error(f"CRITICAL: Bundle generation appears to have hit infinite loop or timeout issue")
@@ -390,7 +390,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
         
     except Exception as e:
         generation_time = time.time() - start_time
-        logger.error(f"Unexpected error in bundle generation after {generation_time:.2f}s: {e}")
+        logger.exception(f"Unexpected error in bundle generation after {generation_time:.2f}s: {e}")
         
         # Update status without lock in case of unexpected errors
         await concurrency_controller.atomic_status_update_with_precondition(

@@ -70,7 +70,7 @@ async def update_generation_progress(
         )
 
         stmt = stmt.on_conflict_do_update(
-            index_elements=[GenerationProgress.upload_id],
+            index_elements=["upload_id"],
             set_={
                 "shop_domain": shop_domain,
                 "step": step,
