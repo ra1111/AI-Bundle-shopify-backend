@@ -28,6 +28,7 @@ from services.ml.fallback_ladder import FallbackLadder
 # Import observability and feature flag systems (PR-8)
 from services.obs.metrics import metrics_collector
 from services.feature_flags import feature_flags
+from services.progress_tracker import update_generation_progress
 
 logger = logging.getLogger(__name__)
 
@@ -307,9 +308,20 @@ class BundleGenerator:
         """Generate bundle recommendations using comprehensive v2 pipeline"""
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
-        logger.info(f"Starting v2 bundle generation for upload: {csv_upload_id}")
+
+        await update_generation_progress(
+            csv_upload_id,
+            step="enrichment",
+            progress=5,
+            status="in_progress",
+            message="Starting enrichment…",
+        )
+
+        pipeline_start = time.time()
+        logger.info(f"[{csv_upload_id}] ========== BUNDLE GENERATION PIPELINE STARTED ==========")
+        logger.info(f"[{csv_upload_id}] Configuration: timeout={self.max_time_budget_seconds}s max_attempts={self.max_total_attempts}")
         self._refresh_thresholds()
-        
+
         # Initialize loop prevention tracking
         self.seen_sku_combinations.clear()
         self.generation_stats = {
@@ -320,45 +332,112 @@ class BundleGenerator:
             'timeout_exits': 0,
             'early_exits': 0
         }
-        
-        # Initialize comprehensive metrics
+
+        # Initialize comprehensive metrics with timing
         metrics = {
             "v2_pipeline_enabled": self.enable_v2_pipeline,
-            "data_mapping": {"enabled": False, "metrics": {}},
-            "objective_scoring": {"enabled": False, "metrics": {}},
-            "ml_candidates": {"enabled": False, "metrics": {}},
-            "bayesian_pricing": {"enabled": False, "metrics": {}},
-            "weighted_ranking": {"enabled": False, "metrics": {}},
-            "deduplication": {"enabled": False, "metrics": {}},
-            "explainability": {"enabled": False, "metrics": {}},
+            "data_mapping": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "objective_scoring": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "ml_candidates": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "bayesian_pricing": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "weighted_ranking": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "deduplication": {"enabled": False, "metrics": {}, "duration_ms": 0},
+            "explainability": {"enabled": False, "metrics": {}, "duration_ms": 0},
             "bundle_counts": {"FBT": 0, "VOLUME_DISCOUNT": 0, "MIX_MATCH": 0, "BXGY": 0, "FIXED": 0},
             "total_recommendations": 0,
             "processing_time_ms": 0,
-            "loop_prevention_stats": self.generation_stats
+            "loop_prevention_stats": self.generation_stats,
+            "phase_timings": {}
         }
-        
+
         start_time = datetime.now()
-        
+
         # Set hard timeout
         end_time = start_time + timedelta(seconds=self.max_time_budget_seconds)
-        
+
         try:
             # Phase 1: Data Mapping and Enrichment
             if self.enable_data_mapping and csv_upload_id:
-                logger.info("Phase 1: Data mapping and enrichment")
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 1: Data Mapping & Enrichment - STARTED")
                 data_mapping_result = await self.data_mapper.enrich_order_lines_with_variants(csv_upload_id)
-                metrics["data_mapping"] = {"enabled": True, "metrics": data_mapping_result.get("metrics", {})}
+                phase_duration = int((time.time() - phase_start) * 1000)
+                enrichment_metrics = data_mapping_result.get("metrics", {})
+                logger.info(f"[{csv_upload_id}] Phase 1: Data Mapping & Enrichment - COMPLETED in {phase_duration}ms | "
+                           f"total_lines={enrichment_metrics.get('total_order_lines', 0)} "
+                           f"resolved={enrichment_metrics.get('resolved_variants', 0)} "
+                           f"unresolved={enrichment_metrics.get('unresolved_skus', 0)}")
+                metrics["data_mapping"] = {"enabled": True, "metrics": enrichment_metrics, "duration_ms": phase_duration}
+                metrics["phase_timings"]["phase_1_data_mapping"] = phase_duration
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="enrichment",
+                    progress=25,
+                    status="in_progress",
+                    message=(
+                        "Enrichment complete – "
+                        f"{enrichment_metrics.get('resolved_variants', 0)} variants resolved."
+                    ),
+                )
+            else:
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="enrichment",
+                    progress=25,
+                    status="in_progress",
+                    message="Enrichment skipped (disabled).",
+                )
             
+            await update_generation_progress(
+                csv_upload_id,
+                step="scoring",
+                progress=30,
+                status="in_progress",
+                message="Scoring objectives…",
+            )
+
             # Phase 2: Objective Scoring
             if self.enable_objective_scoring and csv_upload_id:
-                logger.info("Phase 2: Objective scoring")
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 2: Objective Scoring - STARTED")
                 objective_result = await self.objective_scorer.compute_objective_flags(csv_upload_id)
-                metrics["objective_scoring"] = {"enabled": True, "metrics": objective_result.get("metrics", {})}
+                phase_duration = int((time.time() - phase_start) * 1000)
+                objective_metrics = objective_result.get("metrics", {})
+                logger.info(f"[{csv_upload_id}] Phase 2: Objective Scoring - COMPLETED in {phase_duration}ms | "
+                           f"products_scored={objective_metrics.get('products_scored', 0)} "
+                           f"objectives_computed={len(self.objectives)}")
+                metrics["objective_scoring"] = {"enabled": True, "metrics": objective_metrics, "duration_ms": phase_duration}
+                metrics["phase_timings"]["phase_2_objective_scoring"] = phase_duration
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="scoring",
+                    progress=45,
+                    status="in_progress",
+                    message="Objective scoring complete.",
+                )
+            else:
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="scoring",
+                    progress=45,
+                    status="in_progress",
+                    message="Objective scoring skipped (disabled).",
+                )
             
+            await update_generation_progress(
+                csv_upload_id,
+                step="ml_generation",
+                progress=50,
+                status="in_progress",
+                message="Generating ML candidates…",
+            )
+
             # Phase 3: Generate candidates for each objective with loop prevention
+            phase3_start = time.time()
+            logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - STARTED | objectives={len(self.objectives)} bundle_types={len(self.bundle_types)}")
             all_recommendations = []
             objectives_processed = 0
-            
+
             for objective_name, objective_config in self.objectives.items():
                 # Check time budget
                 if datetime.now() >= end_time:
@@ -400,33 +479,67 @@ class BundleGenerator:
                         logger.info(f"Progress: {len(all_recommendations)} recommendations, {self.generation_stats['total_attempts']} attempts")
                 
                 objectives_processed += 1
-                
+
                 # Persist partial results periodically
                 if len(all_recommendations) >= 20 and len(all_recommendations) % 20 == 0:
-                    logger.info(f"Persisting {len(all_recommendations)} partial results")
+                    logger.info(f"[{csv_upload_id}] Persisting {len(all_recommendations)} partial results")
                     try:
                         await self.store_partial_recommendations(all_recommendations, csv_upload_id)
                     except Exception as e:
-                        logger.warning(f"Failed to persist partial results: {e}")
-            
+                        logger.warning(f"[{csv_upload_id}] Failed to persist partial results: {e}")
+
+            phase3_duration = int((time.time() - phase3_start) * 1000)
+            logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
+                       f"candidates_generated={len(all_recommendations)} "
+                       f"objectives_processed={objectives_processed} "
+                       f"attempts={self.generation_stats['total_attempts']} "
+                       f"successes={self.generation_stats['successful_generations']} "
+                       f"duplicates_skipped={self.generation_stats['skipped_duplicates']}")
+            metrics["ml_candidates"] = {"enabled": True, "duration_ms": phase3_duration,
+                                        "candidates_generated": len(all_recommendations)}
+            metrics["phase_timings"]["phase_3_ml_candidates"] = phase3_duration
+            candidate_count = len(all_recommendations)
+            await update_generation_progress(
+                csv_upload_id,
+                step="ml_generation",
+                progress=70,
+                status="in_progress",
+                message=f"ML candidate generation complete – {candidate_count} candidates ready.",
+                bundle_count=candidate_count if candidate_count else None,
+            )
+            await update_generation_progress(
+                csv_upload_id,
+                step="optimization",
+                progress=75,
+                status="in_progress",
+                message="Optimizing bundle candidates…",
+            )
+
             # Phase 4: Deduplication
             if self.enable_deduplication and all_recommendations:
-                logger.info("Phase 4: Deduplication")
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 4: Deduplication - STARTED | input_candidates={len(all_recommendations)}")
                 dedupe_result = await self.deduplicator.deduplicate_candidates(all_recommendations, csv_upload_id)
                 all_recommendations = dedupe_result.get("unique_candidates", all_recommendations)
-                metrics["deduplication"] = {"enabled": True, "metrics": dedupe_result.get("metrics", {})}
+                phase_duration = int((time.time() - phase_start) * 1000)
+                dedupe_metrics = dedupe_result.get("metrics", {})
+                logger.info(f"[{csv_upload_id}] Phase 4: Deduplication - COMPLETED in {phase_duration}ms | "
+                           f"unique_candidates={len(all_recommendations)} "
+                           f"duplicates_removed={dedupe_metrics.get('duplicates_removed', 0)}")
+                metrics["deduplication"] = {"enabled": True, "metrics": dedupe_metrics, "duration_ms": phase_duration}
+                metrics["phase_timings"]["phase_4_deduplication"] = phase_duration
             
-            # Phase 5: Global Enterprise Optimization (across all bundle types)
+            # Phase 5a: Global Enterprise Optimization (across all bundle types)
             if self.enable_enterprise_optimization and all_recommendations and len(all_recommendations) > 10:
-                logger.info("Phase 5: Global enterprise optimization across all bundle types")
-                optimization_start_time = time.time()
-                
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 5a: Enterprise Optimization - STARTED | input_bundles={len(all_recommendations)}")
+
                 try:
                     # Run global optimization for portfolio-level optimization
                     global_constraints = await self.constraint_manager.get_constraints_for_objective(
                         "increase_aov", csv_upload_id  # Use default objective for global optimization
                     ) if self.enable_constraint_management else []
-                    
+
                     global_optimization_result = await self.optimization_engine.optimize_bundle_portfolio(
                         all_recommendations,
                         [OptimizationObjective.MAXIMIZE_REVENUE, OptimizationObjective.MAXIMIZE_MARGIN],
@@ -434,77 +547,129 @@ class BundleGenerator:
                         csv_upload_id,
                         "pareto" if self.enable_pareto_optimization else "weighted_sum"
                     )
-                    
+
                     if global_optimization_result.get("optimization_successful", False):
                         pareto_solutions = global_optimization_result.get("pareto_solutions", [])
                         if pareto_solutions:
                             all_recommendations = pareto_solutions
-                            logger.info(f"Global optimization: {len(all_recommendations)} portfolio-optimal solutions")
-                    
+
+                    phase_duration = int((time.time() - phase_start) * 1000)
+                    logger.info(f"[{csv_upload_id}] Phase 5a: Enterprise Optimization - COMPLETED in {phase_duration}ms | "
+                               f"output_bundles={len(all_recommendations)} "
+                               f"constraints_applied={len(global_constraints)}")
+
                     metrics["global_enterprise_optimization"] = {
                         "enabled": True,
                         "input_recommendations": len(all_recommendations),
                         "pareto_solutions": len(all_recommendations),
-                        "processing_time": (time.time() - optimization_start_time) * 1000,
+                        "duration_ms": phase_duration,
                         "global_optimization_metrics": global_optimization_result.get("metrics", {})
                     }
-                    
+                    metrics["phase_timings"]["phase_5a_optimization"] = phase_duration
+
                 except Exception as e:
-                    logger.warning(f"Global enterprise optimization failed: {e}")
-                    metrics["global_enterprise_optimization"] = {"enabled": True, "error": str(e)}
+                    phase_duration = int((time.time() - phase_start) * 1000)
+                    logger.warning(f"[{csv_upload_id}] Phase 5a: Enterprise Optimization - FAILED in {phase_duration}ms | error={str(e)}")
+                    metrics["global_enterprise_optimization"] = {"enabled": True, "error": str(e), "duration_ms": phase_duration}
             
             # Phase 5b: Weighted Ranking (fallback or when enterprise optimization disabled)
             elif self.enable_weighted_ranking and all_recommendations:
-                logger.info("Phase 5b: Weighted ranking (fallback)")
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 5b: Weighted Ranking - STARTED (fallback) | bundles={len(all_recommendations)}")
                 # Rank all recommendations together for global optimization
                 ranked_recommendations = await self.ranker.rank_bundle_recommendations(
                     all_recommendations, "increase_aov", csv_upload_id  # Use default objective for global ranking
                 )
                 all_recommendations = ranked_recommendations
-                metrics["weighted_ranking"] = {"enabled": True}
-            
+                phase_duration = int((time.time() - phase_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 5b: Weighted Ranking - COMPLETED in {phase_duration}ms")
+                metrics["weighted_ranking"] = {"enabled": True, "duration_ms": phase_duration}
+                metrics["phase_timings"]["phase_5b_ranking"] = phase_duration
+
             else:
                 metrics["global_enterprise_optimization"] = {"enabled": False}
                 metrics["weighted_ranking"] = {"enabled": False}
-            
+
             # Phase 5c: Ensure minimum pair coverage via forced fallbacks
+            phase_start = time.time()
+            bundles_before = len(all_recommendations)
             all_recommendations = await self._apply_forced_pair_fallbacks(all_recommendations, csv_upload_id)
+            injected = len(all_recommendations) - bundles_before
+            if injected > 0:
+                phase_duration = int((time.time() - phase_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 5c: Fallback Injection - COMPLETED in {phase_duration}ms | injected={injected}")
+                metrics["phase_timings"]["phase_5c_fallback"] = phase_duration
 
             # Phase 6: Explainability
             if self.enable_explainability and all_recommendations:
-                logger.info("Phase 6: Adding explanations")
+                phase_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 6: Explainability - STARTED | bundles={len(all_recommendations)}")
                 for recommendation in all_recommendations:
                     explanation = self.explainer.generate_explanation(recommendation)
                     recommendation["explanation"] = explanation
-                    
+
                     if self.enable_explainability:
                         detailed_explanation = self.explainer.generate_detailed_explanation(recommendation)
                         recommendation["detailed_explanation"] = detailed_explanation
-                
-                metrics["explainability"] = {"enabled": True}
+
+                phase_duration = int((time.time() - phase_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 6: Explainability - COMPLETED in {phase_duration}ms")
+                metrics["explainability"] = {"enabled": True, "duration_ms": phase_duration}
+                metrics["phase_timings"]["phase_6_explainability"] = phase_duration
             
-            # Phase 7: Finalization and storage
+            await update_generation_progress(
+                csv_upload_id,
+                step="optimization",
+                progress=85,
+                status="in_progress",
+                message="Optimization complete. Preparing AI descriptions…",
+            )
+
+            # Phase 7: Pricing (part of finalization)
+            pricing_start = time.time()
+            logger.info(f"[{csv_upload_id}] Phase 7: Pricing & Finalization - STARTED | bundles={len(all_recommendations)}")
+
+            # Phase 8: AI Copy Generation & Phase 9: Storage happen in finalize_recommendations
             final_recommendations = await self.finalize_recommendations(all_recommendations, csv_upload_id, metrics)
+
+            finalization_duration = int((time.time() - pricing_start) * 1000)
+            logger.info(f"[{csv_upload_id}] Phase 7-9: Pricing, AI Copy & Storage - COMPLETED in {finalization_duration}ms")
+            metrics["phase_timings"]["phase_7_9_finalization"] = finalization_duration
             
             # Update metrics
             metrics["total_recommendations"] = len(final_recommendations)
-            processing_time = (datetime.now() - start_time).total_seconds() * 1000
-            metrics["processing_time_ms"] = int(processing_time)
-            
+            total_pipeline_duration = int((time.time() - pipeline_start) * 1000)
+            metrics["processing_time_ms"] = total_pipeline_duration
+
             # Add loop prevention statistics to metrics
             metrics["loop_prevention_stats"] = self.generation_stats.copy()
-            
-            # Log final statistics
-            logger.info(f"Bundle generation completed. Stats: {self.generation_stats}")
-            logger.info(f"Processed {len(self.seen_sku_combinations)} unique SKU combinations")
-            
+
             # Count by bundle type
             for rec in final_recommendations:
                 bundle_type = rec.get("bundle_type", "UNKNOWN")
                 if bundle_type in metrics["bundle_counts"]:
                     metrics["bundle_counts"][bundle_type] += 1
-            
-            logger.info(f"v2 Bundle generation completed: {len(final_recommendations)} recommendations in {processing_time:.1f}ms. Stats: {self.generation_stats}")
+
+            # Log final comprehensive summary
+            logger.info(f"[{csv_upload_id}] ========== BUNDLE GENERATION PIPELINE COMPLETED ==========")
+            logger.info(f"[{csv_upload_id}] Total Duration: {total_pipeline_duration}ms ({total_pipeline_duration/1000:.1f}s)")
+            logger.info(f"[{csv_upload_id}] Bundles Generated: {len(final_recommendations)} total")
+            logger.info(f"[{csv_upload_id}] Bundle Types: FBT={metrics['bundle_counts']['FBT']} "
+                       f"VOLUME={metrics['bundle_counts']['VOLUME_DISCOUNT']} "
+                       f"MIX_MATCH={metrics['bundle_counts']['MIX_MATCH']} "
+                       f"BXGY={metrics['bundle_counts']['BXGY']} "
+                       f"FIXED={metrics['bundle_counts']['FIXED']}")
+            logger.info(f"[{csv_upload_id}] Generation Stats: attempts={self.generation_stats['total_attempts']} "
+                       f"successes={self.generation_stats['successful_generations']} "
+                       f"duplicates_skipped={self.generation_stats['skipped_duplicates']} "
+                       f"failures={self.generation_stats['failed_attempts']}")
+            logger.info(f"[{csv_upload_id}] Unique SKU Combinations Processed: {len(self.seen_sku_combinations)}")
+
+            # Log phase breakdown
+            logger.info(f"[{csv_upload_id}] Phase Timing Breakdown:")
+            for phase_name, duration in sorted(metrics["phase_timings"].items()):
+                percentage = (duration / total_pipeline_duration * 100) if total_pipeline_duration > 0 else 0
+                logger.info(f"[{csv_upload_id}]   - {phase_name}: {duration}ms ({percentage:.1f}%)")
             
             return {
                 "recommendations": final_recommendations,
@@ -515,6 +680,13 @@ class BundleGenerator:
             
         except Exception as e:
             logger.error(f"Error in v2 bundle generation: {e}")
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=100,
+                status="failed",
+                message=f"Bundle generation failed: {e}",
+            )
             # Fallback to v1 pipeline if v2 fails
             if self.enable_v2_pipeline:
                 logger.info("Falling back to v1 pipeline due to v2 error")
@@ -707,7 +879,6 @@ class BundleGenerator:
                 if end_time and datetime.now() >= end_time:
                     logger.warning(f"Time budget exceeded during candidate processing for {objective_type_key}")
                     break
-            
             # Phase 4: Enterprise Optimization (PR-4)
             if (self.enable_enterprise_optimization and recommendations and
                     len(recommendations) >= self.min_candidates_for_optimization):
@@ -857,6 +1028,16 @@ class BundleGenerator:
                     pair_usage[pair_key] += 1
                     final_recommendations.append(rec)
             
+            bundle_total = len(final_recommendations)
+            await update_generation_progress(
+                csv_upload_id,
+                step="ai_descriptions",
+                progress=90,
+                status="in_progress",
+                message="Generating AI descriptions…" if bundle_total else "No bundles to describe.",
+                bundle_count=bundle_total if bundle_total else None,
+            )
+            
             # Add AI-generated copy if available
             if final_recommendations:
                 for rec in final_recommendations[:10]:  # Limit AI copy generation for cost
@@ -866,15 +1047,49 @@ class BundleGenerator:
                     except Exception as e:
                         logger.warning(f"Error generating AI copy: {e}")
                         rec["ai_copy"] = {"title": "Bundle Deal", "description": "Great products bundled together"}
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ai_descriptions",
+                    progress=92,
+                    status="in_progress",
+                    message="AI descriptions ready.",
+                    bundle_count=bundle_total,
+                )
             
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=95,
+                status="in_progress",
+                message="Finalizing bundle recommendations…",
+                bundle_count=bundle_total if bundle_total else None,
+            )
+
             # Store recommendations in database
             if final_recommendations and csv_upload_id:
                 await self.store_recommendations(final_recommendations, csv_upload_id)
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=100,
+                status="completed",
+                message="Bundle generation complete.",
+                bundle_count=bundle_total if bundle_total else None,
+                time_remaining=0,
+            )
             
             return final_recommendations
             
         except Exception as e:
             logger.error(f"Error finalizing recommendations: {e}")
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=100,
+                status="failed",
+                message=f"Finalization error: {e}",
+            )
             return recommendations  # Return original recommendations if finalization fails
     
     async def store_partial_recommendations(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> None:

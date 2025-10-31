@@ -27,6 +27,7 @@ from routers import (
     analytics,
     export,
     shopify_upload,
+    generation_progress,
 )
 
 from database import init_db
@@ -170,6 +171,7 @@ app.include_router(bundle_recommendations.router, prefix="/api", tags=["bundle-r
 app.include_router(bundles.router, prefix="/api", tags=["bundles"])
 app.include_router(analytics.router, prefix="/api", tags=["analytics"])
 app.include_router(export.router, prefix="/api", tags=["export"])
+app.include_router(generation_progress.router, prefix="/api", tags=["generation-progress"])
 app.include_router(shopify_upload.router)
 app.include_router(admin_router, prefix="/api", tags=["admin"])
 

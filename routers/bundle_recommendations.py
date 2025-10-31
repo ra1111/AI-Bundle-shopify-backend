@@ -11,6 +11,7 @@ from datetime import datetime
 
 from database import get_db, BundleRecommendation
 from services.bundle_generator import BundleGenerator
+from services.progress_tracker import update_generation_progress
 from routers.uploads import _resolve_orders_upload, _ensure_data_ready
 from settings import resolve_shop_id
 
@@ -210,6 +211,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                         "csv_upload_id": csv_upload_id
                     }
                     
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="finalization",
+                        progress=100,
+                        status="failed",
+                        message="Bundle generation timed out after 6 minutes.",
+                    )
+                    
                     # Try to get any partial results that might have been persisted
                     try:
                         from database import get_db
@@ -310,6 +319,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                 
                 if not failure_update["success"]:
                     logger.error(f"Failed to update failure status: {failure_update['error']}")
+
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=100,
+                    status="failed",
+                    message=f"Bundle generation failed: {e}",
+                )
                 
                 raise
             
@@ -323,6 +340,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             "bundle_generation_failed",
             additional_fields={"error_message": f"Process timeout after 6 minutes: {str(e)}"}
         )
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="failed",
+            message=f"Process timeout after 6 minutes: {e}",
+        )
         return
         
     except TimeoutError as e:
@@ -333,6 +357,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             "bundle_generation_failed",
             additional_fields={"error_message": f"Lock timeout: {str(e)}"}
         )
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="failed",
+            message=f"Lock timeout: {e}",
+        )
         return
         
     except ValueError as e:
@@ -341,6 +372,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             csv_upload_id, 
             "bundle_generation_failed",
             additional_fields={"error_message": f"Invalid CSV upload: {str(e)}"}
+        )
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="failed",
+            message=f"Invalid CSV upload: {e}",
         )
         return
         
@@ -353,5 +391,12 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             csv_upload_id, 
             "bundle_generation_failed",
             additional_fields={"error_message": f"Unexpected error: {str(e)}"}
+        )
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="failed",
+            message=f"Unexpected error: {e}",
         )
         raise

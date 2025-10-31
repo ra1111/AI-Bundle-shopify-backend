@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy import (
     String, Text, Integer, Numeric, DateTime, Boolean,
-    ForeignKey, func, Index, event
+    ForeignKey, func, Index, event, CheckConstraint
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.pool import StaticPool
@@ -213,6 +213,32 @@ class CsvUpload(Base):
     order_lines = relationship("OrderLine", back_populates="csv_upload")
     association_rules = relationship("AssociationRule", back_populates="csv_upload")
     bundle_recommendations = relationship("BundleRecommendation", back_populates="csv_upload")
+
+
+class GenerationProgress(Base):
+    __tablename__ = "generation_progress"
+
+    upload_id: Mapped[str] = mapped_column(String, primary_key=True)
+    shop_domain: Mapped[str] = mapped_column(Text, nullable=False)
+    step: Mapped[str] = mapped_column(Text, nullable=False)
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column("metadata", JSONB, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("progress BETWEEN 0 AND 100", name="ck_generation_progress_range"),
+        CheckConstraint(
+            "status IN ('in_progress','completed','failed')",
+            name="ck_generation_progress_status",
+        ),
+    )
 
 
 class Order(Base):

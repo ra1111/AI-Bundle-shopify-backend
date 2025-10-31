@@ -160,7 +160,8 @@ class CSVProcessor:
         try:
             t0 = time.time()
             run_id = await storage.get_run_id_for_upload(upload_id)
-            logger.info(f"CSV: start upload_id={upload_id} run_id={run_id} type_hint={csv_type}")
+            logger.info(f"[{upload_id}] ========== CSV PROCESSING STARTED ==========")
+            logger.info(f"[{upload_id}] run_id={run_id} type_hint={csv_type}")
 
             # Parse CSV
             csv_reader = csv.DictReader(io.StringIO(csv_content))
@@ -243,7 +244,8 @@ class CSVProcessor:
                 "processed_rows": len(rows)
             })
             dur_ms = int((time.time() - t0) * 1000)
-            logger.info(f"CSV: completed upload_id={upload_id} run_id={run_id} rows={len(rows)} durMs={dur_ms}")
+            logger.info(f"[{upload_id}] ========== CSV PROCESSING COMPLETED ==========")
+            logger.info(f"[{upload_id}] Type: {csv_type} | Rows: {len(rows)} | Duration: {dur_ms}ms ({dur_ms/1000:.1f}s)")
 
         except Exception as e:
             logger.error(f"CSV: error upload_id={upload_id}: {e}")
