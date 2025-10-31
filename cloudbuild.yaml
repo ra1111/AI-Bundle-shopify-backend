@@ -39,8 +39,9 @@ steps:
         "--cpu", "2",
         "--timeout", "300",
         "--max-instances", "10",
+        "--clear-cloudsql-instances",
         "--set-env-vars", "OPENBLAS_CORETYPE=HASWELL,GEMINI_BG_MODEL=gemini-2.0-flash-image",
-        "--set-secrets", "GEMINI_API_KEY=GEMINI_API_KEY:latest"
+        "--set-secrets", "DATABASE_URL=DATABASE_URL:latest,GEMINI_API_KEY=GEMINI_API_KEY:latest,OPENAI_API_KEY=OPENAI_API_KEY:latest"
       ]
 
 images:

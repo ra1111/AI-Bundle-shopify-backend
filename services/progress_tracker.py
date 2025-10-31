@@ -8,7 +8,7 @@ from typing import Literal, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import func, select
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import ProgrammingError, DBAPIError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import AsyncSessionLocal, CsvUpload, GenerationProgress
@@ -58,60 +58,112 @@ async def update_generation_progress(
     }
 
     async with AsyncSessionLocal() as session:
-        shop_domain = await _resolve_shop_domain(session, upload_id_str)
-
-        progress_table = GenerationProgress.__table__
-
-        stmt = (
-            pg_insert(progress_table)
-            .values(
-                upload_id=upload_id_str,
-                shop_domain=shop_domain,
-                step=step,
-                progress=safe_progress,
-                status=status,
-                message=message,
-                metadata=metadata_payload or None,
-            )
-        )
-
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[progress_table.c.upload_id],
-            set_={
-                progress_table.c.shop_domain: shop_domain,
-                progress_table.c.step: step,
-                progress_table.c.progress: safe_progress,
-                progress_table.c.status: status,
-                progress_table.c.message: message,
-                progress_table.c.metadata: metadata_payload or None,
-                progress_table.c.updated_at: func.now(),
-            },
-        )
-
         try:
-            await session.execute(stmt)
-        except ProgrammingError as exc:
-            if "generation_progress" in str(exc):
-                logger.warning(
-                    "generation_progress table missing; attempting to create it on the fly"
-                )
+            shop_domain = await _resolve_shop_domain(session, upload_id_str)
 
-                async def _create_table(sync_session):
-                    GenerationProgress.__table__.create(
-                        bind=sync_session.bind, checkfirst=True
+            progress_table = GenerationProgress.__table__
+
+            stmt = (
+                pg_insert(progress_table)
+                .values(
+                    upload_id=upload_id_str,
+                    shop_domain=shop_domain,
+                    step=step,
+                    progress=safe_progress,
+                    status=status,
+                    message=message,
+                    metadata=metadata_payload or None,
+                )
+            )
+
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[progress_table.c.upload_id],
+                set_={
+                    progress_table.c.shop_domain: shop_domain,
+                    progress_table.c.step: step,
+                    progress_table.c.progress: safe_progress,
+                    progress_table.c.status: status,
+                    progress_table.c.message: message,
+                    progress_table.c.metadata: metadata_payload or None,
+                    progress_table.c.updated_at: func.now(),
+                },
+            )
+
+            try:
+                await session.execute(stmt)
+            except ProgrammingError as exc:
+                if "generation_progress" in str(exc):
+                    logger.warning(
+                        "generation_progress table missing; attempting to create it on the fly"
                     )
 
-                await session.run_sync(_create_table)
-                await session.execute(stmt)
+                    await session.rollback()
+
+                    async def _create_table(sync_session):
+                        GenerationProgress.__table__.create(
+                            bind=sync_session.bind, checkfirst=True
+                        )
+
+                    try:
+                        async with session.begin():
+                            await session.run_sync(_create_table)
+                    except ProgrammingError:
+                        # If another worker created the table in the meantime, ignore the error.
+                        await session.rollback()
+
+                    await session.execute(stmt)
+                else:
+                    raise
+
+            await session.commit()
+
+            logger.info(
+                "Progress updated for upload %s step=%s progress=%s status=%s",
+                upload_id_str,
+                step,
+                safe_progress,
+                status,
+            )
+
+        except DBAPIError as exc:
+            # Handle transaction abort errors gracefully
+            if "InFailedSQLTransactionError" in str(exc) or "transaction is aborted" in str(exc):
+                logger.warning(
+                    "Transaction aborted while updating progress for upload %s - attempting rollback and retry",
+                    upload_id_str
+                )
+                await session.rollback()
+
+                # Retry once with a fresh transaction
+                try:
+                    await session.execute(stmt)
+                    await session.commit()
+                    logger.info(
+                        "Progress updated (retry) for upload %s step=%s progress=%s status=%s",
+                        upload_id_str,
+                        step,
+                        safe_progress,
+                        status,
+                    )
+                except Exception as retry_exc:
+                    logger.error(
+                        "Failed to update progress even after retry for upload %s: %s",
+                        upload_id_str,
+                        retry_exc
+                    )
+                    # Don't re-raise - progress tracking should not crash the main workflow
             else:
-                raise
+                # For other database errors, log but don't crash
+                logger.error(
+                    "Database error updating progress for upload %s: %s",
+                    upload_id_str,
+                    exc
+                )
 
-        await session.commit()
-
-        logger.info(
-            "Progress updated for upload %s step=%s progress=%s status=%s",
-            upload_id_str,
-            step,
-            safe_progress,
-            status,
-        )
+        except Exception as exc:
+            # Catch-all for any other errors - log but don't crash
+            logger.error(
+                "Unexpected error updating progress for upload %s: %s",
+                upload_id_str,
+                exc
+            )
