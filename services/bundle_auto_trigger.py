@@ -129,6 +129,12 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
                 )
             return
 
+    # All required CSVs are ready!
+    logger.info(
+        "Auto-bundle: ✓ ALL REQUIRED CSV TYPES READY for run %s - proceeding to bundle generation",
+        run_id,
+    )
+
     orders_upload = latest_by_type["orders"]
     orders_upload_id = getattr(orders_upload, "id", None)
     orders_status = getattr(orders_upload, "status", "")
@@ -205,6 +211,12 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
             _pending_runs.discard(upload_id)
 
     asyncio.create_task(_run_generation(orders_upload_id))
+
+    logger.info(
+        "Auto-bundle: ✓ BACKGROUND TASK CREATED for orders upload %s (run %s) - bundle generation will start shortly",
+        orders_upload_id,
+        run_id,
+    )
 
 
 __all__ = ["maybe_trigger_bundle_generation"]

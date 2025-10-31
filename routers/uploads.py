@@ -92,6 +92,11 @@ async def upload_csv(
         effective_run_id = (runId or str(uuid.uuid4())).strip()
         resolved_shop_id = resolve_shop_id(shopId, shopDomain)
 
+        if runId:
+            logger.info(f"[{request_id}] Using provided runId={effective_run_id}")
+        else:
+            logger.warning(f"[{request_id}] ⚠️ No runId provided - generated new runId={effective_run_id} (CSVs won't be grouped!)")
+
         csv_upload = CsvUpload(
             id=upload_id,
             filename=file.filename,
@@ -105,7 +110,7 @@ async def upload_csv(
         )
         db.add(csv_upload)
         await db.commit()
-        logger.info(f"[{request_id}] Created CsvUpload id={upload_id}")
+        logger.info(f"[{request_id}] Created CsvUpload id={upload_id} run_id={effective_run_id} shop_id={resolved_shop_id} csv_type={normalized_type}")
 
         # hand off to background (use the normalized type exactly once)
         csv_content = content.decode('utf-8', errors="replace")
