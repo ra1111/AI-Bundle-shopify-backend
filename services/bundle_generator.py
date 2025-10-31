@@ -3,6 +3,7 @@ Bundle Generator Service v2
 Creates bundle recommendations using comprehensive v2 pipeline with enhanced features
 """
 from typing import List, Dict, Any, Optional
+import asyncio
 import logging
 import uuid
 from decimal import Decimal
