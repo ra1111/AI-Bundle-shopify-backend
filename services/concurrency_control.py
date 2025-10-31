@@ -80,13 +80,11 @@ class ConcurrencyController:
         
         for attempt in range(self.max_retries):
             try:
-                # Try to acquire lock (non-blocking) - with explicit commit to avoid idle transactions
+                # Try to acquire lock (non-blocking)
                 result = await conn.execute(
                     text("SELECT pg_try_advisory_lock(:lock_key)"),
                     {"lock_key": lock_key}
                 )
-                # Explicitly commit to prevent idle transaction state
-                await conn.commit()
                 acquired = result.scalar()
                 
                 if acquired:
@@ -126,8 +124,6 @@ class ConcurrencyController:
                 text("SELECT pg_advisory_unlock(:lock_key)"),
                 {"lock_key": lock_key}
             )
-            # Explicitly commit to prevent idle transaction state
-            await conn.commit()
             released = result.scalar()
             
             success = bool(released) if released is not None else False
@@ -169,15 +165,13 @@ class ConcurrencyController:
         lock_key = self._generate_lock_key(shop_id, operation)
         lock_identifier = f"{shop_id}:{operation}"
         
-        # Create dedicated raw connection for advisory lock with AUTOCOMMIT to prevent idle transactions
+        # Create dedicated raw connection for advisory lock
+        logger.info(f"Creating database connection for {operation} lock (shop: {shop_id}, csv_upload: {csv_upload_id})")
         conn = await engine.connect()
-        
+        logger.info(f"Database connection established, attempting to acquire {operation} lock (lock_key: {lock_key})")
+
         try:
-            # Set AUTOCOMMIT mode to eliminate idle transaction issues completely
-            # This prevents "idle in transaction" state that can block vacuum operations
-            conn = conn.execution_options(isolation_level="AUTOCOMMIT")
-            
-            # Acquire lock with exponential backoff using AUTOCOMMIT connection
+            # Acquire lock with exponential backoff
             acquired = await self._acquire_advisory_lock_with_backoff(conn, lock_key, shop_id, operation)
             
             if not acquired:
