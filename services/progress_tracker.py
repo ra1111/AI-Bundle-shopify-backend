@@ -59,26 +59,31 @@ async def update_generation_progress(
     async with AsyncSessionLocal() as session:
         shop_domain = await _resolve_shop_domain(session, upload_id_str)
 
-        stmt = pg_insert(GenerationProgress).values(
-            upload_id=upload_id_str,
-            shop_domain=shop_domain,
-            step=step,
-            progress=safe_progress,
-            status=status,
-            message=message,
-            metadata=metadata_payload or None,
+        progress_table = GenerationProgress.__table__
+
+        stmt = (
+            pg_insert(progress_table)
+            .values(
+                upload_id=upload_id_str,
+                shop_domain=shop_domain,
+                step=step,
+                progress=safe_progress,
+                status=status,
+                message=message,
+                metadata=metadata_payload or None,
+            )
         )
 
         stmt = stmt.on_conflict_do_update(
-            index_elements=["upload_id"],
+            index_elements=[progress_table.c.upload_id],
             set_={
-                "shop_domain": shop_domain,
-                "step": step,
-                "progress": safe_progress,
-                "status": status,
-                "message": message,
-                "metadata": metadata_payload or None,
-                "updated_at": func.now(),
+                progress_table.c.shop_domain: shop_domain,
+                progress_table.c.step: step,
+                progress_table.c.progress: safe_progress,
+                progress_table.c.status: status,
+                progress_table.c.message: message,
+                progress_table.c.metadata: metadata_payload or None,
+                progress_table.c.updated_at: func.now(),
             },
         )
 
