@@ -400,7 +400,17 @@ class BundleGenerator:
             if self.enable_objective_scoring and csv_upload_id:
                 phase_start = time.time()
                 logger.info(f"[{csv_upload_id}] Phase 2: Objective Scoring - STARTED")
-                objective_result = await self.objective_scorer.compute_objective_flags(csv_upload_id)
+
+                # Add timeout for objective scoring (60 seconds max)
+                try:
+                    objective_result = await asyncio.wait_for(
+                        self.objective_scorer.compute_objective_flags(csv_upload_id),
+                        timeout=60.0
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(f"[{csv_upload_id}] Phase 2: Objective Scoring TIMEOUT after 60s - continuing with empty flags")
+                    objective_result = {"metrics": {"timeout": True, "total_items": 0}, "updated_items": 0}
+
                 phase_duration = int((time.time() - phase_start) * 1000)
                 objective_metrics = objective_result.get("metrics", {})
                 logger.info(f"[{csv_upload_id}] Phase 2: Objective Scoring - COMPLETED in {phase_duration}ms | "
