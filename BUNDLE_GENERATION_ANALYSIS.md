@@ -12,6 +12,17 @@
 5. Frontend polls `GET /api/upload-status/{uploadId}` to check progress
 6. When CSV status = "completed", frontend shows "Sync Complete - Review Recommendations"
 
+### Polling Payloads (Auto-Trigger Flow)
+
+Once the auto-trigger kicks in, the frontend can rely on two polling endpoints:
+
+| Endpoint | Purpose | Example Payload | Notes |
+| --- | --- | --- | --- |
+| `GET /api/upload-status/{uploadId}` | High-level state of a CSV upload (and, implicitly, bundle generation) | ```json<br>{<br>  "id": "f042…d703",<br>  "csvType": "catalog_joined",<br>  "status": "bundle_generation_queued",<br>  "totalRows": 42,<br>  "processedRows": 42,<br>  "errorMessage": null<br>}``` | `status` transitions: `processing` → `completed` (CSV done) → `bundle_generation_queued` → `generating_bundles` → `bundle_generation_completed` or `bundle_generation_failed`. Any upload in the same run reflects the bundle status once orders begin generating. |
+| `GET /generation-progress/{uploadId}` | Detailed phase + progress bar copy | ```json<br>{<br>  "upload_id": "f042…d703",<br>  "step": "scoring",<br>  "progress": 45,<br>  "status": "in_progress",<br>  "message": "Objective scoring complete.",<br>  "metadata": { "bundle_count": 18 },<br>  "updated_at": "2025-10-31T11:41:40Z"<br>}``` | Steps emitted in chronological order: `queueing` (auto-trigger scheduled) → `enrichment` → `scoring` → `ml_generation` → `optimization` → `pricing` → `explainability` → `finalization`. Final responses return `status: "completed"` (or `"failed"`) with a closing message such as `"Bundle generation completed successfully."` |
+
+*Tip*: poll `/api/upload-status` every ~5s for headline status; when it reports `bundle_generation_queued` or later, start polling `/generation-progress` to paint the multi-step progress UI.
+
 **❌ THE GAP:**
 - After CSV upload completes, user clicks "Review Recommendations"
 - Frontend calls `POST /api/generate-bundles` with `{csvUploadId}`

@@ -163,6 +163,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
         return
     
     try:
+        logger.info(f"Bundle generation {scope}: attempting to acquire shop lock")
         # Use the new concurrency control system that locks by shop_id
         async with concurrency_controller.acquire_shop_lock_for_csv_upload(
             csv_upload_id, "bundle_generation"
@@ -173,6 +174,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
             logger.info(f"Acquired bundle generation lock for shop {shop_id} (CSV upload {csv_upload_id})")
             
             # Atomically update status with precondition check
+            logger.info(f"Bundle generation {scope}: updating CSV upload status to generating_bundles")
             status_update = await concurrency_controller.atomic_status_update_with_precondition(
                 csv_upload_id, 
                 "generating_bundles",
@@ -192,10 +194,12 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                 
                 # HARD TIMEOUT: Force termination after 6 minutes (360 seconds)
                 try:
+                    logger.info(f"Bundle generation {scope}: invoking generator with 360s timeout")
                     generation_result = await asyncio.wait_for(
                         generator.generate_bundle_recommendations(csv_upload_id),
                         timeout=360.0  # 6 minute absolute maximum
                     )
+                    logger.info(f"Bundle generation {scope}: generator completed without timeout")
                 except asyncio.TimeoutError:
                     logger.error(f"TIMEOUT: Bundle generation exceeded 6 minutes for {csv_upload_id}, force terminating")
                     # Return a timeout result instead of letting it hang
@@ -272,6 +276,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                     }
                     
                     # Atomically store metrics with compare-and-set
+                    logger.info(f"Bundle generation {scope}: persisting bundle_generation_metrics field")
                     metrics_update = await concurrency_controller.atomic_status_update_with_precondition(
                         csv_upload_id,
                         "generating_bundles",  # Keep current status
@@ -287,6 +292,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str]):
                     logger.info(f"Bundle generation completed {scope} in {generation_time:.2f}s")
                 
                 # Atomically update status to completed with precondition
+                logger.info(f"Bundle generation {scope}: attempting status transition to bundle_generation_completed")
                 completion_update = await concurrency_controller.atomic_status_update_with_precondition(
                     csv_upload_id, 
                     "bundle_generation_completed",

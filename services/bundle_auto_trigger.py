@@ -40,12 +40,42 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
 
     run_id = await storage.get_run_id_for_upload(completed_upload_id)
     if not run_id:
-        # CSV not associated with a run; nothing to do.
+        logger.info(
+            "Auto-bundle: upload %s has no run_id; skipping trigger",
+            completed_upload_id,
+        )
         return
 
-    uploads = await storage.get_run_uploads(run_id)
-    if not uploads:
+    logger.info(
+        "Auto-bundle: evaluating upload %s (run %s) for auto trigger",
+        completed_upload_id,
+        run_id,
+    )
+
+    try:
+        uploads = await storage.get_run_uploads(run_id)
+    except Exception as exc:
+        logger.exception(
+            "Auto-bundle: failed to fetch uploads for run %s from upload %s: %s",
+            run_id,
+            completed_upload_id,
+            exc,
+        )
         return
+
+    if not uploads:
+        logger.info(
+            "Auto-bundle: no uploads found for run %s (from %s)",
+            run_id,
+            completed_upload_id,
+        )
+        return
+
+    logger.info(
+        "Auto-bundle: run %s has %d total uploads",
+        run_id,
+        len(uploads),
+    )
 
     # Reduce to the most recent upload per required type.
     latest_by_type: Dict[str, Any] = {}
@@ -58,10 +88,23 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
         if csv_type in REQUIRED_UPLOAD_TYPES and csv_type not in latest_by_type:
             latest_by_type[csv_type] = upload
 
+    logger.info(
+        "Auto-bundle: latest uploads snapshot for run %s -> %s",
+        run_id,
+        {
+            csv_type: {
+                "id": getattr(upload, "id", None),
+                "status": getattr(upload, "status", None),
+                "created_at": getattr(upload, "created_at", None),
+            }
+            for csv_type, upload in latest_by_type.items()
+        },
+    )
+
     missing_types = REQUIRED_UPLOAD_TYPES - latest_by_type.keys()
     if missing_types:
-        logger.debug(
-            "Auto-bundle: run %s missing required CSV types: %s",
+        logger.info(
+            "Auto-bundle: run %s waiting for missing CSV types: %s",
             run_id,
             ", ".join(sorted(missing_types)),
         )
@@ -70,12 +113,20 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
     # Ensure all required uploads reached a ready status.
     for csv_type, upload in latest_by_type.items():
         if upload is None or getattr(upload, "status", None) not in READY_STATUSES:
-            logger.debug(
-                "Auto-bundle: run %s waiting for %s upload (status=%s)",
-                run_id,
-                csv_type,
-                getattr(upload, "status", None),
-            )
+            logger.info(
+            "Auto-bundle: run %s waiting for %s upload status to be ready (current=%s)",
+            run_id,
+            csv_type,
+            getattr(upload, "status", None),
+        )
+            if upload is not None:
+                logger.info(
+                    "Auto-bundle: upload %s details -> processed_rows=%s total_rows=%s error=%s",
+                    getattr(upload, "id", None),
+                    getattr(upload, "processed_rows", None),
+                    getattr(upload, "total_rows", None),
+                    getattr(upload, "error_message", None),
+                )
             return
 
     orders_upload = latest_by_type["orders"]
@@ -86,8 +137,8 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
         return
 
     if orders_upload_id in _pending_runs:
-        logger.debug(
-            "Auto-bundle: bundle generation already pending for orders upload %s",
+        logger.info(
+            "Auto-bundle: generation already pending for orders upload %s",
             orders_upload_id,
         )
         return
@@ -103,6 +154,10 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
     # Update status to reflect the queued bundle generation (best-effort).
     try:
         await storage.update_csv_upload(orders_upload_id, {"status": "bundle_generation_queued"})
+        logger.info(
+            "Auto-bundle: orders upload %s status -> bundle_generation_queued",
+            orders_upload_id,
+        )
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.warning(
             "Auto-bundle: failed to mark orders upload %s as queued: %s",
@@ -126,7 +181,7 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
         )
 
     logger.info(
-        "Auto-bundle: scheduling bundle generation for orders upload %s (run %s)",
+        "Auto-bundle: scheduling bundle generation for orders upload %s (run %s) -> coroutine queued",
         orders_upload_id,
         run_id,
     )
@@ -136,6 +191,10 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
         try:
             from routers.bundle_recommendations import generate_bundles_background
 
+            logger.info(
+                "Auto-bundle: background coroutine starting for upload %s",
+                upload_id,
+            )
             await generate_bundles_background(upload_id)
         except Exception:
             logger.exception(
