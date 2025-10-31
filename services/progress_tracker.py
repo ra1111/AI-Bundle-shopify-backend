@@ -8,6 +8,7 @@ from typing import Literal, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database import AsyncSessionLocal, CsvUpload, GenerationProgress
@@ -87,7 +88,24 @@ async def update_generation_progress(
             },
         )
 
-        await session.execute(stmt)
+        try:
+            await session.execute(stmt)
+        except ProgrammingError as exc:
+            if "generation_progress" in str(exc):
+                logger.warning(
+                    "generation_progress table missing; attempting to create it on the fly"
+                )
+
+                async def _create_table(sync_session):
+                    GenerationProgress.__table__.create(
+                        bind=sync_session.bind, checkfirst=True
+                    )
+
+                await session.run_sync(_create_table)
+                await session.execute(stmt)
+            else:
+                raise
+
         await session.commit()
 
         logger.info(
