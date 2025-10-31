@@ -166,6 +166,15 @@ class StorageService:
         async with self.get_session() as session:
             return await session.get(CsvUpload, upload_id)
     
+    async def get_run_uploads(self, run_id: str) -> List[CsvUpload]:
+        """Return all CSV uploads belonging to a run."""
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            query = select(CsvUpload).where(CsvUpload.run_id == run_id)
+            result = await session.execute(query)
+            return list(result.scalars().all())
+    
     async def update_csv_upload(self, upload_id: str, updates: Dict[str, Any]) -> Optional[CsvUpload]:
         """Update CSV upload record"""
         async with self.get_session() as session:

@@ -15,6 +15,7 @@ from decimal import Decimal
 from .storage import storage
 from services.data_mapper import DataMapper
 from services.feature_flags import feature_flags
+from services.bundle_auto_trigger import maybe_trigger_bundle_generation
 from database import AsyncSessionLocal  # kept for parity; storage handles inserts
 from sqlalchemy.exc import IntegrityError
 from settings import resolve_shop_id, infer_shop_id_from_rows, sanitize_shop_id
@@ -246,6 +247,16 @@ class CSVProcessor:
             dur_ms = int((time.time() - t0) * 1000)
             logger.info(f"[{upload_id}] ========== CSV PROCESSING COMPLETED ==========")
             logger.info(f"[{upload_id}] Type: {csv_type} | Rows: {len(rows)} | Duration: {dur_ms}ms ({dur_ms/1000:.1f}s)")
+
+            # Automatically kick off bundle generation when all required CSVs are ready.
+            try:
+                await maybe_trigger_bundle_generation(upload_id)
+            except Exception as trigger_error:
+                logger.warning(
+                    "Auto-bundle trigger failed for upload %s: %s",
+                    upload_id,
+                    trigger_error,
+                )
 
         except Exception as e:
             logger.error(f"CSV: error upload_id={upload_id}: {e}")
