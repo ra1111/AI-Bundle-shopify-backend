@@ -451,55 +451,34 @@ class BundleGenerator:
             all_recommendations = []
             objectives_processed = 0
 
-            for objective_name, objective_config in self.objectives.items():
-                # Check time budget
-                if datetime.now() >= end_time:
-                    logger.warning(f"Time budget exceeded, stopping at objective: {objective_name}")
-                    self.generation_stats['timeout_exits'] += 1
-                    break
-                
-                # Check attempt limits
-                if self.generation_stats['total_attempts'] >= self.max_total_attempts:
-                    logger.warning(f"Max attempts ({self.max_total_attempts}) reached, stopping at objective: {objective_name}")
-                    self.generation_stats['early_exits'] += 1
-                    break
-                
-                # Check attempt vs success ratio for early exit
-                if (self.generation_stats['total_attempts'] > 100 and 
-                    self.generation_stats['successful_generations'] > 0):
-                    success_rate = self.generation_stats['successful_generations'] / self.generation_stats['total_attempts']
-                    if success_rate < 0.05:  # Less than 5% success rate
-                        logger.warning(f"Low success rate ({success_rate:.2%}), early exit at objective: {objective_name}")
-                        self.generation_stats['early_exits'] += 1
-                        break
-                
-                logger.info(f"Generating bundles for objective: {objective_name} (attempts: {self.generation_stats['total_attempts']}, successes: {self.generation_stats['successful_generations']})")
-                
+            # PARALLEL EXECUTION: Generate all objective/bundle_type combinations concurrently
+            # Build list of tasks for all objective × bundle_type combinations
+            generation_tasks = []
+            for objective_name in self.objectives.keys():
                 for bundle_type in self.bundle_types:
-                    # Check time budget again
-                    if datetime.now() >= end_time:
-                        logger.warning(f"Time budget exceeded, stopping at bundle_type: {bundle_type}")
-                        self.generation_stats['timeout_exits'] += 1
-                        break
-                    
-                    objective_recommendations = await self.generate_objective_bundles(
+                    task = self.generate_objective_bundles(
                         csv_upload_id, objective_name, bundle_type, metrics, end_time
                     )
-                    all_recommendations.extend(objective_recommendations)
-                    
-                    # Log progress every few iterations
-                    if (objectives_processed * len(self.bundle_types) + self.bundle_types.index(bundle_type)) % 5 == 0:
-                        logger.info(f"Progress: {len(all_recommendations)} recommendations, {self.generation_stats['total_attempts']} attempts")
-                
-                objectives_processed += 1
+                    generation_tasks.append((objective_name, bundle_type, task))
 
-                # Persist partial results periodically
-                if len(all_recommendations) >= 20 and len(all_recommendations) % 20 == 0:
-                    logger.info(f"[{csv_upload_id}] Persisting {len(all_recommendations)} partial results")
-                    try:
-                        await self.store_partial_recommendations(all_recommendations, csv_upload_id)
-                    except Exception as e:
-                        logger.warning(f"[{csv_upload_id}] Failed to persist partial results: {e}")
+            logger.info(f"[{csv_upload_id}] Running {len(generation_tasks)} objective/bundle_type combinations in parallel")
+
+            # Execute all tasks concurrently
+            tasks_only = [task for _, _, task in generation_tasks]
+            results = await asyncio.gather(*tasks_only, return_exceptions=True)
+
+            # Process results and count successes/failures
+            for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
+                if isinstance(result, Exception):
+                    logger.warning(f"Failed to generate bundles for {objective_name}/{bundle_type}: {result}")
+                    self.generation_stats['failed_attempts'] += 1
+                elif isinstance(result, list):
+                    all_recommendations.extend(result)
+                    if len(result) > 0:
+                        objectives_processed += 1
+                        logger.info(f"Generated {len(result)} bundles for {objective_name}/{bundle_type}")
+
+            logger.info(f"[{csv_upload_id}] Parallel execution complete: {len(all_recommendations)} total candidates from {objectives_processed} successful combinations")
 
             phase3_duration = int((time.time() - phase3_start) * 1000)
             logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
@@ -1057,15 +1036,30 @@ class BundleGenerator:
                 bundle_count=bundle_total if bundle_total else None,
             )
             
-            # Add AI-generated copy if available
+            # Add AI-generated copy if available (BATCHED for speed)
             if final_recommendations:
-                for rec in final_recommendations[:10]:  # Limit AI copy generation for cost
-                    try:
-                        ai_copy = await self.ai_generator.generate_bundle_copy(rec)
-                        rec["ai_copy"] = ai_copy
-                    except Exception as e:
-                        logger.warning(f"Error generating AI copy: {e}")
-                        rec["ai_copy"] = {"title": "Bundle Deal", "description": "Great products bundled together"}
+                batch_size = 5  # Process 5 bundles at a time to avoid rate limits
+                bundles_for_copy = final_recommendations[:10]  # Limit AI copy generation for cost
+
+                logger.info(f"[{csv_upload_id}] Generating AI copy for {len(bundles_for_copy)} bundles in batches of {batch_size}")
+
+                for i in range(0, len(bundles_for_copy), batch_size):
+                    batch = bundles_for_copy[i:i+batch_size]
+
+                    # Generate AI copy for batch in parallel
+                    copy_tasks = [self.ai_generator.generate_bundle_copy(rec) for rec in batch]
+                    copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
+
+                    # Assign results back to recommendations
+                    for rec, result in zip(batch, copy_results):
+                        if isinstance(result, Exception):
+                            logger.warning(f"Error generating AI copy: {result}")
+                            rec["ai_copy"] = {"title": "Bundle Deal", "description": "Great products bundled together"}
+                        else:
+                            rec["ai_copy"] = result
+
+                    logger.info(f"[{csv_upload_id}] Generated AI copy for batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size}")
+
                 await update_generation_progress(
                     csv_upload_id,
                     step="ai_descriptions",
