@@ -161,66 +161,76 @@ class FallbackLadder:
         
         candidates = []
         tier_metrics = {}
-        
-        # Tier 1: Association rules (strict)
-        tier_candidates = await self._tier1_association_rules(csv_upload_id, bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier1_strict_rules'] = len(tier_candidates)
-        logger.info(f"Tier 1 (strict rules): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 2: Adaptive relax
-        tier_candidates = await self._tier2_adaptive_relax(csv_upload_id, bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier2_adaptive'] = len(tier_candidates)
-        logger.info(f"Tier 2 (adaptive): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 3: Smoothed co-occurrence
-        tier_candidates = self._tier3_smoothed_cooccurrence(bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier3_smoothed'] = len(tier_candidates)
-        logger.info(f"Tier 3 (smoothed): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 4: Item-item similarity
-        tier_candidates = self._tier4_item_similarity(bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier4_similarity'] = len(tier_candidates)
-        logger.info(f"Tier 4 (similarity): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 5: Heuristics
-        tier_candidates = self._tier5_heuristics(bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier5_heuristics'] = len(tier_candidates)
-        logger.info(f"Tier 5 (heuristics): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 6: Popularity/trending
-        tier_candidates = self._tier6_popularity(bundle_type)
-        candidates.extend(tier_candidates)
-        tier_metrics['tier6_popularity'] = len(tier_candidates)
-        logger.info(f"Tier 6 (popularity): {len(tier_candidates)} candidates")
-        
-        if len(candidates) >= target_n:
-            return candidates[:target_n]
-        
-        # Tier 7: Cold-start content
+
+        # OPTIMIZATION: Reverse tier order - start with simple/fast tiers that work on small datasets
+        # Bottom-up approach: Try cheapest methods first (popularity, heuristics, cold-start)
+        # Then move to expensive methods (association rules, co-occurrence) only if needed
+
+        # Tier 7: Cold-start content (FAST - works on minimal data)
         tier_candidates = self._tier7_cold_start(bundle_type)
         candidates.extend(tier_candidates)
         tier_metrics['tier7_cold_start'] = len(tier_candidates)
         logger.info(f"Tier 7 (cold-start): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 7, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 6: Popularity/trending (FAST - simple sorting)
+        tier_candidates = self._tier6_popularity(bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier6_popularity'] = len(tier_candidates)
+        logger.info(f"Tier 6 (popularity): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 6, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 5: Heuristics (FAST - rule-based)
+        tier_candidates = self._tier5_heuristics(bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier5_heuristics'] = len(tier_candidates)
+        logger.info(f"Tier 5 (heuristics): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 5, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 4: Item-item similarity (MEDIUM - requires catalog)
+        tier_candidates = self._tier4_item_similarity(bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier4_similarity'] = len(tier_candidates)
+        logger.info(f"Tier 4 (similarity): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 4, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 3: Smoothed co-occurrence (SLOW - requires transactions)
+        tier_candidates = self._tier3_smoothed_cooccurrence(bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier3_smoothed'] = len(tier_candidates)
+        logger.info(f"Tier 3 (smoothed): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 3, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 2: Adaptive relax (SLOW - multiple DB queries)
+        tier_candidates = await self._tier2_adaptive_relax(csv_upload_id, bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier2_adaptive'] = len(tier_candidates)
+        logger.info(f"Tier 2 (adaptive): {len(tier_candidates)} candidates")
+
+        if len(candidates) >= target_n:
+            logger.info(f"Target reached with Tier 2, skipping remaining tiers")
+            return candidates[:target_n]
+
+        # Tier 1: Association rules (SLOWEST - strict thresholds, requires significant data)
+        tier_candidates = await self._tier1_association_rules(csv_upload_id, bundle_type)
+        candidates.extend(tier_candidates)
+        tier_metrics['tier1_strict_rules'] = len(tier_candidates)
+        logger.info(f"Tier 1 (strict rules): {len(tier_candidates)} candidates")
         
         logger.info(f"FallbackLadder generated {len(candidates)} total candidates: {tier_metrics}")
         return candidates
