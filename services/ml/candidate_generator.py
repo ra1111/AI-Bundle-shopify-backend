@@ -10,10 +10,21 @@ from collections import defaultdict
 from itertools import combinations
 import hashlib
 import json
+from dataclasses import dataclass
 
 from services.storage import storage
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CandidateGenerationContext:
+    run_id: Optional[str]
+    valid_skus: Set[str]
+    varid_to_sku: Dict[str, str]
+    transactions: List[Set[str]]
+    sequences: List[List[str]]
+    embeddings: Dict[str, np.ndarray]
 
 class CandidateGenerator:
     """Advanced candidate generation using ML techniques"""
@@ -24,7 +35,31 @@ class CandidateGenerator:
         self.min_frequency = 2
         self.use_fpgrowth = True  # Feature flag for FPGrowth vs Apriori
     
-    async def generate_candidates(self, csv_upload_id: str, bundle_type: str, objective: str) -> Dict[str, Any]:
+    async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
+        """Prefetch expensive data needed by candidate generation."""
+        run_id = await storage.get_run_id_for_upload(csv_upload_id)
+        valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
+        varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
+        transactions = await self.get_transactions_for_mining(csv_upload_id)
+        sequences = await self.get_purchase_sequences(csv_upload_id)
+        embeddings = await self.get_or_train_embeddings(csv_upload_id, sequences=sequences)
+
+        return CandidateGenerationContext(
+            run_id=run_id,
+            valid_skus=valid_skus,
+            varid_to_sku=varid_to_sku,
+            transactions=transactions,
+            sequences=sequences,
+            embeddings=embeddings or {},
+        )
+    
+    async def generate_candidates(
+        self,
+        csv_upload_id: str,
+        bundle_type: str,
+        objective: str,
+        context: Optional[CandidateGenerationContext] = None,
+    ) -> Dict[str, Any]:
         """Generate bundle candidates using both Apriori and item2vec"""
         metrics = {
             "apriori_candidates": 0,
@@ -37,12 +72,12 @@ class CandidateGenerator:
         }
         
         try:
-            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            run_id = context.run_id if context else await storage.get_run_id_for_upload(csv_upload_id)
             # CRITICAL FIX: Preload valid SKUs to prevent infinite loop
             logger.info(f"Preloading valid SKUs for scope: run_id={run_id} csv_upload_id={csv_upload_id}")
-            valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
+            valid_skus = context.valid_skus if context else await self.get_valid_skus_for_csv(csv_upload_id)
             # Map variant_id -> sku so rule products expressed as variant_ids can be validated against catalog
-            varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
+            varid_to_sku = context.varid_to_sku if context else await self.get_variantid_to_sku_map(csv_upload_id)
             logger.info(f"Found {len(valid_skus)} valid SKUs for prefiltering")
             
             # Generate candidates from multiple sources
@@ -60,15 +95,33 @@ class CandidateGenerator:
             
             # 2. FPGrowth algorithm (more efficient)
             if self.use_fpgrowth:
-                fpgrowth_candidates = await self.generate_fpgrowth_candidates(csv_upload_id, bundle_type)
+                transactions = context.transactions if context else None
+                fpgrowth_candidates = await self.generate_fpgrowth_candidates(
+                    csv_upload_id,
+                    bundle_type,
+                    transactions=transactions,
+                )
                 metrics["fpgrowth_candidates"] = len(fpgrowth_candidates)
             
             # 3. item2vec embeddings (semantic similarity)
-            item2vec_candidates = await self.generate_item2vec_candidates(csv_upload_id, bundle_type, objective)
+            embeddings = context.embeddings if context else None
+            sequences = context.sequences if context else None
+            item2vec_candidates = await self.generate_item2vec_candidates(
+                csv_upload_id,
+                bundle_type,
+                objective,
+                embeddings=embeddings,
+                sequences=sequences,
+            )
             metrics["item2vec_candidates"] = len(item2vec_candidates)
             
             # 4. Deterministic top-pair mining to guarantee strongest co-purchases make it through
-            top_pair_candidates = await self.generate_top_pair_candidates(csv_upload_id, bundle_type)
+            transactions_for_pairs = context.transactions if context else None
+            top_pair_candidates = await self.generate_top_pair_candidates(
+                csv_upload_id,
+                bundle_type,
+                transactions=transactions_for_pairs,
+            )
             metrics["top_pair_candidates"] = len(top_pair_candidates)
 
             # 5. Combine and deduplicate candidates
@@ -158,30 +211,38 @@ class CandidateGenerator:
             logger.warning(f"Error getting valid SKUs for {csv_upload_id}: {e}")
             return set()
 
-    async def generate_top_pair_candidates(self, csv_upload_id: str, bundle_type: str, limit: int = 20) -> List[Dict[str, Any]]:
+    async def generate_top_pair_candidates(
+        self,
+        csv_upload_id: str,
+        bundle_type: str,
+        limit: int = 20,
+        transactions: Optional[List[Set[str]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Ensure the strongest SKU pairs are always available as candidates."""
-        try:
-            run_id = await storage.get_run_id_for_upload(csv_upload_id)
-        except Exception:
-            run_id = None
+        if transactions is None:
+            try:
+                run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            except Exception:
+                run_id = None
 
-        if run_id:
-            order_lines = await storage.get_order_lines_by_run(run_id)
-        else:
-            order_lines = await storage.get_order_lines(csv_upload_id)
+            if run_id:
+                order_lines = await storage.get_order_lines_by_run(run_id)
+            else:
+                order_lines = await storage.get_order_lines(csv_upload_id)
 
-        order_sku_map: Dict[str, Set[str]] = defaultdict(set)
-        for line in order_lines:
-            order_id = getattr(line, "order_id", None)
-            sku = getattr(line, "sku", None)
-            if not order_id or not sku:
-                continue
-            sku = str(sku).strip()
-            if not sku or sku.startswith("gid://") or sku.startswith("no-sku-"):
-                continue
-            order_sku_map[order_id].add(sku)
+            order_sku_map: Dict[str, Set[str]] = defaultdict(set)
+            for line in order_lines:
+                order_id = getattr(line, "order_id", None)
+                sku = getattr(line, "sku", None)
+                if not order_id or not sku:
+                    continue
+                sku = str(sku).strip()
+                if not sku or sku.startswith("gid://") or sku.startswith("no-sku-"):
+                    continue
+                order_sku_map[order_id].add(sku)
 
-        transactions = [skus for skus in order_sku_map.values() if len(skus) >= 2]
+            transactions = [skus for skus in order_sku_map.values() if len(skus) >= 2]
+
         transaction_count = len(transactions)
         if transaction_count == 0:
             logger.info(f"Top pair mining skipped for {csv_upload_id}: no multi-item transactions")
@@ -273,11 +334,17 @@ class CandidateGenerator:
         
         return filtered_candidates
     
-    async def generate_fpgrowth_candidates(self, csv_upload_id: str, bundle_type: str) -> List[Dict[str, Any]]:
+    async def generate_fpgrowth_candidates(
+        self,
+        csv_upload_id: str,
+        bundle_type: str,
+        transactions: Optional[List[Set[str]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Generate candidates using FPGrowth algorithm"""
         try:
             # Get transaction data (order baskets)
-            transactions = await self.get_transactions_for_mining(csv_upload_id)
+            if transactions is None:
+                transactions = await self.get_transactions_for_mining(csv_upload_id)
             if len(transactions) < 10:
                 logger.info("Insufficient transactions for FPGrowth, falling back to Apriori")
                 return []
@@ -354,11 +421,19 @@ class CandidateGenerator:
         
         return result
     
-    async def generate_item2vec_candidates(self, csv_upload_id: str, bundle_type: str, objective: str) -> List[Dict[str, Any]]:
+    async def generate_item2vec_candidates(
+        self,
+        csv_upload_id: str,
+        bundle_type: str,
+        objective: str,
+        embeddings: Optional[Dict[str, np.ndarray]] = None,
+        sequences: Optional[List[List[str]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Generate candidates using item2vec embeddings"""
         try:
             # Train or load item2vec embeddings
-            embeddings = await self.get_or_train_embeddings(csv_upload_id)
+            if embeddings is None:
+                embeddings = await self.get_or_train_embeddings(csv_upload_id, sequences=sequences)
             if not embeddings:
                 logger.info("No embeddings available for item2vec candidates")
                 return []
@@ -393,7 +468,11 @@ class CandidateGenerator:
             logger.warning(f"Error in item2vec generation: {e}")
             return []
     
-    async def get_or_train_embeddings(self, csv_upload_id: str) -> Dict[str, np.ndarray]:
+    async def get_or_train_embeddings(
+        self,
+        csv_upload_id: str,
+        sequences: Optional[List[List[str]]] = None,
+    ) -> Dict[str, np.ndarray]:
         """Get existing embeddings or train new ones"""
         try:
             # Check if embeddings exist for this upload
@@ -402,7 +481,7 @@ class CandidateGenerator:
                 return self.deserialize_embeddings(existing_embeddings)
             
             # Train new embeddings
-            embeddings = await self.train_item2vec_embeddings(csv_upload_id)
+            embeddings = await self.train_item2vec_embeddings(csv_upload_id, sequences=sequences)
             
             # Store embeddings for future use
             if embeddings:
@@ -414,11 +493,16 @@ class CandidateGenerator:
             logger.warning(f"Error getting/training embeddings: {e}")
             return {}
     
-    async def train_item2vec_embeddings(self, csv_upload_id: str) -> Dict[str, np.ndarray]:
+    async def train_item2vec_embeddings(
+        self,
+        csv_upload_id: str,
+        sequences: Optional[List[List[str]]] = None,
+    ) -> Dict[str, np.ndarray]:
         """Train item2vec embeddings using skip-gram approach"""
         try:
             # Get order sequences (baskets)
-            sequences = await self.get_purchase_sequences(csv_upload_id)
+            if sequences is None:
+                sequences = await self.get_purchase_sequences(csv_upload_id)
             if len(sequences) < 10:
                 return {}
             

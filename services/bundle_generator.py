@@ -11,12 +11,13 @@ from datetime import datetime, timedelta
 import random
 import time
 from collections import defaultdict
+import os
 
 from services.storage import storage
 from services.ai_copy_generator import AICopyGenerator
 from services.data_mapper import DataMapper
 from services.objectives import ObjectiveScorer
-from services.ml.candidate_generator import CandidateGenerator
+from services.ml.candidate_generator import CandidateGenerator, CandidateGenerationContext
 from services.pricing import BayesianPricingEngine
 from services.ranker import WeightedLinearRanker
 from services.deduplication import DeduplicationService
@@ -116,6 +117,7 @@ class BundleGenerator:
             'timeout_exits': 0,
             'early_exits': 0
         }
+        self.phase3_concurrency_limit = max(1, int(os.getenv("PHASE3_CONCURRENCY_LIMIT", "6")))
         
         # ARCHITECT FIX: Circuit-breaker pattern to stop runaway behavior
         self.consecutive_failures = 0
@@ -175,6 +177,18 @@ class BundleGenerator:
                 use_relaxed
             )
             self._last_threshold_signature = signature
+
+    async def _gather_with_concurrency(self, limit: int, coroutines: List[Any]) -> List[Any]:
+        """Run coroutines with a concurrency cap to avoid exhausting DB connections."""
+        if not coroutines:
+            return []
+        semaphore = asyncio.Semaphore(max(1, limit))
+
+        async def _runner(coro):
+            async with semaphore:
+                return await coro
+
+        return await asyncio.gather(*(_runner(coro) for coro in coroutines), return_exceptions=True)
 
     async def _apply_forced_pair_fallbacks(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> List[Dict[str, Any]]:
         """Inject top association rule pairs when coverage is too low."""
@@ -453,11 +467,17 @@ class BundleGenerator:
 
             # PARALLEL EXECUTION: Generate all objective/bundle_type combinations concurrently
             # Build list of tasks for all objective × bundle_type combinations
+            candidate_context: CandidateGenerationContext = await self.candidate_generator.prepare_context(csv_upload_id)
             generation_tasks = []
             for objective_name in self.objectives.keys():
                 for bundle_type in self.bundle_types:
                     task = self.generate_objective_bundles(
-                        csv_upload_id, objective_name, bundle_type, metrics, end_time
+                        csv_upload_id,
+                        objective_name,
+                        bundle_type,
+                        metrics,
+                        end_time,
+                        candidate_context,
                     )
                     generation_tasks.append((objective_name, bundle_type, task))
 
@@ -466,7 +486,7 @@ class BundleGenerator:
 
             # Execute all tasks concurrently
             tasks_only = [task for _, _, task in generation_tasks]
-            results = await asyncio.gather(*tasks_only, return_exceptions=True)
+            results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
 
             parallel_duration = int((time.time() - parallel_start) * 1000)
             logger.info(f"[{csv_upload_id}] Parallel execution wall-clock time: {parallel_duration}ms")
@@ -711,7 +731,15 @@ class BundleGenerator:
             else:
                 raise
     
-    async def generate_objective_bundles(self, csv_upload_id: str, objective: str, bundle_type: str, metrics: Dict[str, Any], end_time: datetime = None) -> List[Dict[str, Any]]:
+    async def generate_objective_bundles(
+        self,
+        csv_upload_id: str,
+        objective: str,
+        bundle_type: str,
+        metrics: Dict[str, Any],
+        end_time: datetime = None,
+        context: Optional[CandidateGenerationContext] = None,
+    ) -> List[Dict[str, Any]]:
         """Generate bundles for a specific objective and bundle type with loop prevention"""
         objective_type_key = f"{objective}_{bundle_type}"
         attempts_for_this_combo = 0
@@ -742,7 +770,12 @@ class BundleGenerator:
             if self.enable_ml_candidates:
                 try:
                     logger.info(f"[{csv_upload_id}] Task {objective_type_key} - ML candidate generation STARTED")
-                    candidate_result = await self.candidate_generator.generate_candidates(csv_upload_id, bundle_type, objective)
+                    candidate_result = await self.candidate_generator.generate_candidates(
+                        csv_upload_id,
+                        bundle_type,
+                        objective,
+                        context=context,
+                    )
                     ml_duration = int((time.time() - ml_start) * 1000)
                     logger.info(f"[{csv_upload_id}] Task {objective_type_key} - ML candidate generation COMPLETED in {ml_duration}ms")
 
