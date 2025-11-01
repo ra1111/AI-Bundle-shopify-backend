@@ -364,11 +364,13 @@ class BundleGenerator:
                 data_mapping_result = await self.data_mapper.enrich_order_lines_with_variants(csv_upload_id)
                 phase_duration = int((time.time() - phase_start) * 1000)
                 enrichment_metrics = data_mapping_result.get("metrics", {})
+                total_order_lines = enrichment_metrics.get('total_order_lines', 0)
                 logger.info(f"[{csv_upload_id}] Phase 1: Data Mapping & Enrichment - COMPLETED in {phase_duration}ms | "
-                           f"total_lines={enrichment_metrics.get('total_order_lines', 0)} "
+                           f"total_lines={total_order_lines} "
                            f"resolved={enrichment_metrics.get('resolved_variants', 0)} "
                            f"unresolved={enrichment_metrics.get('unresolved_skus', 0)}")
                 metrics["data_mapping"] = {"enabled": True, "metrics": enrichment_metrics, "duration_ms": phase_duration}
+                metrics["total_order_lines"] = total_order_lines  # Track for Phase 3 FallbackLadder decision
                 metrics["phase_timings"]["phase_1_data_mapping"] = phase_duration
                 await update_generation_progress(
                     csv_upload_id,
@@ -750,7 +752,10 @@ class BundleGenerator:
             
             # Phase 3a.1: FallbackLadder for Small Shops (when insufficient candidates)
             min_candidates_threshold = 5  # Minimum candidates for adequate recommendations
-            if len(candidates) < min_candidates_threshold:
+            total_order_lines = metrics.get("total_order_lines", 0)
+
+            # Skip FallbackLadder for very small datasets (< 10 order lines) as it's too slow and won't generate useful bundles
+            if len(candidates) < min_candidates_threshold and total_order_lines >= 10:
                 logger.info(f"Insufficient candidates ({len(candidates)}) for {objective}/{bundle_type}, activating FallbackLadder")
                 try:
                     fallback_candidates = await self.fallback_ladder.generate_candidates(
@@ -784,6 +789,9 @@ class BundleGenerator:
                 except Exception as e:
                     logger.warning(f"FallbackLadder failed for {objective}/{bundle_type}: {e}")
                     metrics["fallback_ladder"] = {"activated": True, "error": str(e)}
+            elif len(candidates) < min_candidates_threshold and total_order_lines < 10:
+                logger.info(f"Skipping FallbackLadder for small dataset ({total_order_lines} order lines) - insufficient data for meaningful bundles")
+                metrics["fallback_ladder"] = {"activated": False, "reason": "dataset_too_small", "order_lines": total_order_lines}
             else:
                 metrics["fallback_ladder"] = {"activated": False, "reason": "sufficient_candidates"}
             
