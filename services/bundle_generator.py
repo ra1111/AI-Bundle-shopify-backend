@@ -462,10 +462,14 @@ class BundleGenerator:
                     generation_tasks.append((objective_name, bundle_type, task))
 
             logger.info(f"[{csv_upload_id}] Running {len(generation_tasks)} objective/bundle_type combinations in parallel")
+            parallel_start = time.time()
 
             # Execute all tasks concurrently
             tasks_only = [task for _, _, task in generation_tasks]
             results = await asyncio.gather(*tasks_only, return_exceptions=True)
+
+            parallel_duration = int((time.time() - parallel_start) * 1000)
+            logger.info(f"[{csv_upload_id}] Parallel execution wall-clock time: {parallel_duration}ms")
 
             # Process results and count successes/failures
             for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
@@ -671,7 +675,28 @@ class BundleGenerator:
             }
             
         except Exception as e:
-            logger.error(f"Error in v2 bundle generation: {e}")
+            # Calculate total time even on failure
+            total_pipeline_duration = int((time.time() - pipeline_start) * 1000)
+
+            logger.error(f"[{csv_upload_id}] ========== BUNDLE GENERATION PIPELINE FAILED ==========")
+            logger.error(f"[{csv_upload_id}] Error: {str(e)}")
+            logger.error(f"[{csv_upload_id}] Total Duration Before Failure: {total_pipeline_duration}ms ({total_pipeline_duration/1000:.1f}s)")
+
+            # Log phase breakdown even on failure
+            if metrics.get("phase_timings"):
+                logger.info(f"[{csv_upload_id}] Phase Timing Breakdown (Before Failure):")
+                for phase_name, duration in sorted(metrics["phase_timings"].items()):
+                    percentage = (duration / total_pipeline_duration * 100) if total_pipeline_duration > 0 else 0
+                    logger.info(f"[{csv_upload_id}]   - {phase_name}: {duration}ms ({percentage:.1f}%)")
+
+            # Log generation stats
+            logger.info(f"[{csv_upload_id}] Generation Stats (Before Failure): attempts={self.generation_stats['total_attempts']} "
+                       f"successes={self.generation_stats['successful_generations']} "
+                       f"duplicates_skipped={self.generation_stats['skipped_duplicates']} "
+                       f"failures={self.generation_stats['failed_attempts']}")
+
+            logger.error(f"[{csv_upload_id}] ================================================================")
+
             await update_generation_progress(
                 csv_upload_id,
                 step="finalization",
@@ -1038,12 +1063,14 @@ class BundleGenerator:
             
             # Add AI-generated copy if available (BATCHED for speed)
             if final_recommendations:
+                ai_copy_start = time.time()
                 batch_size = 5  # Process 5 bundles at a time to avoid rate limits
                 bundles_for_copy = final_recommendations[:10]  # Limit AI copy generation for cost
 
-                logger.info(f"[{csv_upload_id}] Generating AI copy for {len(bundles_for_copy)} bundles in batches of {batch_size}")
+                logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - STARTED | bundles={len(bundles_for_copy)} batch_size={batch_size}")
 
                 for i in range(0, len(bundles_for_copy), batch_size):
+                    batch_start = time.time()
                     batch = bundles_for_copy[i:i+batch_size]
 
                     # Generate AI copy for batch in parallel
@@ -1058,7 +1085,12 @@ class BundleGenerator:
                         else:
                             rec["ai_copy"] = result
 
-                    logger.info(f"[{csv_upload_id}] Generated AI copy for batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size}")
+                    batch_duration = int((time.time() - batch_start) * 1000)
+                    logger.info(f"[{csv_upload_id}] AI Copy batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size} completed in {batch_duration}ms")
+
+                ai_copy_duration = int((time.time() - ai_copy_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - COMPLETED in {ai_copy_duration}ms")
+                metrics["phase_timings"]["phase_8_ai_copy"] = ai_copy_duration
 
                 await update_generation_progress(
                     csv_upload_id,
@@ -1080,7 +1112,12 @@ class BundleGenerator:
 
             # Store recommendations in database
             if final_recommendations and csv_upload_id:
+                storage_start = time.time()
+                logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - STARTED | bundles={len(final_recommendations)}")
                 await self.store_recommendations(final_recommendations, csv_upload_id)
+                storage_duration = int((time.time() - storage_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - COMPLETED in {storage_duration}ms")
+                metrics["phase_timings"]["phase_9_storage"] = storage_duration
 
             await update_generation_progress(
                 csv_upload_id,
