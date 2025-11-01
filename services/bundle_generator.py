@@ -86,12 +86,12 @@ class BundleGenerator:
         # v2 feature flags
         self.enable_v2_pipeline = True  # Enable comprehensive v2 features
         self.enable_data_mapping = True
-        self.enable_objective_scoring = True
+        self.enable_objective_scoring = False  # DISABLED: 60s+ timeout bottleneck
         self.enable_ml_candidates = True
         self.enable_bayesian_pricing = True
         self.enable_weighted_ranking = True
         self.enable_deduplication = True
-        self.enable_explainability = True
+        self.enable_explainability = False  # DISABLED: Non-critical, saves time
         
         # Enterprise optimization feature flags (PR-4)
         self.enable_enterprise_optimization = True

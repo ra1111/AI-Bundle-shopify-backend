@@ -42,7 +42,9 @@ class CandidateGenerator:
         varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
         transactions = await self.get_transactions_for_mining(csv_upload_id)
         sequences = await self.get_purchase_sequences(csv_upload_id)
-        embeddings = await self.get_or_train_embeddings(csv_upload_id, sequences=sequences)
+        # DISABLED: item2vec training is a major bottleneck (60-120 seconds)
+        # embeddings = await self.get_or_train_embeddings(csv_upload_id, sequences=sequences)
+        embeddings = {}  # Skip embeddings to save 60-120 seconds
 
         return CandidateGenerationContext(
             run_id=run_id,
