@@ -60,8 +60,8 @@ class BundleGenerator:
         
         # Bundle configuration
         self.bundle_types = ['FBT', 'VOLUME_DISCOUNT', 'MIX_MATCH', 'BXGY', 'FIXED']
-        
-        # 8 Objective types for enhanced bundle generation
+
+        # 8 Objective types for enhanced bundle generation (all defined for backward compatibility)
         self.objectives = {
             'increase_aov': {'priority': 1.0, 'description': 'Increase Average Order Value'},
             'clear_slow_movers': {'priority': 1.2, 'description': 'Clear Slow-Moving Inventory'},
@@ -72,6 +72,28 @@ class BundleGenerator:
             'subscription_push': {'priority': 1.0, 'description': 'Subscription Promotion'},
             'margin_guard': {'priority': 1.3, 'description': 'Maintain High Margins'}
         }
+
+        # PARETO OPTIMIZATION: Map each objective to best-fit bundle type(s)
+        # This reduces 8 objectives × 5 types (40 tasks) to 3-4 objectives × 1-2 types (3-8 tasks)
+        self.objective_to_bundle_types = {
+            # Top priority objectives (Pareto 80/20)
+            'margin_guard': ['FBT', 'FIXED'],              # Protect margins: FBT works best
+            'clear_slow_movers': ['VOLUME_DISCOUNT', 'BXGY'],  # Move inventory: Volume discounts
+            'increase_aov': ['MIX_MATCH', 'FBT'],          # Boost AOV: Mix & Match maximizes cart
+
+            # Secondary objectives (only for large datasets)
+            'new_launch': ['FBT', 'FIXED'],                # Promote new products: FBT exposure
+            'seasonal_promo': ['BXGY', 'FIXED'],           # Seasonal: BXGY promotions
+
+            # Low priority (rarely used)
+            'category_bundle': ['MIX_MATCH'],
+            'gift_box': ['FIXED'],
+            'subscription_push': ['VOLUME_DISCOUNT'],
+        }
+
+        # Early termination thresholds
+        self.min_transactions_for_ml = 10  # Skip ML phase if < 10 transactions
+        self.min_products_for_ml = 5       # Skip ML phase if < 5 unique products
         
         # Bundle generation thresholds
         self.base_min_support = 0.05
@@ -189,6 +211,65 @@ class BundleGenerator:
                 return await coro
 
         return await asyncio.gather(*(_runner(coro) for coro in coroutines), return_exceptions=True)
+
+    def _should_skip_ml_phase(self, context: CandidateGenerationContext, csv_upload_id: str) -> tuple[bool, str]:
+        """
+        Check if ML phase should be skipped due to insufficient data.
+        Returns (should_skip: bool, reason: str)
+        """
+        # Check transaction count
+        txn_count = len(context.transactions) if context and context.transactions else 0
+        if txn_count < self.min_transactions_for_ml:
+            reason = f"Only {txn_count} transactions (need {self.min_transactions_for_ml}+)"
+            logger.warning(f"[{csv_upload_id}] Skipping ML phase: {reason}")
+            return (True, reason)
+
+        # Check unique products
+        product_count = len(context.valid_skus) if context and context.valid_skus else 0
+        if product_count < self.min_products_for_ml:
+            reason = f"Only {product_count} unique products (need {self.min_products_for_ml}+)"
+            logger.warning(f"[{csv_upload_id}] Skipping ML phase: {reason}")
+            return (True, reason)
+
+        return (False, "")
+
+    def _select_objectives_for_dataset(self, context: CandidateGenerationContext) -> List[str]:
+        """
+        Dynamically select objectives based on dataset size using Pareto principle.
+        Returns top objectives that cover 80% of business value.
+        """
+        txn_count = len(context.transactions) if context and context.transactions else 0
+        product_count = len(context.valid_skus) if context and context.valid_skus else 0
+
+        # Tiny dataset (<10 txns): Skip ML entirely (handled by _should_skip_ml_phase)
+        # This shouldn't be called if ML is skipped, but defensive check
+        if txn_count < 10:
+            return []
+
+        # Small dataset (10-50 txns): Focus on top 2 objectives (Pareto 80%)
+        if txn_count < 50:
+            objectives = ['margin_guard', 'increase_aov']  # 2 objectives × 2 types = 4 tasks
+            logger.info(f"Small dataset ({txn_count} txns): Using {len(objectives)} top objectives")
+            return objectives
+
+        # Medium dataset (50-200 txns): Top 3 objectives (Pareto 80%)
+        elif txn_count < 200:
+            objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov']  # 3 objectives × 2 types = 6 tasks
+            logger.info(f"Medium dataset ({txn_count} txns): Using {len(objectives)} objectives")
+            return objectives
+
+        # Large dataset (200+ txns): Top 4 objectives
+        else:
+            objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov', 'new_launch']  # 4 objectives × 2 types = 8 tasks
+            logger.info(f"Large dataset ({txn_count} txns): Using {len(objectives)} objectives")
+            return objectives
+
+    def _get_bundle_types_for_objective(self, objective: str) -> List[str]:
+        """
+        Get the best-fit bundle types for a given objective.
+        Returns 1-2 bundle types instead of all 5.
+        """
+        return self.objective_to_bundle_types.get(objective, ['FBT'])  # Default to FBT if not mapped
 
     async def _apply_forced_pair_fallbacks(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> List[Dict[str, Any]]:
         """Inject top association rule pairs when coverage is too low."""
@@ -461,59 +542,92 @@ class BundleGenerator:
 
             # Phase 3: Generate candidates for each objective with loop prevention
             phase3_start = time.time()
-            logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - STARTED | objectives={len(self.objectives)} bundle_types={len(self.bundle_types)}")
             all_recommendations = []
             objectives_processed = 0
 
-            # PARALLEL EXECUTION: Generate all objective/bundle_type combinations concurrently
-            # Build list of tasks for all objective × bundle_type combinations
+            # PARETO OPTIMIZATION: Prepare context and check if we should skip ML phase
             candidate_context: CandidateGenerationContext = await self.candidate_generator.prepare_context(csv_upload_id)
-            generation_tasks = []
-            for objective_name in self.objectives.keys():
-                for bundle_type in self.bundle_types:
-                    task = self.generate_objective_bundles(
-                        csv_upload_id,
-                        objective_name,
-                        bundle_type,
-                        metrics,
-                        end_time,
-                        candidate_context,
-                    )
-                    generation_tasks.append((objective_name, bundle_type, task))
 
-            logger.info(f"[{csv_upload_id}] Running {len(generation_tasks)} objective/bundle_type combinations in parallel")
-            parallel_start = time.time()
+            # Early termination check
+            should_skip, skip_reason = self._should_skip_ml_phase(candidate_context, csv_upload_id)
+            if should_skip:
+                logger.warning(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - SKIPPED | reason={skip_reason}")
+                metrics["ml_candidates"] = {
+                    "enabled": False,
+                    "skipped": True,
+                    "skip_reason": skip_reason,
+                    "duration_ms": 0
+                }
+                metrics["phase_timings"]["phase_3_ml_candidates"] = 0
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ml_generation",
+                    progress=70,
+                    status="in_progress",
+                    message=f"ML generation skipped: {skip_reason}",
+                )
+            else:
+                # PARETO OPTIMIZATION: Select top objectives dynamically based on dataset size
+                selected_objectives = self._select_objectives_for_dataset(candidate_context)
+                logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - STARTED | "
+                           f"selected_objectives={len(selected_objectives)} (Pareto optimized from {len(self.objectives)})")
 
-            # Execute all tasks concurrently
-            tasks_only = [task for _, _, task in generation_tasks]
-            results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
+                # PARALLEL EXECUTION: Generate selected objective/bundle_type combinations concurrently
+                # Build list of tasks using intelligent bundle type mapping
+                generation_tasks = []
+                for objective_name in selected_objectives:
+                    # Get best-fit bundle types for this objective (1-2 types instead of all 5)
+                    bundle_types_for_objective = self._get_bundle_types_for_objective(objective_name)
+                    for bundle_type in bundle_types_for_objective:
+                        task = self.generate_objective_bundles(
+                            csv_upload_id,
+                            objective_name,
+                            bundle_type,
+                            metrics,
+                            end_time,
+                            candidate_context,
+                        )
+                        generation_tasks.append((objective_name, bundle_type, task))
 
-            parallel_duration = int((time.time() - parallel_start) * 1000)
-            logger.info(f"[{csv_upload_id}] Parallel execution wall-clock time: {parallel_duration}ms")
+                # Log reduction
+                old_task_count = len(self.objectives) * len(self.bundle_types)  # 40 tasks
+                new_task_count = len(generation_tasks)
+                reduction_pct = int((1 - new_task_count / old_task_count) * 100) if old_task_count > 0 else 0
+                logger.info(f"[{csv_upload_id}] Pareto optimization: {old_task_count} tasks → {new_task_count} tasks ({reduction_pct}% reduction)")
+                logger.info(f"[{csv_upload_id}] Running {len(generation_tasks)} objective/bundle_type combinations in parallel")
 
-            # Process results and count successes/failures
-            for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
-                if isinstance(result, Exception):
-                    logger.warning(f"Failed to generate bundles for {objective_name}/{bundle_type}: {result}")
-                    self.generation_stats['failed_attempts'] += 1
-                elif isinstance(result, list):
-                    all_recommendations.extend(result)
-                    if len(result) > 0:
-                        objectives_processed += 1
-                        logger.info(f"Generated {len(result)} bundles for {objective_name}/{bundle_type}")
+                parallel_start = time.time()
 
-            logger.info(f"[{csv_upload_id}] Parallel execution complete: {len(all_recommendations)} total candidates from {objectives_processed} successful combinations")
+                # Execute all tasks concurrently
+                tasks_only = [task for _, _, task in generation_tasks]
+                results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
 
-            phase3_duration = int((time.time() - phase3_start) * 1000)
-            logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
-                       f"candidates_generated={len(all_recommendations)} "
-                       f"objectives_processed={objectives_processed} "
-                       f"attempts={self.generation_stats['total_attempts']} "
-                       f"successes={self.generation_stats['successful_generations']} "
-                       f"duplicates_skipped={self.generation_stats['skipped_duplicates']}")
-            metrics["ml_candidates"] = {"enabled": True, "duration_ms": phase3_duration,
-                                        "candidates_generated": len(all_recommendations)}
-            metrics["phase_timings"]["phase_3_ml_candidates"] = phase3_duration
+                parallel_duration = int((time.time() - parallel_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Parallel execution wall-clock time: {parallel_duration}ms")
+
+                # Process results and count successes/failures
+                for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
+                    if isinstance(result, Exception):
+                        logger.warning(f"Failed to generate bundles for {objective_name}/{bundle_type}: {result}")
+                        self.generation_stats['failed_attempts'] += 1
+                    elif isinstance(result, list):
+                        all_recommendations.extend(result)
+                        if len(result) > 0:
+                            objectives_processed += 1
+                            logger.info(f"Generated {len(result)} bundles for {objective_name}/{bundle_type}")
+
+                logger.info(f"[{csv_upload_id}] Parallel execution complete: {len(all_recommendations)} total candidates from {objectives_processed} successful combinations")
+
+                phase3_duration = int((time.time() - phase3_start) * 1000)
+                logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
+                           f"candidates_generated={len(all_recommendations)} "
+                           f"objectives_processed={objectives_processed} "
+                           f"attempts={self.generation_stats['total_attempts']} "
+                           f"successes={self.generation_stats['successful_generations']} "
+                           f"duplicates_skipped={self.generation_stats['skipped_duplicates']}")
+                metrics["ml_candidates"] = {"enabled": True, "duration_ms": phase3_duration,
+                                            "candidates_generated": len(all_recommendations)}
+                metrics["phase_timings"]["phase_3_ml_candidates"] = phase3_duration
             candidate_count = len(all_recommendations)
             await update_generation_progress(
                 csv_upload_id,
