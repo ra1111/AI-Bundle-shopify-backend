@@ -715,7 +715,11 @@ class BundleGenerator:
         """Generate bundles for a specific objective and bundle type with loop prevention"""
         objective_type_key = f"{objective}_{bundle_type}"
         attempts_for_this_combo = 0
-        
+
+        # DETAILED TIMING: Track this individual task
+        task_start = time.time()
+        logger.info(f"[{csv_upload_id}] Task {objective_type_key} - STARTED")
+
         try:
             # Check if we've exceeded attempts for this specific objective/type combo
             if attempts_for_this_combo >= self.max_attempts_per_objective_type:
@@ -733,21 +737,28 @@ class BundleGenerator:
             # Phase 3a: ML Candidate Generation with attempt tracking
             self.generation_stats['total_attempts'] += 1
             attempts_for_this_combo += 1
-            
+
+            ml_start = time.time()
             if self.enable_ml_candidates:
                 try:
+                    logger.info(f"[{csv_upload_id}] Task {objective_type_key} - ML candidate generation STARTED")
                     candidate_result = await self.candidate_generator.generate_candidates(csv_upload_id, bundle_type, objective)
+                    ml_duration = int((time.time() - ml_start) * 1000)
+                    logger.info(f"[{csv_upload_id}] Task {objective_type_key} - ML candidate generation COMPLETED in {ml_duration}ms")
+
                     candidates = candidate_result.get("candidates", [])
                     metrics["ml_candidates"] = {"enabled": True, "metrics": candidate_result.get("metrics", {})}
-                    
+
                     if candidates:
                         self.generation_stats['successful_generations'] += 1
+                        logger.info(f"[{csv_upload_id}] Task {objective_type_key} - Generated {len(candidates)} ML candidates")
                     else:
                         self.generation_stats['failed_attempts'] += 1
                         logger.debug(f"No ML candidates generated for {objective_type_key}")
-                        
+
                 except Exception as e:
-                    logger.warning(f"ML candidate generation failed for {objective_type_key}: {e}")
+                    ml_duration = int((time.time() - ml_start) * 1000)
+                    logger.warning(f"[{csv_upload_id}] Task {objective_type_key} - ML candidate generation FAILED after {ml_duration}ms: {e}")
                     candidates = []
                     self.generation_stats['failed_attempts'] += 1
             else:
@@ -760,7 +771,8 @@ class BundleGenerator:
 
             # Skip FallbackLadder for very small datasets (< 10 order lines) as it's too slow and won't generate useful bundles
             if len(candidates) < min_candidates_threshold and total_order_lines >= 10:
-                logger.info(f"Insufficient candidates ({len(candidates)}) for {objective}/{bundle_type}, activating FallbackLadder")
+                fallback_start = time.time()
+                logger.info(f"[{csv_upload_id}] Task {objective_type_key} - FallbackLadder STARTED | current_candidates={len(candidates)} order_lines={total_order_lines}")
                 try:
                     fallback_candidates = await self.fallback_ladder.generate_candidates(
                         csv_upload_id=csv_upload_id,
@@ -768,7 +780,9 @@ class BundleGenerator:
                         bundle_type=bundle_type,
                         target_n=10
                     )
-                    
+                    fallback_duration = int((time.time() - fallback_start) * 1000)
+                    logger.info(f"[{csv_upload_id}] Task {objective_type_key} - FallbackLadder COMPLETED in {fallback_duration}ms | generated={len(fallback_candidates)}")
+
                     # Convert FallbackCandidate objects to regular dict format
                     for fb_candidate in fallback_candidates:
                         fallback_dict = {
@@ -782,7 +796,7 @@ class BundleGenerator:
                             "explanation": fb_candidate.explanation
                         }
                         candidates.append(fallback_dict)
-                    
+
                     logger.info(f"FallbackLadder generated {len(fallback_candidates)} additional candidates")
                     metrics["fallback_ladder"] = {
                         "activated": True,
@@ -791,15 +805,20 @@ class BundleGenerator:
                         "total_candidates": len(candidates)
                     }
                 except Exception as e:
-                    logger.warning(f"FallbackLadder failed for {objective}/{bundle_type}: {e}")
+                    fallback_duration = int((time.time() - fallback_start) * 1000)
+                    logger.warning(f"[{csv_upload_id}] Task {objective_type_key} - FallbackLadder FAILED after {fallback_duration}ms: {e}")
                     metrics["fallback_ladder"] = {"activated": True, "error": str(e)}
             elif len(candidates) < min_candidates_threshold and total_order_lines < 10:
-                logger.info(f"Skipping FallbackLadder for small dataset ({total_order_lines} order lines) - insufficient data for meaningful bundles")
+                logger.info(f"[{csv_upload_id}] Task {objective_type_key} - Skipping FallbackLadder | dataset_too_small={total_order_lines} order_lines")
                 metrics["fallback_ladder"] = {"activated": False, "reason": "dataset_too_small", "order_lines": total_order_lines}
             else:
+                logger.info(f"[{csv_upload_id}] Task {objective_type_key} - Skipping FallbackLadder | sufficient_candidates={len(candidates)}")
                 metrics["fallback_ladder"] = {"activated": False, "reason": "sufficient_candidates"}
             
             # Convert candidates to recommendations format with duplicate checking
+            conversion_start = time.time()
+            if candidates:
+                logger.info(f"[{csv_upload_id}] Task {objective_type_key} - Converting {len(candidates)} candidates to recommendations")
             for candidate in candidates:
                 # Check for duplicate SKU combinations
                 product_set = frozenset(candidate.get("products", []))
@@ -993,13 +1012,19 @@ class BundleGenerator:
                     "candidate_count": len(recommendations)
                 }
             
-            # Log stats for this objective/bundle type
-            logger.info(f"Completed {objective_type_key}: {len(recommendations)} recommendations, {attempts_for_this_combo} attempts")
-            
+            # DETAILED TIMING: Task completion with full breakdown
+            task_duration = int((time.time() - task_start) * 1000)
+            conversion_duration = int((time.time() - conversion_start) * 1000) if candidates else 0
+
+            logger.info(f"[{csv_upload_id}] Task {objective_type_key} - COMPLETED in {task_duration}ms | "
+                       f"recommendations={len(recommendations)} attempts={attempts_for_this_combo} "
+                       f"conversion_time={conversion_duration}ms")
+
             return recommendations
-            
+
         except Exception as e:
-            logger.error(f"Error generating objective bundles for {objective_type_key}: {e}")
+            task_duration = int((time.time() - task_start) * 1000)
+            logger.error(f"[{csv_upload_id}] Task {objective_type_key} - FAILED after {task_duration}ms: {e}")
             self.generation_stats['failed_attempts'] += 1
             return []
     
