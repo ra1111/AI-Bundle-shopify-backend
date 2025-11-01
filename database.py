@@ -48,8 +48,8 @@ if DATABASE_URL:
     engine = create_async_engine(
         DATABASE_URL,
         echo=os.getenv("NODE_ENV") == "development",
-        pool_size=10,
-        max_overflow=20,
+        pool_size=50,  # Increased to support 40+ parallel Phase 3 tasks
+        max_overflow=10,  # Total max: 60 connections
         pool_pre_ping=True,
         pool_recycle=3600,
         pool_timeout=30,
