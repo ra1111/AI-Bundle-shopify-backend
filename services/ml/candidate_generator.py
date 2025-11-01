@@ -1,6 +1,6 @@
 """
 ML Candidate Generator Service
-Implements item2vec embeddings and FPGrowth algorithm for better candidate generation
+Implements LLM embeddings (replacing item2vec) and FPGrowth algorithm for better candidate generation
 """
 from typing import List, Dict, Any, Optional, Tuple, Set
 import logging
@@ -13,6 +13,8 @@ import json
 from dataclasses import dataclass
 
 from services.storage import storage
+from services.ml.llm_embeddings import llm_embedding_engine
+from services.ml.hybrid_scorer import hybrid_scorer
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +39,42 @@ class CandidateGenerator:
     
     async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
         """Prefetch expensive data needed by candidate generation."""
+        import time
+        start_time = time.time()
+
         run_id = await storage.get_run_id_for_upload(csv_upload_id)
         valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
         varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
         transactions = await self.get_transactions_for_mining(csv_upload_id)
         sequences = await self.get_purchase_sequences(csv_upload_id)
-        # DISABLED: item2vec training is a major bottleneck (60-120 seconds)
-        # embeddings = await self.get_or_train_embeddings(csv_upload_id, sequences=sequences)
-        embeddings = {}  # Skip embeddings to save 60-120 seconds
+
+        # NEW: Generate LLM embeddings (replaces item2vec)
+        # Expected time: 2-3 seconds (vs 60-120s for item2vec)
+        embeddings = {}
+        try:
+            # Get catalog products for embedding generation
+            catalog = await storage.get_catalog_snapshots_by_run(run_id)
+            catalog_list = [
+                {
+                    'sku': getattr(item, 'sku', ''),
+                    'title': getattr(item, 'title', ''),
+                    'product_category': getattr(item, 'product_category', ''),
+                    'brand': getattr(item, 'brand', ''),
+                    'vendor': getattr(item, 'vendor', ''),
+                    'product_type': getattr(item, 'product_type', ''),
+                    'description': getattr(item, 'description', ''),
+                    'tags': getattr(item, 'tags', ''),
+                }
+                for item in catalog
+            ]
+
+            logger.info(f"Generating LLM embeddings for {len(catalog_list)} products...")
+            embeddings = await llm_embedding_engine.get_embeddings_batch(catalog_list, use_cache=True)
+            logger.info(f"LLM embeddings generated in {time.time() - start_time:.2f}s")
+
+        except Exception as e:
+            logger.warning(f"Failed to generate LLM embeddings: {e}. Continuing without embeddings.")
+            embeddings = {}
 
         return CandidateGenerationContext(
             run_id=run_id,
@@ -105,17 +135,36 @@ class CandidateGenerator:
                 )
                 metrics["fpgrowth_candidates"] = len(fpgrowth_candidates)
             
-            # 3. item2vec embeddings (semantic similarity)
-            embeddings = context.embeddings if context else None
-            sequences = context.sequences if context else None
-            item2vec_candidates = await self.generate_item2vec_candidates(
-                csv_upload_id,
-                bundle_type,
-                objective,
-                embeddings=embeddings,
-                sequences=sequences,
-            )
-            metrics["item2vec_candidates"] = len(item2vec_candidates)
+            # 3. LLM embeddings (semantic similarity) - REPLACES item2vec
+            embeddings = context.embeddings if context else {}
+            llm_candidates = []
+            if embeddings:
+                try:
+                    # Get catalog for LLM candidate generation
+                    catalog = await storage.get_catalog_snapshots_by_run(run_id)
+                    catalog_list = [
+                        {
+                            'sku': getattr(item, 'sku', ''),
+                            'title': getattr(item, 'title', ''),
+                            'product_category': getattr(item, 'product_category', ''),
+                        }
+                        for item in catalog
+                    ]
+
+                    llm_candidates = await llm_embedding_engine.generate_candidates_by_similarity(
+                        csv_upload_id=csv_upload_id,
+                        bundle_type=bundle_type,
+                        objective=objective,
+                        catalog=catalog_list,
+                        embeddings=embeddings,
+                        num_candidates=20
+                    )
+                    logger.info(f"Generated {len(llm_candidates)} LLM-based candidates")
+                except Exception as e:
+                    logger.warning(f"Failed to generate LLM candidates: {e}")
+
+            metrics["llm_candidates"] = len(llm_candidates)
+            metrics["item2vec_candidates"] = 0  # Deprecated
             
             # 4. Deterministic top-pair mining to guarantee strongest co-purchases make it through
             transactions_for_pairs = context.transactions if context else None
@@ -126,9 +175,9 @@ class CandidateGenerator:
             )
             metrics["top_pair_candidates"] = len(top_pair_candidates)
 
-            # 5. Combine and deduplicate candidates
+            # 5. Combine and deduplicate candidates (using LLM + transactional)
             all_candidates = self.combine_candidates(
-                apriori_candidates, fpgrowth_candidates, item2vec_candidates, top_pair_candidates
+                apriori_candidates, fpgrowth_candidates, llm_candidates, top_pair_candidates
             )
 
             # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
@@ -136,24 +185,33 @@ class CandidateGenerator:
             all_candidates = self.filter_candidates_by_valid_skus(all_candidates, valid_skus, varid_to_sku)
             invalid_filtered = original_count - len(all_candidates)
             metrics["invalid_sku_candidates_filtered"] = invalid_filtered
-            metrics["total_unique_candidates"] = len(all_candidates)
-            
+
             if invalid_filtered > 0:
                 logger.warning(f"Candidates: filtered_invalid={invalid_filtered} remaining={len(all_candidates)} valid_skus={len(valid_skus)} varid_map={len(varid_to_sku)}")
 
+            # 6. HYBRID SCORING: Combine LLM semantic + transactional signals
+            transaction_count = len(context.transactions) if context and context.transactions else 0
+            all_candidates = hybrid_scorer.rank_candidates(all_candidates, transaction_count)
+
+            metrics["total_unique_candidates"] = len(all_candidates)
+            metrics["hybrid_scoring"] = {
+                "transaction_count": transaction_count,
+                "weights": hybrid_scorer.get_weights_for_dataset(transaction_count).__dict__
+            }
+
             logger.info(
                 f"Candidates: scope upload_id={csv_upload_id} run_id={run_id} "
-                f"apriori={len(apriori_candidates)} fpgrowth={len(fpgrowth_candidates)} item2vec={len(item2vec_candidates)} "
-                f"unique_after_filter={len(all_candidates)}"
+                f"apriori={len(apriori_candidates)} fpgrowth={len(fpgrowth_candidates)} llm={len(llm_candidates)} "
+                f"unique_after_filter={len(all_candidates)} hybrid_scored=True"
             )
-            
-            # 6. Add source information for explainability
+
+            # 7. Add source information for explainability
             for candidate in all_candidates:
                 candidate["generation_sources"] = self.identify_sources(
                     candidate,
                     apriori_candidates,
                     fpgrowth_candidates,
-                    item2vec_candidates,
+                    llm_candidates,
                     top_pair_candidates
                 )
 
