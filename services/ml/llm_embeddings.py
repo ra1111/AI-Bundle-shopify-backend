@@ -1,414 +1,440 @@
 """
-LLM-based Product Embeddings Engine
+LLM-based Product Embeddings Engine (v2)
 
-Replaces item2vec with OpenAI embeddings for:
-- Zero training time (vs 60-120s for item2vec)
-- Cold start support (works for new products)
-- Semantic understanding (not just behavioral)
+- Replaces item2vec with OpenAI embeddings
+- Zero training time, cold-start friendly
+- Persistent cache (memory + storage)
+- L2-normalized vectors for stable cosine
+- Safe batching with retries & dedup
+- Configurable similarity thresholds
 """
 
-import logging
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-import asyncio
-import hashlib
-import json
-from openai import AsyncOpenAI
+from __future__ import annotations
 import os
+import json
+import math
+import time
+import hashlib
+import logging
+from typing import Any, Dict, List, Tuple, Optional, Iterable
 
-from services.storage import storage
+import numpy as np
+from openai import AsyncOpenAI
+
+from services.storage import storage  # must expose async get(key)->str|None and set(key, value, ttl=None)
 
 logger = logging.getLogger(__name__)
 
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
 class LLMEmbeddingEngine:
-    """Generate and cache product embeddings using OpenAI's embedding models"""
+    """
+    Generate and cache product embeddings using OpenAI's embedding models.
 
-    def __init__(self):
-        self.client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.model = "text-embedding-3-small"  # 1536 dims, $0.02/1M tokens
-        self.embedding_dim = 1536
-        self.batch_size = 100  # OpenAI allows up to 2048 inputs per request
-        self._memory_cache = {}  # In-memory cache for this request
+    Public API:
+      - get_embedding(product)
+      - get_embeddings_batch(products)
+      - find_similar_products(target_sku, catalog, embeddings, top_k, min_similarity)
+      - compute_bundle_similarity(products, embeddings)
+      - generate_candidates_by_similarity(csv_upload_id, bundle_type, objective, catalog, embeddings, num_candidates)
+    """
 
-    def _create_product_text(self, product: Dict) -> str:
-        """Create rich text representation of product for embedding"""
-        parts = []
+    # ------- defaults / config -------
+    DEFAULT_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # 1536 dims
+    DEFAULT_DIM = int(os.getenv("EMBED_DIM", "1536"))
+    BATCH_SIZE = int(os.getenv("EMBED_BATCH", "100"))  # OpenAI supports large inputs; keep modest for stability
+    CACHE_NS = os.getenv("EMBED_CACHE_NS", "embeddings:v1")  # bump if _create_product_text changes materially
+    CACHE_TTL_S = int(os.getenv("EMBED_CACHE_TTL_S", str(60 * 60 * 24 * 30)))  # 30 days
 
-        # Title (most important)
-        if product.get('title'):
-            parts.append(product['title'])
+    # thresholds for candidate builders (env overridable)
+    FBT_MIN = float(os.getenv("SIM_FBT_MIN", "0.40"))        # complementary floor
+    TOO_SIM = float(os.getenv("SIM_TOO_SIMILAR", "0.70"))    # skip near-duplicates
+    VOLUME_MIN = float(os.getenv("SIM_VOLUME_MIN", "0.70"))  # volume (very similar)
 
-        # Category
-        if product.get('product_category'):
-            parts.append(f"Category: {product['product_category']}")
+    # retry config
+    RETRY_MAX = int(os.getenv("EMBED_RETRY_MAX", "3"))
+    RETRY_BACKOFF_BASE_S = float(os.getenv("EMBED_RETRY_BACKOFF_BASE_S", "0.5"))
 
-        # Brand
-        if product.get('brand'):
-            parts.append(f"Brand: {product['brand']}")
+    def __init__(self) -> None:
+        raw_key = os.getenv("OPENAI_API_KEY", "")
+        api_key = raw_key.strip()  # remove accidental newlines/spaces
+        self.client = AsyncOpenAI(api_key=api_key)
+        self.model = self.DEFAULT_MODEL
+        self.embedding_dim = self.DEFAULT_DIM
+        self.batch_size = self.BATCH_SIZE
+        self.normalize = True
+        self._memory_cache: Dict[str, np.ndarray] = {}
 
-        # Vendor
-        if product.get('vendor'):
-            parts.append(f"Vendor: {product['vendor']}")
+    # --------- text synthesis & cache keys ---------
+    @staticmethod
+    def _hash(s: str) -> str:
+        return hashlib.md5(s.encode("utf-8")).hexdigest()
 
-        # Product type
-        if product.get('product_type'):
-            parts.append(f"Type: {product['product_type']}")
+    def _storage_key(self, cache_key: str) -> str:
+        return f"{self.CACHE_NS}:{cache_key}"
 
-        # Description (truncated)
-        if product.get('description'):
-            desc = str(product['description'])[:200]  # Limit to 200 chars
-            parts.append(desc)
+    def _get_field(self, p: Dict[str, Any], *keys: str, default: Optional[str] = None) -> Optional[str]:
+        for k in keys:
+            v = p.get(k)
+            if v:
+                return str(v)
+        return default
 
-        # Tags
-        if product.get('tags'):
-            tags = product['tags'] if isinstance(product['tags'], str) else ', '.join(product['tags'])
-            parts.append(f"Tags: {tags}")
+    def _create_product_text(self, product: Dict[str, Any]) -> str:
+        parts: List[str] = []
+        title = self._get_field(product, "title", "name")
+        if title:
+            parts.append(title)
 
-        return ' | '.join(parts)
+        category = self._get_field(product, "product_type", "product_category", "category")
+        if category:
+            parts.append(f"Category: {category}")
 
-    def _get_embedding_cache_key(self, text: str) -> str:
-        """Generate cache key for embedding"""
-        return hashlib.md5(text.encode()).hexdigest()
+        brand = self._get_field(product, "brand")
+        if brand:
+            parts.append(f"Brand: {brand}")
 
-    async def get_embedding(self, product: Dict, use_cache: bool = True) -> np.ndarray:
-        """Get embedding for a single product"""
+        vendor = self._get_field(product, "vendor")
+        if vendor:
+            parts.append(f"Vendor: {vendor}")
+
+        ptype = self._get_field(product, "type")
+        if ptype:
+            parts.append(f"Type: {ptype}")
+
+        desc = self._get_field(product, "description", "body_html", "body")
+        if desc:
+            parts.append(desc[:200])
+
+        tags = product.get("tags")
+        if tags:
+            parts.append(f"Tags: {tags if isinstance(tags, str) else ', '.join(tags)}")
+
+        return " | ".join(parts)
+
+    # --------- math helpers ---------
+    @staticmethod
+    def _l2(v: np.ndarray) -> np.ndarray:
+        n = np.linalg.norm(v)
+        return v if n == 0 else (v / n)
+
+    @staticmethod
+    def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+        return 0.0 if denom == 0 else float(np.dot(a, b) / denom)
+
+    # --------- storage-backed cache ---------
+    async def _get_cached_embedding(self, cache_key: str) -> Optional[np.ndarray]:
+        # memory first
+        v = self._memory_cache.get(cache_key)
+        if v is not None:
+            return v
+        # persistent
+        try:
+            skey = self._storage_key(cache_key)
+            blob = await storage.get(skey)
+            if not blob:
+                return None
+            vec = np.array(json.loads(blob), dtype=np.float32)
+            if self.normalize:
+                vec = self._l2(vec)
+            self._memory_cache[cache_key] = vec
+            return vec
+        except Exception as e:
+            logger.warning(f"EMBED_CACHE: read failed for key={cache_key}: {e}")
+            return None
+
+    async def _set_cached_embedding(self, cache_key: str, vec: np.ndarray) -> None:
+        if self.normalize:
+            vec = self._l2(vec)
+        self._memory_cache[cache_key] = vec
+        try:
+            skey = self._storage_key(cache_key)
+            await storage.set(skey, json.dumps(vec.tolist()), ttl=self.CACHE_TTL_S)
+        except Exception as e:
+            logger.warning(f"EMBED_CACHE: write failed for key={cache_key}: {e}")
+
+    # --------- single embedding ---------
+    async def get_embedding(self, product: Dict[str, Any], use_cache: bool = True) -> np.ndarray:
         text = self._create_product_text(product)
-        cache_key = self._get_embedding_cache_key(text)
+        cache_key = self._hash(text)
 
-        # Check cache if enabled
         if use_cache:
             cached = await self._get_cached_embedding(cache_key)
             if cached is not None:
                 return cached
 
-        # Generate new embedding
-        try:
-            response = await self.client.embeddings.create(
-                model=self.model,
-                input=text
-            )
-            embedding = np.array(response.data[0].embedding, dtype=np.float32)
+        # call API with retries
+        inputs = [text]
+        vecs = await self._embed_texts(inputs)
+        vec = vecs[0] if vecs else np.zeros(self.embedding_dim, dtype=np.float32)
 
-            # Cache the embedding
+        if use_cache and vec is not None:
+            await self._set_cached_embedding(cache_key, vec)
+
+        return vec
+
+    # --------- batched embedding (dedup + retries) ---------
+    async def get_embeddings_batch(self, products: List[Dict[str, Any]], use_cache: bool = True) -> Dict[str, np.ndarray]:
+        """
+        Returns {sku: embedding}. Skips products with no sku.
+        Deduplicates identical texts to save tokens.
+        """
+        logger.info("LLM_EMBEDDINGS: request count=%d use_cache=%s", len(products) if products else 0, use_cache)
+
+        out: Dict[str, np.ndarray] = {}
+        if not products:
+            return out
+
+        # prepare texts & dedup by text hash
+        pending: List[Tuple[str, str, str]] = []  # (sku, text, cache_key)
+        text_to_skus: Dict[str, List[str]] = {}
+        cache_hits = 0
+
+        for p in products:
+            sku = p.get("sku")
+            if not sku:
+                continue
+            text = self._create_product_text(p)
+            cache_key = self._hash(text)
+
             if use_cache:
-                await self._cache_embedding(cache_key, embedding, text)
-
-            return embedding
-
-        except Exception as e:
-            logger.error(f"Error generating embedding for product {product.get('sku', 'unknown')}: {e}")
-            # Return zero vector as fallback
-            return np.zeros(self.embedding_dim, dtype=np.float32)
-
-    async def get_embeddings_batch(self, products: List[Dict], use_cache: bool = True) -> Dict[str, np.ndarray]:
-        """Get embeddings for multiple products efficiently (batched API calls)"""
-        try:
-            logger.info(
-                f"LLM_EMBEDDINGS: Batch embedding request | "
-                f"products={len(products) if products else 0}, use_cache={use_cache}"
-            )
-
-            embeddings = {}
-            products_to_embed = []
-            product_texts = {}
-
-            # Prepare texts and check cache
-            for product in products if products else []:
-                sku = product.get('sku')
-                if not sku:
+                cached = await self._get_cached_embedding(cache_key)
+                if cached is not None:
+                    out[sku] = cached
+                    cache_hits += 1
                     continue
 
-                text = self._create_product_text(product)
-                cache_key = self._get_embedding_cache_key(text)
-                product_texts[sku] = text
+            pending.append((sku, text, cache_key))
+            text_to_skus.setdefault(cache_key, []).append(sku)
 
-                # Check cache
-                if use_cache:
-                    cached = await self._get_cached_embedding(cache_key)
-                    if cached is not None:
-                        embeddings[sku] = cached
-                        continue
+        if not pending:
+            logger.info("LLM_EMBEDDINGS: served fully from cache | cache_hits=%d", cache_hits)
+            return out
 
-                products_to_embed.append((sku, text, cache_key))
+        # deduplicate identical texts (by cache_key)
+        unique_items: List[Tuple[str, str]] = []  # (cache_key, text)
+        seen = set()
+        for _, text, ck in pending:
+            if ck in seen:
+                continue
+            seen.add(ck)
+            unique_items.append((ck, text))
 
-            if not products_to_embed:
-                logger.info(
-                    f"LLM_EMBEDDINGS: All embeddings found in cache | "
-                    f"cached_count={len(embeddings)}"
-                )
-                return embeddings
+        logger.info("LLM_EMBEDDINGS: to_generate_unique=%d (from %d pending) batches≈%d",
+                    len(unique_items), len(pending), (len(unique_items)-1)//self.batch_size + 1)
 
-            logger.info(
-                f"LLM_EMBEDDINGS: Generating new embeddings | "
-                f"cached={len(embeddings)}, to_generate={len(products_to_embed)}, "
-                f"batches={(len(products_to_embed)-1)//self.batch_size + 1}"
-            )
+        # embed in batches
+        generated: Dict[str, np.ndarray] = {}
+        for i in range(0, len(unique_items), self.batch_size):
+            batch = unique_items[i:i + self.batch_size]
+            batch_keys = [ck for ck, _ in batch]
+            batch_texts = [tx for _, tx in batch]
 
-            # Batch the API calls
-            for i in range(0, len(products_to_embed), self.batch_size):
-                batch = products_to_embed[i:i + self.batch_size]
-                batch_texts = [text for _, text, _ in batch]
-                batch_num = i//self.batch_size + 1
-                total_batches = (len(products_to_embed)-1)//self.batch_size + 1
+            # call API with retries
+            vecs = await self._embed_texts(batch_texts)
+            if not vecs or len(vecs) != len(batch_texts):
+                # length mismatch or failure; fill zeros
+                logger.error("LLM_EMBEDDINGS: batch mismatch/failure, got=%s expected=%s",
+                             len(vecs) if vecs else 0, len(batch_texts))
+                for ck in batch_keys:
+                    generated[ck] = np.zeros(self.embedding_dim, dtype=np.float32)
+                continue
 
-                try:
-                    logger.info(
-                        f"LLM_EMBEDDINGS: Calling OpenAI API | "
-                        f"batch={batch_num}/{total_batches}, batch_size={len(batch)}, "
-                        f"model={self.model}"
-                    )
+            # write to cache maps
+            for ck, v in zip(batch_keys, vecs):
+                if v is None or not isinstance(v, np.ndarray):
+                    v = np.zeros(self.embedding_dim, dtype=np.float32)
+                await self._set_cached_embedding(ck, v)
+                generated[ck] = v
 
-                    response = await self.client.embeddings.create(
-                        model=self.model,
-                        input=batch_texts
-                    )
+        # fan out to SKUs
+        for ck, skus in text_to_skus.items():
+            v = generated.get(ck)
+            if v is None:
+                # might have been filled earlier by cache in the same run
+                v = self._memory_cache.get(ck, np.zeros(self.embedding_dim, dtype=np.float32))
+            for sku in skus:
+                out[sku] = v
 
-                    # Process response
-                    for j, (sku, text, cache_key) in enumerate(batch):
-                        embedding = np.array(response.data[j].embedding, dtype=np.float32)
-                        embeddings[sku] = embedding
+        logger.info("LLM_EMBEDDINGS: done | total=%d cache_hits=%d newly_embedded_unique=%d",
+                    len(out), cache_hits, len(generated))
+        return out
 
-                        # Cache the embedding
-                        if use_cache:
-                            await self._cache_embedding(cache_key, embedding, text)
+    # --------- low-level embed with retries ---------
+    async def _embed_texts(self, texts: List[str]) -> List[np.ndarray]:
+        """
+        Returns list of np.ndarray, preserving order; zero-vector on failure.
+        Retries 429/5xx with simple exponential backoff.
+        """
+        if not texts:
+            return []
 
-                    logger.info(
-                        f"LLM_EMBEDDINGS: Batch complete | "
-                        f"batch={batch_num}/{total_batches}, embeddings_generated={len(batch)}"
-                    )
+        attempt = 0
+        while True:
+            try:
+                resp = await self.client.embeddings.create(model=self.model, input=texts)
+                data = resp.data or []
+                out: List[np.ndarray] = []
+                for i in range(len(texts)):
+                    if i >= len(data) or not getattr(data[i], "embedding", None):
+                        out.append(np.zeros(self.embedding_dim, dtype=np.float32))
+                    else:
+                        vec = np.array(data[i].embedding, dtype=np.float32)
+                        out.append(self._l2(vec) if self.normalize else vec)
+                return out
+            except Exception as e:
+                attempt += 1
+                msg = str(e)
+                # non-retryable (e.g., bad key/headers)
+                if "Illegal header value" in msg or "authentication" in msg.lower():
+                    logger.error("EMBED: non-retryable error: %s", msg)
+                    return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts]
+                if attempt > self.RETRY_MAX:
+                    logger.error("EMBED: retries exhausted (%d). last error: %s", attempt, msg)
+                    return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts]
+                backoff = self.RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)) * (1.0 + 0.1 * (attempt))
+                logger.warning("EMBED: transient error (attempt %d/%d): %s | sleeping %.2fs",
+                               attempt, self.RETRY_MAX, msg, backoff)
+                await self._sleep(backoff)
 
-                except Exception as e:
-                    logger.error(
-                        f"LLM_EMBEDDINGS: Error generating embeddings for batch {batch_num}: {e} | "
-                        f"Using zero vectors as fallback for {len(batch)} products",
-                        exc_info=True
-                    )
-                    # Use zero vectors as fallback for failed batch
-                    for sku, _, _ in batch:
-                        embeddings[sku] = np.zeros(self.embedding_dim, dtype=np.float32)
+    @staticmethod
+    async def _sleep(seconds: float) -> None:
+        # tiny awaitable sleep without importing asyncio at top-level for tests
+        import asyncio as _asyncio
+        await _asyncio.sleep(seconds)
 
-            logger.info(
-                f"LLM_EMBEDDINGS: Batch embedding complete | "
-                f"total_embeddings={len(embeddings)}, "
-                f"cached={len(embeddings) - len(products_to_embed)}, "
-                f"generated={len(products_to_embed)}"
-            )
-
-            return embeddings
-
-        except Exception as e:
-            logger.error(
-                f"LLM_EMBEDDINGS: Fatal error in batch embedding: {e} | "
-                f"Returning partial results ({len(embeddings)} embeddings)",
-                exc_info=True
-            )
-            return embeddings  # Return whatever we got
-
+    # --------- similarity & candidates ---------
     async def find_similar_products(
         self,
         target_sku: str,
-        catalog: List[Dict],
+        catalog: List[Dict[str, Any]],
         embeddings: Dict[str, np.ndarray],
         top_k: int = 20,
-        min_similarity: float = 0.5
+        min_similarity: float = 0.5,
     ) -> List[Tuple[str, float]]:
-        """Find products similar to target using cosine similarity"""
         if target_sku not in embeddings:
-            logger.warning(f"Target SKU {target_sku} not in embeddings")
+            logger.warning("SIM: target SKU %s missing embedding", target_sku)
             return []
 
-        target_emb = embeddings[target_sku]
-        similarities = []
-
-        for product in catalog:
-            sku = product.get('sku')
-            if not sku or sku == target_sku or sku not in embeddings:
+        t = embeddings[target_sku]
+        sims: List[Tuple[str, float]] = []
+        for p in catalog:
+            sku = p.get("sku")
+            if not sku or sku == target_sku:
                 continue
+            v = embeddings.get(sku)
+            if v is None:
+                continue
+            s = self._cosine(t, v)
+            if s >= min_similarity:
+                sims.append((sku, float(s)))
 
-            product_emb = embeddings[sku]
-            similarity = self._cosine_similarity(target_emb, product_emb)
-
-            if similarity >= min_similarity:
-                similarities.append((sku, float(similarity)))
-
-        # Sort by similarity descending
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        return similarities[:top_k]
-
-    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        """Compute cosine similarity between two vectors"""
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-
-        return float(np.dot(a, b) / (norm_a * norm_b))
+        sims.sort(key=lambda x: x[1], reverse=True)
+        return sims[:top_k]
 
     def compute_bundle_similarity(self, products: List[str], embeddings: Dict[str, np.ndarray]) -> float:
-        """Compute average pairwise similarity for products in a bundle"""
         if len(products) < 2:
             return 0.0
-
-        similarities = []
+        vals: List[float] = []
         for i in range(len(products)):
             for j in range(i + 1, len(products)):
-                sku_i, sku_j = products[i], products[j]
-
-                if sku_i in embeddings and sku_j in embeddings:
-                    sim = self._cosine_similarity(embeddings[sku_i], embeddings[sku_j])
-                    similarities.append(sim)
-
-        return float(np.mean(similarities)) if similarities else 0.0
-
-    async def _get_cached_embedding(self, cache_key: str) -> Optional[np.ndarray]:
-        """Retrieve embedding from in-memory cache"""
-        return self._memory_cache.get(cache_key)
-
-    async def _cache_embedding(self, cache_key: str, embedding: np.ndarray, text: str):
-        """Store embedding in in-memory cache"""
-        self._memory_cache[cache_key] = embedding
+                a = embeddings.get(products[i])
+                b = embeddings.get(products[j])
+                if a is None or b is None:
+                    continue
+                vals.append(self._cosine(a, b))
+        return float(np.mean(vals)) if vals else 0.0
 
     async def generate_candidates_by_similarity(
         self,
         csv_upload_id: str,
         bundle_type: str,
         objective: str,
-        catalog: List[Dict],
+        catalog: List[Dict[str, Any]],
         embeddings: Dict[str, np.ndarray],
-        num_candidates: int = 20
-    ) -> List[Dict]:
-        """Generate bundle candidates using LLM semantic similarity"""
-        candidates = []
+        num_candidates: int = 20,
+    ) -> List[Dict[str, Any]]:
+        if not catalog or not embeddings:
+            return []
+        bt = (bundle_type or "").upper()
+        if bt == "FBT":
+            return await self._gen_fbt(catalog, embeddings, num_candidates)
+        if bt == "VOLUME_DISCOUNT":
+            return await self._gen_volume(catalog, embeddings, num_candidates)
+        if bt == "MIX_MATCH":
+            return await self._gen_mixmatch(catalog, embeddings, num_candidates)
+        if bt == "BXGY":
+            return await self._gen_bxgy(catalog, embeddings, num_candidates)
+        if bt == "FIXED":
+            return await self._gen_fixed(catalog, embeddings, objective, num_candidates)
+        return []
 
-        # Strategy depends on bundle type
-        if bundle_type == "FBT":
-            # Frequently Bought Together: Find complementary products
-            candidates = await self._generate_fbt_candidates(catalog, embeddings, num_candidates)
-
-        elif bundle_type == "VOLUME_DISCOUNT":
-            # Volume discount: Find similar products that make sense to buy multiple of
-            candidates = await self._generate_volume_candidates(catalog, embeddings, num_candidates)
-
-        elif bundle_type == "MIX_MATCH":
-            # Mix & Match: Find products in same category with variety
-            candidates = await self._generate_mix_match_candidates(catalog, embeddings, num_candidates)
-
-        elif bundle_type == "BXGY":
-            # Buy X Get Y: Find complementary pairs
-            candidates = await self._generate_bxgy_candidates(catalog, embeddings, num_candidates)
-
-        elif bundle_type == "FIXED":
-            # Fixed bundle: Curated sets
-            candidates = await self._generate_fixed_candidates(catalog, embeddings, objective, num_candidates)
-
-        return candidates
-
-    async def _generate_fbt_candidates(
-        self,
-        catalog: List[Dict],
-        embeddings: Dict[str, np.ndarray],
-        num_candidates: int
-    ) -> List[Dict]:
-        """Generate FBT candidates using complementary similarity"""
-        candidates = []
-
-        # For each product, find moderately similar products (0.4-0.7 similarity)
-        # Not too similar (different products) but related (complementary)
-        for product in catalog[:50]:  # Limit to top 50 products to avoid timeout
-            sku = product.get('sku')
+    # ---- internal generators ----
+    async def _gen_fbt(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        head = catalog[: min(50, len(catalog))]
+        for p in head:
+            sku = p.get("sku")
             if not sku or sku not in embeddings:
                 continue
-
-            similar = await self.find_similar_products(
+            neigh = await self.find_similar_products(
                 target_sku=sku,
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=10,
-                min_similarity=0.4  # Complementary, not identical
+                min_similarity=self.FBT_MIN,
             )
+            for s_sku, sim in neigh[:5]:
+                if sim > self.TOO_SIM:
+                    continue  # skip near-duplicates
+                out.append({"products": [sku, s_sku], "llm_similarity": sim, "source": "llm_fbt"})
+                if len(out) >= n:
+                    return out
+        return out[:n]
 
-            # Create bundles with 2-3 products
-            for similar_sku, sim in similar[:5]:
-                if sim > 0.7:  # Too similar, skip
-                    continue
-
-                candidates.append({
-                    'products': [sku, similar_sku],
-                    'llm_similarity': sim,
-                    'source': 'llm_fbt'
-                })
-
-        return candidates[:num_candidates]
-
-    async def _generate_volume_candidates(
-        self,
-        catalog: List[Dict],
-        embeddings: Dict[str, np.ndarray],
-        num_candidates: int
-    ) -> List[Dict]:
-        """Generate volume discount candidates (same/similar products)"""
-        candidates = []
-
-        # Find products with high similarity (same type, different variants)
-        for product in catalog[:30]:
-            sku = product.get('sku')
+    async def _gen_volume(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        head = catalog[: min(30, len(catalog))]
+        for p in head:
+            sku = p.get("sku")
             if not sku or sku not in embeddings:
                 continue
-
-            similar = await self.find_similar_products(
+            neigh = await self.find_similar_products(
                 target_sku=sku,
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=5,
-                min_similarity=0.7  # Very similar products
+                min_similarity=self.VOLUME_MIN,
             )
+            if len(neigh) >= 2:
+                skus = [s for s, _ in neigh[:3]]
+                avg_sim = float(np.mean([x for _, x in neigh[:3]]))
+                out.append({"products": [sku] + skus, "llm_similarity": avg_sim, "source": "llm_volume"})
+                if len(out) >= n:
+                    return out
+        return out[:n]
 
-            if len(similar) >= 2:
-                similar_skus = [s[0] for s in similar[:3]]
-                candidates.append({
-                    'products': [sku] + similar_skus,
-                    'llm_similarity': np.mean([s[1] for s in similar]),
-                    'source': 'llm_volume'
-                })
+    async def _gen_mixmatch(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+        # Variety within category — start with volume-like, but you could add category gating later
+        return await self._gen_volume(catalog, embeddings, n)
 
-        return candidates[:num_candidates]
+    async def _gen_bxgy(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+        # Complementary pairing similar to FBT
+        return await self._gen_fbt(catalog, embeddings, n)
 
-    async def _generate_mix_match_candidates(
+    async def _gen_fixed(
         self,
-        catalog: List[Dict],
-        embeddings: Dict[str, np.ndarray],
-        num_candidates: int
-    ) -> List[Dict]:
-        """Generate mix & match candidates (variety within category)"""
-        # Similar to volume but with more variety
-        return await self._generate_volume_candidates(catalog, embeddings, num_candidates)
-
-    async def _generate_bxgy_candidates(
-        self,
-        catalog: List[Dict],
-        embeddings: Dict[str, np.ndarray],
-        num_candidates: int
-    ) -> List[Dict]:
-        """Generate BXGY candidates (buy X, get complementary Y free)"""
-        # Similar to FBT
-        return await self._generate_fbt_candidates(catalog, embeddings, num_candidates)
-
-    async def _generate_fixed_candidates(
-        self,
-        catalog: List[Dict],
+        catalog: List[Dict[str, Any]],
         embeddings: Dict[str, np.ndarray],
         objective: str,
-        num_candidates: int
-    ) -> List[Dict]:
-        """Generate fixed bundle candidates based on objective"""
-        candidates = []
-
-        # Use objective to guide bundle creation
-        # For now, use FBT-style complementary matching
-        # TODO: Add objective-specific logic (e.g., gift boxes, seasonal)
-
-        return await self._generate_fbt_candidates(catalog, embeddings, num_candidates)
+        n: int,
+    ) -> List[Dict[str, Any]]:
+        # Placeholder: curate 2-item complementary sets; add objective-specific logic later
+        return await self._gen_fbt(catalog, embeddings, n)
 
 
 # Global instance
