@@ -173,7 +173,10 @@ class CandidateGenerator:
                 except Exception as e:
                     logger.warning(f"Failed to generate LLM candidates: {e}")
             else:
-                logger.warning(f"[{csv_upload_id}] LLM-only mode requested but no embeddings available")
+                if llm_only_mode:
+                    logger.warning(f"[{csv_upload_id}] LLM-only mode requested but no embeddings available")
+                else:
+                    logger.info(f"[{csv_upload_id}] Skipping LLM similarity candidates (no embeddings)")
 
             metrics["llm_candidates"] = len(llm_candidates)
             metrics["item2vec_candidates"] = 0  # Deprecated
