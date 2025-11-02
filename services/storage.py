@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func, desc, and_, or_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from typing import List, Optional, Dict, Any
+from types import SimpleNamespace
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -1055,11 +1056,26 @@ class StorageService:
                     lines_by_order[line.order_id] = []
                 lines_by_order[line.order_id].append(line)
             
-            # Attach order lines to their respective orders
+            # Build lightweight order representations to avoid lazy-loading outside the session
+            result_orders: List[SimpleNamespace] = []
             for order in orders:
-                order.order_lines = lines_by_order.get(order.order_id, [])
+                order_lines = [
+                    SimpleNamespace(
+                        order_id=line.order_id,
+                        sku=line.sku,
+                        variant_id=line.variant_id,
+                    )
+                    for line in lines_by_order.get(order.order_id, [])
+                ]
+                result_orders.append(
+                    SimpleNamespace(
+                        order_id=order.order_id,
+                        csv_upload_id=order.csv_upload_id,
+                        order_lines=order_lines,
+                    )
+                )
             
-            return orders
+            return result_orders
 
     async def get_orders_with_lines_by_run(self, run_id: str) -> List[Order]:
         """Get all orders and their lines for a run (join via CsvUpload.run_id)."""
@@ -1082,9 +1098,24 @@ class StorageService:
             lines_by_order = {}
             for line in all_lines:
                 lines_by_order.setdefault(line.order_id, []).append(line)
+            result_orders: List[SimpleNamespace] = []
             for order in orders:
-                order.order_lines = lines_by_order.get(order.order_id, [])
-            return orders
+                order_lines = [
+                    SimpleNamespace(
+                        order_id=line.order_id,
+                        sku=line.sku,
+                        variant_id=line.variant_id,
+                    )
+                    for line in lines_by_order.get(order.order_id, [])
+                ]
+                result_orders.append(
+                    SimpleNamespace(
+                        order_id=order.order_id,
+                        csv_upload_id=order.csv_upload_id,
+                        order_lines=order_lines,
+                    )
+                )
+            return result_orders
     
     async def get_variant_embeddings(self, csv_upload_id: str) -> Optional[str]:
         """Get stored variant embeddings (mock implementation)"""

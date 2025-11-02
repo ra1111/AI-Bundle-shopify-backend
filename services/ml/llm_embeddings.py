@@ -12,22 +12,17 @@ LLM-based Product Embeddings Engine (v2)
 from __future__ import annotations
 import os
 import json
-import math
-import time
 import hashlib
 import logging
-from typing import Any, Dict, List, Tuple, Optional, Iterable
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
+import inspect
 from openai import AsyncOpenAI
 
 from services.storage import storage  # must expose async get(key)->str|None and set(key, value, ttl=None)
 
 logger = logging.getLogger(__name__)
-
-
-def _now_ms() -> int:
-    return int(time.time() * 1000)
 
 
 class LLMEmbeddingEngine:
@@ -67,6 +62,58 @@ class LLMEmbeddingEngine:
         self.batch_size = self.BATCH_SIZE
         self.normalize = True
         self._memory_cache: Dict[str, np.ndarray] = {}
+        self._persist_ok = False
+        self._read_method = None
+        self._write_method = None
+
+        read_candidates = ("get", "get_text", "read", "read_text", "load")
+        write_candidates = ("set", "put", "write", "write_text", "save")
+
+        for obj in (storage, getattr(storage, "client", None)):
+            if not obj:
+                continue
+            if self._read_method is None:
+                for name in read_candidates:
+                    fn = getattr(obj, name, None)
+                    if fn:
+                        self._read_method = fn
+                        break
+            if self._write_method is None:
+                for name in write_candidates:
+                    fn = getattr(obj, name, None)
+                    if fn:
+                        self._write_method = fn
+                        break
+            if self._read_method and self._write_method:
+                self._persist_ok = True
+                break
+
+        if not self._persist_ok:
+            logger.info("EMBED_CACHE: persistent cache disabled (no compatible storage methods found)")
+
+    # --------- storage adapters ---------
+    async def _storage_get(self, key: str) -> Optional[str]:
+        if not self._persist_ok or self._read_method is None:
+            return None
+        result = self._read_method(key)
+        result = await result if inspect.isawaitable(result) else result
+        if isinstance(result, (bytes, bytearray)):
+            result = result.decode("utf-8", errors="ignore")
+        return result
+
+    async def _storage_set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
+        if not self._persist_ok or self._write_method is None:
+            return
+        try:
+            result = None
+            try:
+                result = self._write_method(key, value, ttl=ttl)
+            except TypeError:
+                result = self._write_method(key, value)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:
+            logger.warning("EMBED_CACHE: write failed for key=%s: %s", key, e)
 
     # --------- text synthesis & cache keys ---------
     @staticmethod
@@ -135,9 +182,11 @@ class LLMEmbeddingEngine:
         # persistent
         try:
             skey = self._storage_key(cache_key)
-            blob = await storage.get(skey)
+            blob = await self._storage_get(skey)
             if not blob:
                 return None
+            if isinstance(blob, (bytes, bytearray)):
+                blob = blob.decode("utf-8", errors="ignore")
             vec = np.array(json.loads(blob), dtype=np.float32)
             if self.normalize:
                 vec = self._l2(vec)
@@ -153,7 +202,8 @@ class LLMEmbeddingEngine:
         self._memory_cache[cache_key] = vec
         try:
             skey = self._storage_key(cache_key)
-            await storage.set(skey, json.dumps(vec.tolist()), ttl=self.CACHE_TTL_S)
+            payload = json.dumps(vec.tolist())
+            await self._storage_set(skey, payload, ttl=self.CACHE_TTL_S)
         except Exception as e:
             logger.warning(f"EMBED_CACHE: write failed for key={cache_key}: {e}")
 
@@ -195,7 +245,7 @@ class LLMEmbeddingEngine:
         cache_hits = 0
 
         for p in products:
-            sku = p.get("sku")
+            sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
             if not sku:
                 continue
             text = self._create_product_text(p)
@@ -276,8 +326,14 @@ class LLMEmbeddingEngine:
         attempt = 0
         while True:
             try:
-                resp = await self.client.embeddings.create(model=self.model, input=texts)
+                resp = await self.client.embeddings.create(
+                    model=self.model,
+                    input=texts,
+                    timeout=30,
+                )
                 data = resp.data or []
+                if data and getattr(data[0], "embedding", None) is not None:
+                    self.embedding_dim = len(data[0].embedding)
                 out: List[np.ndarray] = []
                 for i in range(len(texts)):
                     if i >= len(data) or not getattr(data[i], "embedding", None):
@@ -290,7 +346,8 @@ class LLMEmbeddingEngine:
                 attempt += 1
                 msg = str(e)
                 # non-retryable (e.g., bad key/headers)
-                if "Illegal header value" in msg or "authentication" in msg.lower():
+                nonretry_signals = ("Illegal header value", "authentication", "invalid_api_key", "401")
+                if any(sig.lower() in msg.lower() for sig in nonretry_signals):
                     logger.error("EMBED: non-retryable error: %s", msg)
                     return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts]
                 if attempt > self.RETRY_MAX:
@@ -323,7 +380,7 @@ class LLMEmbeddingEngine:
         t = embeddings[target_sku]
         sims: List[Tuple[str, float]] = []
         for p in catalog:
-            sku = p.get("sku")
+            sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
             if not sku or sku == target_sku:
                 continue
             v = embeddings.get(sku)
