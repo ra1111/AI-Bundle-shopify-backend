@@ -208,10 +208,22 @@ class CandidateGenerator:
             all_candidates = self.combine_candidates(
                 apriori_candidates, fpgrowth_candidates, llm_candidates, top_pair_candidates
             )
+            logger.debug(
+                "[%s] Candidate generation breakdown | mode=%s apriori=%d fpgrowth=%d llm=%d top_pair=%d combined=%d",
+                csv_upload_id,
+                "llm_only" if llm_only_mode else "hybrid",
+                len(apriori_candidates),
+                len(fpgrowth_candidates),
+                len(llm_candidates),
+                len(top_pair_candidates),
+                len(all_candidates),
+            )
 
             # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
             original_count = len(all_candidates)
-            all_candidates = self.filter_candidates_by_valid_skus(all_candidates, valid_skus, varid_to_sku)
+        all_candidates = self.filter_candidates_by_valid_skus(
+            all_candidates, valid_skus, varid_to_sku, csv_upload_id=csv_upload_id
+        )
             invalid_filtered = original_count - len(all_candidates)
             metrics["invalid_sku_candidates_filtered"] = invalid_filtered
 
@@ -384,7 +396,13 @@ class CandidateGenerator:
         )
         return candidates
     
-    def filter_candidates_by_valid_skus(self, candidates: List[Dict[str, Any]], valid_skus: Set[str], varid_to_sku: Dict[str, str]) -> List[Dict[str, Any]]:
+    def filter_candidates_by_valid_skus(
+        self,
+        candidates: List[Dict[str, Any]],
+        valid_skus: Set[str],
+        varid_to_sku: Dict[str, str],
+        csv_upload_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Filter out candidates containing invalid products.
         Accept either SKU directly or variant_id that can be mapped to a SKU via varid_to_sku.
         """
@@ -393,33 +411,73 @@ class CandidateGenerator:
             return candidates
         
         filtered_candidates = []
+        scope = csv_upload_id or "unknown_upload"
         for candidate in candidates:
             products = candidate.get("products", [])
-            if isinstance(products, list) and len(products) >= 2:
-                # Normalize products to SKUs for validation
-                normalized = []
-                all_valid = True
+            failure_reason = None
+            failure_product = None
+            normalized: List[str] = []
+            all_valid = True
+
+            if not isinstance(products, list) or len(products) < 2:
+                all_valid = False
+                failure_reason = "insufficient products"
+            else:
                 for p in products:
                     if p is None:
                         all_valid = False
+                        failure_reason = "null product entry"
+                        failure_product = p
                         break
-                    p_str = str(p)
+
+                    p_str = str(p).strip()
+                    if not p_str:
+                        all_valid = False
+                        failure_reason = "empty identifier"
+                        failure_product = p
+                        break
+
                     if p_str in valid_skus:
                         normalized.append(p_str)
-                    elif p_str in varid_to_sku and varid_to_sku[p_str] in valid_skus:
-                        normalized.append(varid_to_sku[p_str])
+                        continue
+
+                    mapped = varid_to_sku.get(p_str)
+                    if mapped and mapped in valid_skus:
+                        normalized.append(mapped)
+                        continue
+
+                    all_valid = False
+                    failure_product = p_str
+                    if mapped and mapped not in valid_skus:
+                        failure_reason = f"variant resolved to SKU {mapped} not present in catalog"
                     else:
-                        all_valid = False
-                        break
-                if all_valid:
-                    # Overwrite products with normalized SKUs so downstream pricing/selection sees valid SKUs
-                    try:
-                        candidate["products"] = normalized
-                    except Exception:
-                        pass
-                    filtered_candidates.append(candidate)
-                else:
-                    logger.debug(f"Filtered candidate with invalid products: {products}")
+                        failure_reason = "unmapped product (not SKU or variant)"
+                    break
+
+            if all_valid and len(normalized) >= 2:
+                try:
+                    candidate["products"] = normalized
+                except Exception:
+                    pass
+                filtered_candidates.append(candidate)
+            else:
+                sources = candidate.get("generation_sources") or []
+                if isinstance(sources, str):
+                    sources = [sources]
+                source = candidate.get("generation_method") or ",".join(sources)
+                source = source or "unknown"
+                source_lower = source.lower()
+                is_llm = "llm" in source_lower or any("llm" in str(s).lower() for s in sources)
+                log_fn = logger.warning if is_llm else logger.debug
+                log_fn(
+                    "[%s] Filtered candidate | source=%s bundle_type=%s offending=%s reason=%s products=%s",
+                    scope,
+                    source,
+                    candidate.get("bundle_type"),
+                    failure_product,
+                    failure_reason or "unspecified",
+                    products,
+                )
         
         return filtered_candidates
     

@@ -44,8 +44,8 @@ class LLMEmbeddingEngine:
     CACHE_TTL_S = int(os.getenv("EMBED_CACHE_TTL_S", str(60 * 60 * 24 * 30)))  # 30 days
 
     # thresholds for candidate builders (env overridable)
-    FBT_MIN = float(os.getenv("SIM_FBT_MIN", "0.40"))        # complementary floor
-    TOO_SIM = float(os.getenv("SIM_TOO_SIMILAR", "0.70"))    # skip near-duplicates
+    FBT_MIN = float(os.getenv("SIM_FBT_MIN", "0.30"))        # complementary floor (softened for sparse catalogs)
+    TOO_SIM = float(os.getenv("SIM_TOO_SIMILAR", "0.90"))    # skip near-duplicates only
     VOLUME_MIN = float(os.getenv("SIM_VOLUME_MIN", "0.70"))  # volume (very similar)
 
     # retry config
