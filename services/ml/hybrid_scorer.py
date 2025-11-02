@@ -54,17 +54,35 @@ class HybridScorer:
         Returns:
             ScoringWeights with optimal α, β, γ values
         """
-        if transaction_count < 300:
-            # Small store: Trust LLM semantic understanding
-            return ScoringWeights(alpha=0.6, beta=0.2, gamma=0.2)
+        try:
+            if transaction_count < 300:
+                # Small store: Trust LLM semantic understanding
+                weights = ScoringWeights(alpha=0.6, beta=0.2, gamma=0.2)
+                tier = "small"
+            elif transaction_count < 1200:
+                # Medium store: Balanced approach
+                weights = ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2)
+                tier = "medium"
+            else:
+                # Large store: Trust transactional data
+                weights = ScoringWeights(alpha=0.2, beta=0.6, gamma=0.2)
+                tier = "large"
 
-        elif transaction_count < 1200:
-            # Medium store: Balanced approach
+            logger.info(
+                f"HYBRID_SCORER: Dynamic weights selected | "
+                f"transaction_count={transaction_count}, tier={tier}, "
+                f"α={weights.alpha} (LLM), β={weights.beta} (transactional), γ={weights.gamma} (business)"
+            )
+
+            return weights
+
+        except Exception as e:
+            logger.error(
+                f"HYBRID_SCORER: Error selecting weights: {e} | "
+                f"Falling back to balanced weights (α=0.4, β=0.4, γ=0.2)",
+                exc_info=True
+            )
             return ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2)
-
-        else:
-            # Large store: Trust transactional data
-            return ScoringWeights(alpha=0.2, beta=0.6, gamma=0.2)
 
     def score_bundle(
         self,
@@ -194,34 +212,68 @@ class HybridScorer:
         Returns:
             Ranked list of candidates with scores
         """
-        scored_candidates = []
-
-        for candidate in candidates:
-            # Extract signals
-            llm_sim = candidate.get('llm_similarity', 0.5)
-            trans_lift = candidate.get('transactional_lift', 1.0)
-            business_sigs = candidate.get('business_signals', {})
-
-            # Score the bundle
-            score_result = self.score_bundle(
-                bundle_products=candidate.get('products', []),
-                llm_similarity=llm_sim,
-                transactional_lift=trans_lift,
-                business_signals=business_sigs,
-                transaction_count=transaction_count
+        try:
+            logger.info(
+                f"HYBRID_SCORER: Ranking candidates | "
+                f"candidate_count={len(candidates) if candidates else 0}, "
+                f"transaction_count={transaction_count}"
             )
 
-            # Add score to candidate
-            candidate['hybrid_score'] = score_result['final_score']
-            candidate['score_breakdown'] = score_result['breakdown']
-            candidate['weights_used'] = score_result['weights_used']
+            scored_candidates = []
 
-            scored_candidates.append(candidate)
+            for idx, candidate in enumerate(candidates if candidates else []):
+                try:
+                    # Extract signals
+                    llm_sim = candidate.get('llm_similarity', 0.5)
+                    trans_lift = candidate.get('transactional_lift', 1.0)
+                    business_sigs = candidate.get('business_signals', {})
 
-        # Sort by final score descending
-        scored_candidates.sort(key=lambda x: x['hybrid_score'], reverse=True)
+                    # Score the bundle
+                    score_result = self.score_bundle(
+                        bundle_products=candidate.get('products', []),
+                        llm_similarity=llm_sim,
+                        transactional_lift=trans_lift,
+                        business_signals=business_sigs,
+                        transaction_count=transaction_count
+                    )
 
-        return scored_candidates
+                    # Add score to candidate
+                    candidate['hybrid_score'] = score_result['final_score']
+                    candidate['score_breakdown'] = score_result['breakdown']
+                    candidate['weights_used'] = score_result['weights_used']
+
+                    scored_candidates.append(candidate)
+
+                except Exception as e:
+                    logger.warning(
+                        f"HYBRID_SCORER: Error scoring candidate {idx}: {e} | "
+                        f"Skipping candidate"
+                    )
+                    continue
+
+            # Sort by final score descending
+            scored_candidates.sort(key=lambda x: x.get('hybrid_score', 0), reverse=True)
+
+            if scored_candidates:
+                top_score = scored_candidates[0].get('hybrid_score', 0)
+                bottom_score = scored_candidates[-1].get('hybrid_score', 0)
+                logger.info(
+                    f"HYBRID_SCORER: Ranking complete | "
+                    f"ranked_candidates={len(scored_candidates)}, "
+                    f"score_range=[{bottom_score:.3f}, {top_score:.3f}]"
+                )
+            else:
+                logger.warning("HYBRID_SCORER: No candidates successfully scored")
+
+            return scored_candidates
+
+        except Exception as e:
+            logger.error(
+                f"HYBRID_SCORER: Error ranking candidates: {e} | "
+                f"Returning empty list",
+                exc_info=True
+            )
+            return []
 
     def merge_candidates_from_sources(
         self,

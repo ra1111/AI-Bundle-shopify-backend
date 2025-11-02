@@ -102,64 +102,107 @@ class LLMEmbeddingEngine:
 
     async def get_embeddings_batch(self, products: List[Dict], use_cache: bool = True) -> Dict[str, np.ndarray]:
         """Get embeddings for multiple products efficiently (batched API calls)"""
-        embeddings = {}
-        products_to_embed = []
-        product_texts = {}
+        try:
+            logger.info(
+                f"LLM_EMBEDDINGS: Batch embedding request | "
+                f"products={len(products) if products else 0}, use_cache={use_cache}"
+            )
 
-        # Prepare texts and check cache
-        for product in products:
-            sku = product.get('sku')
-            if not sku:
-                continue
+            embeddings = {}
+            products_to_embed = []
+            product_texts = {}
 
-            text = self._create_product_text(product)
-            cache_key = self._get_embedding_cache_key(text)
-            product_texts[sku] = text
-
-            # Check cache
-            if use_cache:
-                cached = await self._get_cached_embedding(cache_key)
-                if cached is not None:
-                    embeddings[sku] = cached
+            # Prepare texts and check cache
+            for product in products if products else []:
+                sku = product.get('sku')
+                if not sku:
                     continue
 
-            products_to_embed.append((sku, text, cache_key))
+                text = self._create_product_text(product)
+                cache_key = self._get_embedding_cache_key(text)
+                product_texts[sku] = text
 
-        if not products_to_embed:
-            logger.info("All embeddings found in cache")
+                # Check cache
+                if use_cache:
+                    cached = await self._get_cached_embedding(cache_key)
+                    if cached is not None:
+                        embeddings[sku] = cached
+                        continue
+
+                products_to_embed.append((sku, text, cache_key))
+
+            if not products_to_embed:
+                logger.info(
+                    f"LLM_EMBEDDINGS: All embeddings found in cache | "
+                    f"cached_count={len(embeddings)}"
+                )
+                return embeddings
+
+            logger.info(
+                f"LLM_EMBEDDINGS: Generating new embeddings | "
+                f"cached={len(embeddings)}, to_generate={len(products_to_embed)}, "
+                f"batches={(len(products_to_embed)-1)//self.batch_size + 1}"
+            )
+
+            # Batch the API calls
+            for i in range(0, len(products_to_embed), self.batch_size):
+                batch = products_to_embed[i:i + self.batch_size]
+                batch_texts = [text for _, text, _ in batch]
+                batch_num = i//self.batch_size + 1
+                total_batches = (len(products_to_embed)-1)//self.batch_size + 1
+
+                try:
+                    logger.info(
+                        f"LLM_EMBEDDINGS: Calling OpenAI API | "
+                        f"batch={batch_num}/{total_batches}, batch_size={len(batch)}, "
+                        f"model={self.model}"
+                    )
+
+                    response = await self.client.embeddings.create(
+                        model=self.model,
+                        input=batch_texts
+                    )
+
+                    # Process response
+                    for j, (sku, text, cache_key) in enumerate(batch):
+                        embedding = np.array(response.data[j].embedding, dtype=np.float32)
+                        embeddings[sku] = embedding
+
+                        # Cache the embedding
+                        if use_cache:
+                            await self._cache_embedding(cache_key, embedding, text)
+
+                    logger.info(
+                        f"LLM_EMBEDDINGS: Batch complete | "
+                        f"batch={batch_num}/{total_batches}, embeddings_generated={len(batch)}"
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"LLM_EMBEDDINGS: Error generating embeddings for batch {batch_num}: {e} | "
+                        f"Using zero vectors as fallback for {len(batch)} products",
+                        exc_info=True
+                    )
+                    # Use zero vectors as fallback for failed batch
+                    for sku, _, _ in batch:
+                        embeddings[sku] = np.zeros(self.embedding_dim, dtype=np.float32)
+
+            logger.info(
+                f"LLM_EMBEDDINGS: Batch embedding complete | "
+                f"total_embeddings={len(embeddings)}, "
+                f"cached={len(embeddings) - len(products_to_embed)}, "
+                f"generated={len(products_to_embed)}"
+            )
+
             return embeddings
 
-        logger.info(f"Generating {len(products_to_embed)} new embeddings (batched)")
-
-        # Batch the API calls
-        for i in range(0, len(products_to_embed), self.batch_size):
-            batch = products_to_embed[i:i + self.batch_size]
-            batch_texts = [text for _, text, _ in batch]
-
-            try:
-                response = await self.client.embeddings.create(
-                    model=self.model,
-                    input=batch_texts
-                )
-
-                # Process response
-                for j, (sku, text, cache_key) in enumerate(batch):
-                    embedding = np.array(response.data[j].embedding, dtype=np.float32)
-                    embeddings[sku] = embedding
-
-                    # Cache the embedding
-                    if use_cache:
-                        await self._cache_embedding(cache_key, embedding, text)
-
-                logger.info(f"Generated batch {i//self.batch_size + 1}/{(len(products_to_embed)-1)//self.batch_size + 1}")
-
-            except Exception as e:
-                logger.error(f"Error generating embeddings for batch starting at {i}: {e}")
-                # Use zero vectors as fallback for failed batch
-                for sku, _, _ in batch:
-                    embeddings[sku] = np.zeros(self.embedding_dim, dtype=np.float32)
-
-        return embeddings
+        except Exception as e:
+            logger.error(
+                f"LLM_EMBEDDINGS: Fatal error in batch embedding: {e} | "
+                f"Returning partial results ({len(embeddings)} embeddings)",
+                exc_info=True
+            )
+            return embeddings  # Return whatever we got
 
     async def find_similar_products(
         self,

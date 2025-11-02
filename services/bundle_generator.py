@@ -217,59 +217,147 @@ class BundleGenerator:
         Check if ML phase should be skipped due to insufficient data.
         Returns (should_skip: bool, reason: str)
         """
-        # Check transaction count
-        txn_count = len(context.transactions) if context and context.transactions else 0
-        if txn_count < self.min_transactions_for_ml:
-            reason = f"Only {txn_count} transactions (need {self.min_transactions_for_ml}+)"
-            logger.warning(f"[{csv_upload_id}] Skipping ML phase: {reason}")
-            return (True, reason)
+        try:
+            # Check transaction count
+            txn_count = len(context.transactions) if context and context.transactions else 0
+            product_count = len(context.valid_skus) if context and context.valid_skus else 0
 
-        # Check unique products
-        product_count = len(context.valid_skus) if context and context.valid_skus else 0
-        if product_count < self.min_products_for_ml:
-            reason = f"Only {product_count} unique products (need {self.min_products_for_ml}+)"
-            logger.warning(f"[{csv_upload_id}] Skipping ML phase: {reason}")
-            return (True, reason)
+            logger.info(
+                f"[{csv_upload_id}] PARETO: Early termination check | "
+                f"txn_count={txn_count} (threshold={self.min_transactions_for_ml}), "
+                f"product_count={product_count} (threshold={self.min_products_for_ml})"
+            )
 
-        return (False, "")
+            if txn_count < self.min_transactions_for_ml:
+                reason = f"Only {txn_count} transactions (need {self.min_transactions_for_ml}+)"
+                logger.warning(
+                    f"[{csv_upload_id}] PARETO: Skipping ML phase - {reason} | "
+                    f"This will save ~195s of wasted computation"
+                )
+                return (True, reason)
+
+            # Check unique products
+            if product_count < self.min_products_for_ml:
+                reason = f"Only {product_count} unique products (need {self.min_products_for_ml}+)"
+                logger.warning(
+                    f"[{csv_upload_id}] PARETO: Skipping ML phase - {reason} | "
+                    f"Insufficient product catalog for meaningful bundles"
+                )
+                return (True, reason)
+
+            logger.info(
+                f"[{csv_upload_id}] PARETO: ML phase proceeding | "
+                f"txn_count={txn_count}, product_count={product_count} | "
+                f"Both thresholds passed"
+            )
+            return (False, "")
+
+        except Exception as e:
+            logger.error(
+                f"[{csv_upload_id}] PARETO: Error in early termination check: {e} | "
+                f"Defaulting to proceed with ML phase",
+                exc_info=True
+            )
+            return (False, "")
 
     def _select_objectives_for_dataset(self, context: CandidateGenerationContext) -> List[str]:
         """
         Dynamically select objectives based on dataset size using Pareto principle.
         Returns top objectives that cover 80% of business value.
         """
-        txn_count = len(context.transactions) if context and context.transactions else 0
-        product_count = len(context.valid_skus) if context and context.valid_skus else 0
+        try:
+            txn_count = len(context.transactions) if context and context.transactions else 0
+            product_count = len(context.valid_skus) if context and context.valid_skus else 0
 
-        # Tiny dataset (<10 txns): Skip ML entirely (handled by _should_skip_ml_phase)
-        # This shouldn't be called if ML is skipped, but defensive check
-        if txn_count < 10:
-            return []
+            logger.info(
+                f"PARETO: Objective selection | "
+                f"txn_count={txn_count}, product_count={product_count}"
+            )
 
-        # Small dataset (10-50 txns): Focus on top 2 objectives (Pareto 80%)
-        if txn_count < 50:
-            objectives = ['margin_guard', 'increase_aov']  # 2 objectives × 2 types = 4 tasks
-            logger.info(f"Small dataset ({txn_count} txns): Using {len(objectives)} top objectives")
-            return objectives
+            # Tiny dataset (<10 txns): Skip ML entirely (handled by _should_skip_ml_phase)
+            # This shouldn't be called if ML is skipped, but defensive check
+            if txn_count < 10:
+                logger.warning(
+                    f"PARETO: Unexpectedly called with tiny dataset ({txn_count} txns) | "
+                    f"Should have been caught by _should_skip_ml_phase | "
+                    f"Returning empty objective list"
+                )
+                return []
 
-        # Medium dataset (50-200 txns): Top 3 objectives (Pareto 80%)
-        elif txn_count < 200:
-            objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov']  # 3 objectives × 2 types = 6 tasks
-            logger.info(f"Medium dataset ({txn_count} txns): Using {len(objectives)} objectives")
-            return objectives
+            # Small dataset (10-50 txns): Focus on top 2 objectives (Pareto 80%)
+            if txn_count < 50:
+                objectives = ['margin_guard', 'increase_aov']  # 2 objectives × 2 types = 4 tasks
+                logger.info(
+                    f"PARETO: Small dataset tier | "
+                    f"txn_count={txn_count} | "
+                    f"selected_objectives={objectives} ({len(objectives)} objectives) | "
+                    f"expected_tasks={len(objectives) * 2} (vs 40 baseline) | "
+                    f"reduction={(1 - (len(objectives) * 2) / 40) * 100:.0f}%"
+                )
+                return objectives
 
-        # Large dataset (200+ txns): Top 4 objectives
-        else:
-            objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov', 'new_launch']  # 4 objectives × 2 types = 8 tasks
-            logger.info(f"Large dataset ({txn_count} txns): Using {len(objectives)} objectives")
-            return objectives
+            # Medium dataset (50-200 txns): Top 3 objectives (Pareto 80%)
+            elif txn_count < 200:
+                objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov']  # 3 objectives × 2 types = 6 tasks
+                logger.info(
+                    f"PARETO: Medium dataset tier | "
+                    f"txn_count={txn_count} | "
+                    f"selected_objectives={objectives} ({len(objectives)} objectives) | "
+                    f"expected_tasks={len(objectives) * 2} (vs 40 baseline) | "
+                    f"reduction={(1 - (len(objectives) * 2) / 40) * 100:.0f}%"
+                )
+                return objectives
+
+            # Large dataset (200+ txns): Top 4 objectives
+            else:
+                objectives = ['margin_guard', 'clear_slow_movers', 'increase_aov', 'new_launch']  # 4 objectives × 2 types = 8 tasks
+                logger.info(
+                    f"PARETO: Large dataset tier | "
+                    f"txn_count={txn_count} | "
+                    f"selected_objectives={objectives} ({len(objectives)} objectives) | "
+                    f"expected_tasks={len(objectives) * 2} (vs 40 baseline) | "
+                    f"reduction={(1 - (len(objectives) * 2) / 40) * 100:.0f}%"
+                )
+                return objectives
+
+        except Exception as e:
+            logger.error(
+                f"PARETO: Error in objective selection: {e} | "
+                f"Falling back to minimal safe objectives",
+                exc_info=True
+            )
+            return ['margin_guard', 'increase_aov']  # Safe fallback
 
     def _get_bundle_types_for_objective(self, objective: str) -> List[str]:
         """
         Get the best-fit bundle types for a given objective.
         Returns 1-2 bundle types instead of all 5.
         """
-        return self.objective_to_bundle_types.get(objective, ['FBT'])  # Default to FBT if not mapped
+        try:
+            types = self.objective_to_bundle_types.get(objective, ['FBT'])
+
+            if objective not in self.objective_to_bundle_types:
+                logger.warning(
+                    f"PARETO: Unknown objective '{objective}' | "
+                    f"Falling back to default bundle type ['FBT'] | "
+                    f"Known objectives: {list(self.objective_to_bundle_types.keys())}"
+                )
+            else:
+                logger.info(
+                    f"PARETO: Bundle type mapping | "
+                    f"objective={objective} -> types={types} | "
+                    f"Reduced from 5 types to {len(types)} type(s)"
+                )
+
+            return types
+
+        except Exception as e:
+            logger.error(
+                f"PARETO: Error getting bundle types for objective '{objective}': {e} | "
+                f"Falling back to safe default ['FBT']",
+                exc_info=True
+            )
+            return ['FBT']  # Safe fallback
 
     async def _apply_forced_pair_fallbacks(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> List[Dict[str, Any]]:
         """Inject top association rule pairs when coverage is too low."""
@@ -575,48 +663,116 @@ class BundleGenerator:
                 # PARALLEL EXECUTION: Generate selected objective/bundle_type combinations concurrently
                 # Build list of tasks using intelligent bundle type mapping
                 generation_tasks = []
-                for objective_name in selected_objectives:
-                    # Get best-fit bundle types for this objective (1-2 types instead of all 5)
-                    bundle_types_for_objective = self._get_bundle_types_for_objective(objective_name)
-                    for bundle_type in bundle_types_for_objective:
-                        task = self.generate_objective_bundles(
-                            csv_upload_id,
-                            objective_name,
-                            bundle_type,
-                            metrics,
-                            end_time,
-                            candidate_context,
-                        )
-                        generation_tasks.append((objective_name, bundle_type, task))
+                try:
+                    for objective_name in selected_objectives:
+                        # Get best-fit bundle types for this objective (1-2 types instead of all 5)
+                        bundle_types_for_objective = self._get_bundle_types_for_objective(objective_name)
+                        for bundle_type in bundle_types_for_objective:
+                            task = self.generate_objective_bundles(
+                                csv_upload_id,
+                                objective_name,
+                                bundle_type,
+                                metrics,
+                                end_time,
+                                candidate_context,
+                            )
+                            generation_tasks.append((objective_name, bundle_type, task))
+                            logger.debug(
+                                f"PARETO: Task created | "
+                                f"objective={objective_name}, bundle_type={bundle_type}"
+                            )
 
-                # Log reduction
-                old_task_count = len(self.objectives) * len(self.bundle_types)  # 40 tasks
-                new_task_count = len(generation_tasks)
-                reduction_pct = int((1 - new_task_count / old_task_count) * 100) if old_task_count > 0 else 0
-                logger.info(f"[{csv_upload_id}] Pareto optimization: {old_task_count} tasks → {new_task_count} tasks ({reduction_pct}% reduction)")
-                logger.info(f"[{csv_upload_id}] Running {len(generation_tasks)} objective/bundle_type combinations in parallel")
+                    # Log reduction
+                    old_task_count = len(self.objectives) * len(self.bundle_types)  # 40 tasks
+                    new_task_count = len(generation_tasks)
+                    reduction_pct = int((1 - new_task_count / old_task_count) * 100) if old_task_count > 0 else 0
+
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Task creation complete | "
+                        f"old_task_count={old_task_count} (8 objectives × 5 types) → "
+                        f"new_task_count={new_task_count} | "
+                        f"reduction={reduction_pct}% | "
+                        f"selected_objectives={selected_objectives}"
+                    )
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Starting parallel execution | "
+                        f"tasks={new_task_count}, concurrency_limit={self.phase3_concurrency_limit}"
+                    )
+
+                except Exception as e:
+                    logger.error(
+                        f"[{csv_upload_id}] PARETO: Error building generation tasks: {e} | "
+                        f"Proceeding with {len(generation_tasks)} tasks created so far",
+                        exc_info=True
+                    )
+                    # Continue with whatever tasks were successfully created
 
                 parallel_start = time.time()
 
                 # Execute all tasks concurrently
-                tasks_only = [task for _, _, task in generation_tasks]
-                results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
+                try:
+                    tasks_only = [task for _, _, task in generation_tasks]
 
-                parallel_duration = int((time.time() - parallel_start) * 1000)
-                logger.info(f"[{csv_upload_id}] Parallel execution wall-clock time: {parallel_duration}ms")
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Executing parallel tasks | "
+                        f"task_count={len(tasks_only)}"
+                    )
 
-                # Process results and count successes/failures
-                for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
-                    if isinstance(result, Exception):
-                        logger.warning(f"Failed to generate bundles for {objective_name}/{bundle_type}: {result}")
-                        self.generation_stats['failed_attempts'] += 1
-                    elif isinstance(result, list):
-                        all_recommendations.extend(result)
-                        if len(result) > 0:
-                            objectives_processed += 1
-                            logger.info(f"Generated {len(result)} bundles for {objective_name}/{bundle_type}")
+                    results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
 
-                logger.info(f"[{csv_upload_id}] Parallel execution complete: {len(all_recommendations)} total candidates from {objectives_processed} successful combinations")
+                    parallel_duration = int((time.time() - parallel_start) * 1000)
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Parallel execution complete | "
+                        f"wall_clock_time={parallel_duration}ms, "
+                        f"avg_time_per_task={parallel_duration // len(tasks_only) if tasks_only else 0}ms"
+                    )
+
+                    # Process results and count successes/failures
+                    success_count = 0
+                    failure_count = 0
+                    empty_count = 0
+
+                    for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
+                        if isinstance(result, Exception):
+                            logger.warning(
+                                f"[{csv_upload_id}] PARETO: Task failed | "
+                                f"objective={objective_name}, bundle_type={bundle_type}, "
+                                f"error={str(result)[:100]}"
+                            )
+                            self.generation_stats['failed_attempts'] += 1
+                            failure_count += 1
+                        elif isinstance(result, list):
+                            all_recommendations.extend(result)
+                            if len(result) > 0:
+                                objectives_processed += 1
+                                success_count += 1
+                                logger.info(
+                                    f"[{csv_upload_id}] PARETO: Task succeeded | "
+                                    f"objective={objective_name}, bundle_type={bundle_type}, "
+                                    f"bundles_generated={len(result)}"
+                                )
+                            else:
+                                empty_count += 1
+                                logger.debug(
+                                    f"PARETO: Task completed but generated 0 bundles | "
+                                    f"objective={objective_name}, bundle_type={bundle_type}"
+                                )
+
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Result processing complete | "
+                        f"total_candidates={len(all_recommendations)}, "
+                        f"successful_combinations={objectives_processed}, "
+                        f"success={success_count}, empty={empty_count}, failed={failure_count}"
+                    )
+
+                except Exception as e:
+                    parallel_duration = int((time.time() - parallel_start) * 1000)
+                    logger.error(
+                        f"[{csv_upload_id}] PARETO: Error during parallel execution: {e} | "
+                        f"partial_results={len(all_recommendations)} candidates | "
+                        f"duration={parallel_duration}ms",
+                        exc_info=True
+                    )
 
                 phase3_duration = int((time.time() - phase3_start) * 1000)
                 logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
