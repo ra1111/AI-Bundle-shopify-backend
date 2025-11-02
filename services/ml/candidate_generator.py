@@ -27,6 +27,7 @@ class CandidateGenerationContext:
     transactions: List[Set[str]]
     sequences: List[List[str]]
     embeddings: Dict[str, np.ndarray]
+    llm_only: bool = False
 
 class CandidateGenerator:
     """Advanced candidate generation using ML techniques"""
@@ -112,28 +113,37 @@ class CandidateGenerator:
             varid_to_sku = context.varid_to_sku if context else await self.get_variantid_to_sku_map(csv_upload_id)
             logger.info(f"Found {len(valid_skus)} valid SKUs for prefiltering")
             
+            llm_only_mode = bool(getattr(context, "llm_only", False))
+            if llm_only_mode:
+                metrics["generation_method"] = "llm_only"
+                logger.info(f"[{csv_upload_id}] LLM-only candidate generation enabled (sparse dataset)")
+            
             # Generate candidates from multiple sources
             apriori_candidates = []
             item2vec_candidates = []
             fpgrowth_candidates = []
             
-            # 1. Traditional Apriori rules (existing)
-            association_rules = (
-                await storage.get_association_rules_by_run(run_id)
-                if run_id else await storage.get_association_rules(csv_upload_id)
-            )
-            apriori_candidates = self.convert_rules_to_candidates(association_rules, bundle_type)
-            metrics["apriori_candidates"] = len(apriori_candidates)
-            
-            # 2. FPGrowth algorithm (more efficient)
-            if self.use_fpgrowth:
-                transactions = context.transactions if context else None
-                fpgrowth_candidates = await self.generate_fpgrowth_candidates(
-                    csv_upload_id,
-                    bundle_type,
-                    transactions=transactions,
+            if not llm_only_mode:
+                # 1. Traditional Apriori rules (existing)
+                association_rules = (
+                    await storage.get_association_rules_by_run(run_id)
+                    if run_id else await storage.get_association_rules(csv_upload_id)
                 )
-                metrics["fpgrowth_candidates"] = len(fpgrowth_candidates)
+                apriori_candidates = self.convert_rules_to_candidates(association_rules, bundle_type)
+                metrics["apriori_candidates"] = len(apriori_candidates)
+                
+                # 2. FPGrowth algorithm (more efficient)
+                if self.use_fpgrowth:
+                    transactions = context.transactions if context else None
+                    fpgrowth_candidates = await self.generate_fpgrowth_candidates(
+                        csv_upload_id,
+                        bundle_type,
+                        transactions=transactions,
+                    )
+                    metrics["fpgrowth_candidates"] = len(fpgrowth_candidates)
+            else:
+                metrics["apriori_candidates"] = 0
+                metrics["fpgrowth_candidates"] = 0
             
             # 3. LLM embeddings (semantic similarity) - REPLACES item2vec
             embeddings = context.embeddings if context else {}
@@ -162,18 +172,24 @@ class CandidateGenerator:
                     logger.info(f"Generated {len(llm_candidates)} LLM-based candidates")
                 except Exception as e:
                     logger.warning(f"Failed to generate LLM candidates: {e}")
+            else:
+                logger.warning(f"[{csv_upload_id}] LLM-only mode requested but no embeddings available")
 
             metrics["llm_candidates"] = len(llm_candidates)
             metrics["item2vec_candidates"] = 0  # Deprecated
             
             # 4. Deterministic top-pair mining to guarantee strongest co-purchases make it through
-            transactions_for_pairs = context.transactions if context else None
-            top_pair_candidates = await self.generate_top_pair_candidates(
-                csv_upload_id,
-                bundle_type,
-                transactions=transactions_for_pairs,
-            )
-            metrics["top_pair_candidates"] = len(top_pair_candidates)
+            top_pair_candidates = []
+            if not llm_only_mode:
+                transactions_for_pairs = context.transactions if context else None
+                top_pair_candidates = await self.generate_top_pair_candidates(
+                    csv_upload_id,
+                    bundle_type,
+                    transactions=transactions_for_pairs,
+                )
+                metrics["top_pair_candidates"] = len(top_pair_candidates)
+            else:
+                metrics["top_pair_candidates"] = 0
 
             # 5. Combine and deduplicate candidates (using LLM + transactional)
             all_candidates = self.combine_candidates(

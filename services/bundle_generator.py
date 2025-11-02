@@ -94,6 +94,7 @@ class BundleGenerator:
         # Early termination thresholds
         self.min_transactions_for_ml = 10  # Skip ML phase if < 10 transactions
         self.min_products_for_ml = 5       # Skip ML phase if < 5 unique products
+        self.min_transactions_for_llm_only = int(os.getenv("MIN_TXNS_FOR_LLM_ONLY", "1"))
         
         # Bundle generation thresholds
         self.base_min_support = 0.05
@@ -229,6 +230,20 @@ class BundleGenerator:
             )
 
             if txn_count < self.min_transactions_for_ml:
+                # Allow LLM-only generation for sparse datasets when embeddings exist
+                if (
+                    context
+                    and context.embeddings
+                    and len(context.embeddings) >= 2
+                    and txn_count >= self.min_transactions_for_llm_only
+                ):
+                    context.llm_only = True
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Enabling LLM-only candidate generation | "
+                        f"txn_count={txn_count} embeddings={len(context.embeddings)}"
+                    )
+                    return (False, "")
+
                 reason = f"Only {txn_count} transactions (need {self.min_transactions_for_ml}+)"
                 logger.warning(
                     f"[{csv_upload_id}] PARETO: Skipping ML phase - {reason} | "
@@ -238,12 +253,18 @@ class BundleGenerator:
 
             # Check unique products
             if product_count < self.min_products_for_ml:
-                reason = f"Only {product_count} unique products (need {self.min_products_for_ml}+)"
-                logger.warning(
-                    f"[{csv_upload_id}] PARETO: Skipping ML phase - {reason} | "
-                    f"Insufficient product catalog for meaningful bundles"
-                )
-                return (True, reason)
+                if context and getattr(context, "llm_only", False) and product_count >= 2:
+                    logger.info(
+                        f"[{csv_upload_id}] PARETO: Proceeding with LLM-only flow despite small catalog | "
+                        f"product_count={product_count}"
+                    )
+                else:
+                    reason = f"Only {product_count} unique products (need {self.min_products_for_ml}+)"
+                    logger.warning(
+                        f"[{csv_upload_id}] PARETO: Skipping ML phase - {reason} | "
+                        f"Insufficient product catalog for meaningful bundles"
+                    )
+                    return (True, reason)
 
             logger.info(
                 f"[{csv_upload_id}] PARETO: ML phase proceeding | "
