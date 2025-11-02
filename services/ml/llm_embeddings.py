@@ -372,6 +372,7 @@ class LLMEmbeddingEngine:
         embeddings: Dict[str, np.ndarray],
         top_k: int = 20,
         min_similarity: float = 0.5,
+        csv_upload_id: Optional[str] = None,
     ) -> List[Tuple[str, float]]:
         if target_sku not in embeddings:
             logger.warning("SIM: target SKU %s missing embedding", target_sku)
@@ -379,6 +380,8 @@ class LLMEmbeddingEngine:
 
         t = embeddings[target_sku]
         sims: List[Tuple[str, float]] = []
+        highest_miss: Optional[float] = None
+        scope = csv_upload_id or "unknown_upload"
         for p in catalog:
             sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
             if not sku or sku == target_sku:
@@ -389,8 +392,21 @@ class LLMEmbeddingEngine:
             s = self._cosine(t, v)
             if s >= min_similarity:
                 sims.append((sku, float(s)))
+            else:
+                if highest_miss is None or s > highest_miss:
+                    highest_miss = float(s)
 
         sims.sort(key=lambda x: x[1], reverse=True)
+        if highest_miss is not None and logger.isEnabledFor(logging.DEBUG):
+            delta = max(min_similarity - highest_miss, 0.0)
+            logger.debug(
+                "[%s] SIM miss | target=%s threshold=%.3f below=%.3f delta=%.3f",
+                scope,
+                target_sku,
+                min_similarity,
+                highest_miss,
+                delta,
+            )
         return sims[:top_k]
 
     def compute_bundle_similarity(self, products: List[str], embeddings: Dict[str, np.ndarray]) -> float:
@@ -419,21 +435,28 @@ class LLMEmbeddingEngine:
             return []
         bt = (bundle_type or "").upper()
         if bt == "FBT":
-            return await self._gen_fbt(catalog, embeddings, num_candidates)
+            return await self._gen_fbt(catalog, embeddings, num_candidates, csv_upload_id=csv_upload_id)
         if bt == "VOLUME_DISCOUNT":
-            return await self._gen_volume(catalog, embeddings, num_candidates)
+            return await self._gen_volume(catalog, embeddings, num_candidates, csv_upload_id=csv_upload_id)
         if bt == "MIX_MATCH":
-            return await self._gen_mixmatch(catalog, embeddings, num_candidates)
+            return await self._gen_mixmatch(catalog, embeddings, num_candidates, csv_upload_id=csv_upload_id)
         if bt == "BXGY":
-            return await self._gen_bxgy(catalog, embeddings, num_candidates)
+            return await self._gen_bxgy(catalog, embeddings, num_candidates, csv_upload_id=csv_upload_id)
         if bt == "FIXED":
-            return await self._gen_fixed(catalog, embeddings, objective, num_candidates)
+            return await self._gen_fixed(catalog, embeddings, objective, num_candidates, csv_upload_id=csv_upload_id)
         return []
 
     # ---- internal generators ----
-    async def _gen_fbt(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+    async def _gen_fbt(
+        self,
+        catalog: List[Dict[str, Any]],
+        embeddings: Dict[str, np.ndarray],
+        n: int,
+        csv_upload_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(50, len(catalog))]
+        scope = csv_upload_id or "unknown_upload"
         for p in head:
             sku = p.get("sku")
             if not sku or sku not in embeddings:
@@ -444,16 +467,34 @@ class LLMEmbeddingEngine:
                 embeddings=embeddings,
                 top_k=10,
                 min_similarity=self.FBT_MIN,
+                csv_upload_id=csv_upload_id,
             )
             for s_sku, sim in neigh[:5]:
                 if sim > self.TOO_SIM:
+                    if logger.isEnabledFor(logging.DEBUG):
+                        delta = sim - self.TOO_SIM
+                        logger.debug(
+                            "[%s] SIM near-duplicate filtered | target=%s candidate=%s sim=%.3f limit=%.3f delta=%.3f",
+                            scope,
+                            sku,
+                            s_sku,
+                            sim,
+                            self.TOO_SIM,
+                            delta,
+                        )
                     continue  # skip near-duplicates
                 out.append({"products": [sku, s_sku], "llm_similarity": sim, "source": "llm_fbt"})
                 if len(out) >= n:
                     return out
         return out[:n]
 
-    async def _gen_volume(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+    async def _gen_volume(
+        self,
+        catalog: List[Dict[str, Any]],
+        embeddings: Dict[str, np.ndarray],
+        n: int,
+        csv_upload_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(30, len(catalog))]
         for p in head:
@@ -466,6 +507,7 @@ class LLMEmbeddingEngine:
                 embeddings=embeddings,
                 top_k=5,
                 min_similarity=self.VOLUME_MIN,
+                csv_upload_id=csv_upload_id,
             )
             if len(neigh) >= 2:
                 skus = [s for s, _ in neigh[:3]]
@@ -475,13 +517,25 @@ class LLMEmbeddingEngine:
                     return out
         return out[:n]
 
-    async def _gen_mixmatch(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+    async def _gen_mixmatch(
+        self,
+        catalog: List[Dict[str, Any]],
+        embeddings: Dict[str, np.ndarray],
+        n: int,
+        csv_upload_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         # Variety within category — start with volume-like, but you could add category gating later
-        return await self._gen_volume(catalog, embeddings, n)
+        return await self._gen_volume(catalog, embeddings, n, csv_upload_id=csv_upload_id)
 
-    async def _gen_bxgy(self, catalog: List[Dict[str, Any]], embeddings: Dict[str, np.ndarray], n: int) -> List[Dict[str, Any]]:
+    async def _gen_bxgy(
+        self,
+        catalog: List[Dict[str, Any]],
+        embeddings: Dict[str, np.ndarray],
+        n: int,
+        csv_upload_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         # Complementary pairing similar to FBT
-        return await self._gen_fbt(catalog, embeddings, n)
+        return await self._gen_fbt(catalog, embeddings, n, csv_upload_id=csv_upload_id)
 
     async def _gen_fixed(
         self,
@@ -489,9 +543,10 @@ class LLMEmbeddingEngine:
         embeddings: Dict[str, np.ndarray],
         objective: str,
         n: int,
+        csv_upload_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         # Placeholder: curate 2-item complementary sets; add objective-specific logic later
-        return await self._gen_fbt(catalog, embeddings, n)
+        return await self._gen_fbt(catalog, embeddings, n, csv_upload_id=csv_upload_id)
 
 
 # Global instance
