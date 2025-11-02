@@ -243,10 +243,12 @@ class LLMEmbeddingEngine:
         pending: List[Tuple[str, str, str]] = []  # (sku, text, cache_key)
         text_to_skus: Dict[str, List[str]] = {}
         cache_hits = 0
+        missing_sku = 0
 
         for p in products:
             sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
             if not sku:
+                missing_sku += 1
                 continue
             text = self._create_product_text(p)
             cache_key = self._hash(text)
@@ -260,6 +262,9 @@ class LLMEmbeddingEngine:
 
             pending.append((sku, text, cache_key))
             text_to_skus.setdefault(cache_key, []).append(sku)
+
+        if missing_sku:
+            logger.info("LLM_EMBEDDINGS: skipped %d catalog entries with no SKU/variant identifier", missing_sku)
 
         if not pending:
             logger.info("LLM_EMBEDDINGS: served fully from cache | cache_hits=%d", cache_hits)
@@ -407,6 +412,14 @@ class LLMEmbeddingEngine:
                 highest_miss,
                 delta,
             )
+        if not sims:
+            logger.info(
+                "[%s] SIM search produced no matches | target=%s threshold=%.3f catalog_checked=%d",
+                scope,
+                target_sku,
+                min_similarity,
+                len(catalog),
+            )
         return sims[:top_k]
 
     def compute_bundle_similarity(self, products: List[str], embeddings: Dict[str, np.ndarray]) -> float:
@@ -457,9 +470,19 @@ class LLMEmbeddingEngine:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(50, len(catalog))]
         scope = csv_upload_id or "unknown_upload"
+        anchors_total = len(head)
+        anchors_missing_sku = 0
+        anchors_missing_embedding = 0
+        neighbors_total = 0
+        neighbors_added = 0
+        neighbors_too_similar = 0
         for p in head:
             sku = p.get("sku")
             if not sku or sku not in embeddings:
+                if not sku:
+                    anchors_missing_sku += 1
+                else:
+                    anchors_missing_embedding += 1
                 continue
             neigh = await self.find_similar_products(
                 target_sku=sku,
@@ -470,6 +493,7 @@ class LLMEmbeddingEngine:
                 csv_upload_id=csv_upload_id,
             )
             for s_sku, sim in neigh[:5]:
+                neighbors_total += 1
                 if sim > self.TOO_SIM:
                     if logger.isEnabledFor(logging.DEBUG):
                         delta = sim - self.TOO_SIM
@@ -482,10 +506,34 @@ class LLMEmbeddingEngine:
                             self.TOO_SIM,
                             delta,
                         )
+                    neighbors_too_similar += 1
                     continue  # skip near-duplicates
                 out.append({"products": [sku, s_sku], "llm_similarity": sim, "source": "llm_fbt"})
+                neighbors_added += 1
                 if len(out) >= n:
+                    logger.info(
+                        "[%s] LLM FBT generation summary | anchors=%d missing_sku=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
+                        scope,
+                        anchors_total,
+                        anchors_missing_sku,
+                        anchors_missing_embedding,
+                        neighbors_total,
+                        neighbors_added,
+                        neighbors_too_similar,
+                        n,
+                    )
                     return out
+        logger.info(
+            "[%s] LLM FBT generation summary | anchors=%d missing_sku=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
+            scope,
+            anchors_total,
+            anchors_missing_sku,
+            anchors_missing_embedding,
+            neighbors_total,
+            neighbors_added,
+            neighbors_too_similar,
+            min(n, len(out)),
+        )
         return out[:n]
 
     async def _gen_volume(
@@ -497,9 +545,15 @@ class LLMEmbeddingEngine:
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(30, len(catalog))]
+        scope = csv_upload_id or "unknown_upload"
+        anchors_total = len(head)
+        anchors_missing = 0
+        neighbors_total = 0
+        neighbors_added = 0
         for p in head:
             sku = p.get("sku")
             if not sku or sku not in embeddings:
+                anchors_missing += 1
                 continue
             neigh = await self.find_similar_products(
                 target_sku=sku,
@@ -511,10 +565,27 @@ class LLMEmbeddingEngine:
             )
             if len(neigh) >= 2:
                 skus = [s for s, _ in neigh[:3]]
+                neighbors_total += len(neigh[:3])
                 avg_sim = float(np.mean([x for _, x in neigh[:3]]))
                 out.append({"products": [sku] + skus, "llm_similarity": avg_sim, "source": "llm_volume"})
+                neighbors_added += 1
                 if len(out) >= n:
+                    logger.info(
+                        "[%s] LLM volume generation summary | anchors=%d missing=%d neighbor_sets=%d",
+                        scope,
+                        anchors_total,
+                        anchors_missing,
+                        neighbors_added,
+                    )
                     return out
+        logger.info(
+            "[%s] LLM volume generation summary | anchors=%d missing=%d neighbor_sets=%d neighbors_considered=%d",
+            scope,
+            anchors_total,
+            anchors_missing,
+            neighbors_added,
+            neighbors_total,
+        )
         return out[:n]
 
     async def _gen_mixmatch(

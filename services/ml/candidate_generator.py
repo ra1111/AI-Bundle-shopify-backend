@@ -37,6 +37,7 @@ class CandidateGenerator:
         self.embedding_dim = 64
         self.min_frequency = 2
         self.use_fpgrowth = True  # Feature flag for FPGrowth vs Apriori
+        self.small_store_relax_threshold = 30  # Allow looser filtering when catalog is tiny
     
     async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
         """Prefetch expensive data needed by candidate generation."""
@@ -68,10 +69,22 @@ class CandidateGenerator:
                 }
                 for item in catalog
             ]
+            with_sku = sum(1 for item in catalog_list if item.get('sku'))
+            logger.info(
+                "[%s] Preparing LLM embeddings | catalog_items=%d with_sku=%d",
+                csv_upload_id,
+                len(catalog_list),
+                with_sku,
+            )
 
             logger.info(f"Generating LLM embeddings for {len(catalog_list)} products...")
             embeddings = await llm_embedding_engine.get_embeddings_batch(catalog_list, use_cache=True)
             logger.info(f"LLM embeddings generated in {time.time() - start_time:.2f}s")
+            logger.info(
+                "[%s] Embedding result | embeddings_available=%d",
+                csv_upload_id,
+                len(embeddings),
+            )
 
         except Exception as e:
             logger.warning(f"Failed to generate LLM embeddings: {e}. Continuing without embeddings.")
@@ -189,6 +202,14 @@ class CandidateGenerator:
                     logger.info(f"[{csv_upload_id}] Skipping LLM similarity candidates (no embeddings)")
 
             metrics["llm_candidates"] = len(llm_candidates)
+            if embeddings and not llm_candidates:
+                logger.info(
+                    "[%s] LLM embeddings produced zero candidates | catalog_with_embeddings=%d objective=%s bundle_type=%s",
+                    csv_upload_id,
+                    len(embeddings),
+                    objective,
+                    bundle_type,
+                )
             metrics["item2vec_candidates"] = 0  # Deprecated
             
             # 4. Deterministic top-pair mining to guarantee strongest co-purchases make it through
@@ -208,7 +229,7 @@ class CandidateGenerator:
             all_candidates = self.combine_candidates(
                 apriori_candidates, fpgrowth_candidates, llm_candidates, top_pair_candidates
             )
-            logger.debug(
+            logger.info(
                 "[%s] Candidate generation breakdown | mode=%s apriori=%d fpgrowth=%d llm=%d top_pair=%d combined=%d",
                 csv_upload_id,
                 "llm_only" if llm_only_mode else "hybrid",
@@ -412,6 +433,16 @@ class CandidateGenerator:
         
         filtered_candidates = []
         scope = csv_upload_id or "unknown_upload"
+        small_store = len(valid_skus) <= self.small_store_relax_threshold
+        if small_store:
+            logger.info(
+                "[%s] Small catalog detected (valid_skus=%d). Relaxed candidate filtering enabled.",
+                scope,
+                len(valid_skus),
+            )
+        filtered_reason_counts: Dict[str, int] = defaultdict(int)
+        relaxed_reason_counts: Dict[str, int] = defaultdict(int)
+        relaxed_candidates = 0
         for candidate in candidates:
             products = candidate.get("products", [])
             failure_reason = None
@@ -468,6 +499,35 @@ class CandidateGenerator:
                 source = source or "unknown"
                 source_lower = source.lower()
                 is_llm = "llm" in source_lower or any("llm" in str(s).lower() for s in sources)
+
+                reason_key = failure_reason or "unspecified"
+                if small_store:
+                    relaxed_reason_counts[reason_key] += 1
+                    relaxed_candidates += 1
+                    fallback_products = []
+                    for original in products:
+                        original_str = str(original).strip() if original else ""
+                        if original_str in valid_skus:
+                            fallback_products.append(original_str)
+                        else:
+                            mapped = varid_to_sku.get(original_str)
+                            fallback_products.append(mapped if mapped else original_str or original)
+                    try:
+                        candidate["products"] = fallback_products
+                    except Exception:
+                        pass
+                    logger.info(
+                        "[%s] Retained candidate for small catalog | source=%s reason=%s offending=%s products=%s",
+                        scope,
+                        source,
+                        reason_key,
+                        failure_product,
+                        products,
+                    )
+                    filtered_candidates.append(candidate)
+                    continue
+
+                filtered_reason_counts[reason_key] += 1
                 log_fn = logger.warning if is_llm else logger.debug
                 log_fn(
                     "[%s] Filtered candidate | source=%s bundle_type=%s offending=%s reason=%s products=%s",
@@ -479,6 +539,22 @@ class CandidateGenerator:
                     products,
                 )
         
+        if filtered_reason_counts:
+            logger.info(
+                "[%s] Candidate filter summary | dropped=%d reasons=%s",
+                scope,
+                sum(filtered_reason_counts.values()),
+                dict(filtered_reason_counts),
+            )
+        if relaxed_reason_counts:
+            logger.info(
+                "[%s] Candidate filter relaxed summary | relaxed=%d threshold=%d reasons=%s",
+                scope,
+                relaxed_candidates,
+                self.small_store_relax_threshold,
+                dict(relaxed_reason_counts),
+            )
+
         return filtered_candidates
     
     async def generate_fpgrowth_candidates(
