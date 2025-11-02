@@ -18,9 +18,8 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 import inspect
-from openai import AsyncOpenAI
-
 from services.storage import storage  # must expose async get(key)->str|None and set(key, value, ttl=None)
+from services.ml.llm_utils import get_async_client, load_settings
 
 logger = logging.getLogger(__name__)
 
@@ -54,17 +53,18 @@ class LLMEmbeddingEngine:
     RETRY_BACKOFF_BASE_S = float(os.getenv("EMBED_RETRY_BACKOFF_BASE_S", "0.5"))
 
     def __init__(self) -> None:
-        raw_key = os.getenv("OPENAI_API_KEY", "")
-        api_key = raw_key.strip()  # remove accidental newlines/spaces
-        self.client = AsyncOpenAI(api_key=api_key)
-        self.model = self.DEFAULT_MODEL
-        self.embedding_dim = self.DEFAULT_DIM
-        self.batch_size = self.BATCH_SIZE
+        self._settings = load_settings()
+        self.client = get_async_client()
+        self.model = self._settings.embedding_model or self.DEFAULT_MODEL
+        self.embedding_dim = self._settings.embedding_dim or self.DEFAULT_DIM
+        self.batch_size = self._settings.embedding_batch_size or self.BATCH_SIZE
         self.normalize = True
         self._memory_cache: Dict[str, np.ndarray] = {}
         self._persist_ok = False
         self._read_method = None
         self._write_method = None
+        self.retry_max = self._settings.retry_max or self.RETRY_MAX
+        self.retry_backoff_base_s = self._settings.retry_backoff_base_s or self.RETRY_BACKOFF_BASE_S
 
         read_candidates = ("get", "get_text", "read", "read_text", "load")
         write_candidates = ("set", "put", "write", "write_text", "save")
@@ -350,12 +350,12 @@ class LLMEmbeddingEngine:
                 if any(sig.lower() in msg.lower() for sig in nonretry_signals):
                     logger.error("EMBED: non-retryable error: %s", msg)
                     return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts]
-                if attempt > self.RETRY_MAX:
+                if attempt > self.retry_max:
                     logger.error("EMBED: retries exhausted (%d). last error: %s", attempt, msg)
                     return [np.zeros(self.embedding_dim, dtype=np.float32) for _ in texts]
-                backoff = self.RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1)) * (1.0 + 0.1 * (attempt))
+                backoff = self.retry_backoff_base_s * (2 ** (attempt - 1)) * (1.0 + 0.1 * (attempt))
                 logger.warning("EMBED: transient error (attempt %d/%d): %s | sleeping %.2fs",
-                               attempt, self.RETRY_MAX, msg, backoff)
+                               attempt, self.retry_max, msg, backoff)
                 await self._sleep(backoff)
 
     @staticmethod

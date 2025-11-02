@@ -287,23 +287,28 @@ class BundleGenerator:
         Returns top objectives that cover 80% of business value.
         """
         try:
+            if context and getattr(context, "llm_only", False):
+                logger.info(
+                    "PARETO: LLM-only mode active | returning default objective set ['increase_aov']"
+                )
+                return ['increase_aov']
+
             txn_count = len(context.transactions) if context and context.transactions else 0
             product_count = len(context.valid_skus) if context and context.valid_skus else 0
-
+    
             logger.info(
                 f"PARETO: Objective selection | "
                 f"txn_count={txn_count}, product_count={product_count}"
             )
 
             # Tiny dataset (<10 txns): Skip ML entirely (handled by _should_skip_ml_phase)
-            # This shouldn't be called if ML is skipped, but defensive check
+            # Defensive check retained for clarity
             if txn_count < 10:
-                logger.warning(
-                    f"PARETO: Unexpectedly called with tiny dataset ({txn_count} txns) | "
-                    f"Should have been caught by _should_skip_ml_phase | "
-                    f"Returning empty objective list"
+                logger.info(
+                    f"PARETO: Tiny dataset ({txn_count} txns) without LLM-only flag | "
+                    f"falling back to minimal objective set ['increase_aov']"
                 )
-                return []
+                return ['increase_aov']
 
             # Small dataset (10-50 txns): Focus on top 2 objectives (Pareto 80%)
             if txn_count < 50:

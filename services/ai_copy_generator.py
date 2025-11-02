@@ -5,20 +5,26 @@ Generates marketing copy using OpenAI
 from typing import List, Dict, Any, Optional
 import logging
 import json
-import os
-from openai import AsyncOpenAI
+
+from services.ml.llm_utils import (
+    get_async_client,
+    load_settings,
+    run_with_common_errors,
+    should_use_llm,
+)
 
 logger = logging.getLogger(__name__)
+
 
 class AICopyGenerator:
     """AI copy generator using OpenAI"""
     
     def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=os.getenv("OPENAI_API_KEY")
-        )
-        self.model = "gpt-3.5-turbo"
-        self.max_tokens = 500
+        self._settings = load_settings()
+        self.client = get_async_client()
+        self.model = self._settings.completion_model
+        self.max_tokens = self._settings.completion_max_tokens
+        self.temperature = self._settings.completion_temperature
         
     async def generate_bundle_copy(
         self, 
@@ -27,54 +33,57 @@ class AICopyGenerator:
         context: str = ""
     ) -> Dict[str, str]:
         """Generate marketing copy for a product bundle"""
-        try:
-            if not os.getenv("OPENAI_API_KEY"):
-                logger.warning("OpenAI API key not found, using fallback copy")
-                return self.generate_fallback_copy(products, bundle_type)
-            
-            # Create prompt for OpenAI
-            prompt = self.create_bundle_prompt(products, bundle_type, context)
-            
-            # Generate copy with OpenAI
-            response = await self.client.chat.completions.create(
+        if not should_use_llm():
+            logger.warning("OpenAI API key not found, using fallback copy")
+            return self.generate_fallback_copy(products, bundle_type)
+
+        # Create prompt for OpenAI
+        prompt = self.create_bundle_prompt(products, bundle_type, context)
+
+        async def _call():
+            return await self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
                         "role": "system",
-                        "content": "You are an expert e-commerce copywriter specializing in product bundles. Generate compelling, conversion-optimized marketing copy that highlights value and encourages purchase."
+                        "content": "You are an expert e-commerce copywriter specializing in product bundles. Generate compelling, conversion-optimized marketing copy that highlights value and encourages purchase.",
                     },
                     {
                         "role": "user",
-                        "content": prompt
-                    }
+                        "content": prompt,
+                    },
                 ],
                 max_tokens=self.max_tokens,
-                temperature=0.7
+                temperature=self.temperature,
             )
-            
-            # Parse response
-            content = response.choices[0].message.content
-            if not content:
-                raise ValueError("Empty response from OpenAI")
-            
-            # Try to parse as JSON, fallback if needed
-            try:
-                ai_copy = json.loads(content)
-                # Validate required fields
-                required_fields = ["title", "description", "valueProposition", "explanation"]
-                if all(field in ai_copy for field in required_fields):
-                    return ai_copy
-                else:
-                    logger.warning("AI response missing required fields")
-                    return self.parse_text_response(content, bundle_type)
-                    
-            except json.JSONDecodeError:
-                # Parse as structured text
-                return self.parse_text_response(content, bundle_type)
-                
-        except Exception as e:
-            logger.error(f"AI copy generation error: {e}")
+
+        response = await run_with_common_errors(
+            "bundle copy generation",
+            _call,
+        )
+
+        if response is None or not response.choices:
             return self.generate_fallback_copy(products, bundle_type)
+
+        content = response.choices[0].message.content
+        if not content:
+            logger.warning("Empty response from OpenAI; using fallback copy")
+            return self.generate_fallback_copy(products, bundle_type)
+
+        # Try to parse as JSON, fallback if needed
+        try:
+            ai_copy = json.loads(content)
+            # Validate required fields
+            required_fields = ["title", "description", "valueProposition", "explanation"]
+            if all(field in ai_copy for field in required_fields):
+                return ai_copy
+            else:
+                logger.warning("AI response missing required fields")
+                return self.parse_text_response(content, bundle_type)
+
+        except json.JSONDecodeError:
+            # Parse as structured text
+            return self.parse_text_response(content, bundle_type)
     
     def create_bundle_prompt(
         self, 

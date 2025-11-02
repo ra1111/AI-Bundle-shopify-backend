@@ -170,6 +170,16 @@ class CandidateGenerator:
                         num_candidates=20
                     )
                     logger.info(f"Generated {len(llm_candidates)} LLM-based candidates")
+                    if llm_candidates:
+                        for candidate in llm_candidates:
+                            candidate.setdefault("objective", objective)
+                            candidate.setdefault("bundle_type", bundle_type)
+                            candidate.setdefault("generation_method", "llm_similarity")
+                            sources = candidate.get("generation_sources")
+                            if not sources:
+                                candidate["generation_sources"] = ["llm_similarity"]
+                            elif isinstance(sources, list) and "llm_similarity" not in sources:
+                                candidate["generation_sources"] = sources + ["llm_similarity"]
                 except Exception as e:
                     logger.warning(f"Failed to generate LLM candidates: {e}")
             else:
