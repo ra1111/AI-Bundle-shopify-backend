@@ -224,62 +224,62 @@ class ContinuousObjectiveScorer:
                 f"n_transactions={n_transactions}, n_skus={n_skus}, n_order_lines={n_order_lines}"
             )
 
-        # Product-level metrics
-        sku_to_product = {p.get('sku'): p for p in catalog if p.get('sku')}
+            # Product-level metrics
+            sku_to_product = {p.get('sku'): p for p in catalog if p.get('sku')}
 
-        # Margin statistics
-        margins = []
-        high_margin_count = 0
-        for p in catalog:
-            margin = p.get('margin', 0) or 0
-            if margin > 0:
-                margins.append(margin)
-                if margin > 0.4:  # >40% margin
-                    high_margin_count += 1
+            # Margin statistics
+            margins = []
+            high_margin_count = 0
+            for p in catalog:
+                margin = p.get('margin', 0) or 0
+                if margin > 0:
+                    margins.append(margin)
+                    if margin > 0.4:  # >40% margin
+                        high_margin_count += 1
 
-        margin_variance = float(np.var(margins)) if margins else 0
-        margin_iqr = float(stats.iqr(margins)) if len(margins) > 2 else 0
-        pct_high_margin = high_margin_count / max(n_skus, 1)
+            margin_variance = float(np.var(margins)) if margins else 0
+            margin_iqr = float(stats.iqr(margins)) if len(margins) > 2 else 0
+            pct_high_margin = high_margin_count / max(n_skus, 1)
 
-        # Velocity / slow mover analysis
-        sku_sales = {}
-        for line in order_lines:
-            sku = line.get('sku')
-            if sku:
-                sku_sales[sku] = sku_sales.get(sku, 0) + line.get('quantity', 1)
+            # Velocity / slow mover analysis
+            sku_sales = {}
+            for line in order_lines:
+                sku = line.get('sku')
+                if sku:
+                    sku_sales[sku] = sku_sales.get(sku, 0) + line.get('quantity', 1)
 
-        if sku_sales:
-            velocities = list(sku_sales.values())
-            velocity_median = float(np.median(velocities))
-            slow_movers = sum(1 for v in velocities if v < velocity_median * 0.5)
-            pct_slow_movers = slow_movers / max(len(velocities), 1)
-        else:
-            velocity_median = 0
-            pct_slow_movers = 0
-            slow_movers = 0
+            if sku_sales:
+                velocities = list(sku_sales.values())
+                velocity_median = float(np.median(velocities))
+                slow_movers = sum(1 for v in velocities if v < velocity_median * 0.5)
+                pct_slow_movers = slow_movers / max(len(velocities), 1)
+            else:
+                velocity_median = 0
+                pct_slow_movers = 0
+                slow_movers = 0
 
-        # New product analysis (created in last 30 days)
-        from datetime import datetime, timedelta
-        cutoff_date = datetime.now() - timedelta(days=30)
-        new_skus = 0
-        for p in catalog:
-            created = p.get('created_at')
-            if created and isinstance(created, datetime) and created > cutoff_date:
-                new_skus += 1
-        pct_new_skus = new_skus / max(n_skus, 1)
+            # New product analysis (created in last 30 days)
+            from datetime import datetime, timedelta
+            cutoff_date = datetime.now() - timedelta(days=30)
+            new_skus = 0
+            for p in catalog or []:
+                created = p.get('created_at')
+                if created and isinstance(created, datetime) and created > cutoff_date:
+                    new_skus += 1
+            pct_new_skus = new_skus / max(n_skus, 1)
 
-        # AOV and attach rate
-        if transactions:
-            cart_sizes = [t.get('line_item_count', 1) for t in transactions]
-            avg_items_per_order = float(np.mean(cart_sizes))
-            items_per_order_std = float(np.std(cart_sizes))
-        else:
-            avg_items_per_order = 1.0
-            items_per_order_std = 0.0
+            # AOV and attach rate
+            if transactions:
+                cart_sizes = [t.get('line_item_count', 1) for t in transactions]
+                avg_items_per_order = float(np.mean(cart_sizes))
+                items_per_order_std = float(np.std(cart_sizes))
+            else:
+                avg_items_per_order = 1.0
+                items_per_order_std = 0.0
 
             # Category diversity
             categories = set()
-            for p in catalog if catalog else []:
+            for p in catalog or []:
                 cat = p.get('product_category') or p.get('category')
                 if cat:
                     categories.add(cat)

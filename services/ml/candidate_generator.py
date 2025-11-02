@@ -221,9 +221,9 @@ class CandidateGenerator:
 
             # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
             original_count = len(all_candidates)
-        all_candidates = self.filter_candidates_by_valid_skus(
-            all_candidates, valid_skus, varid_to_sku, csv_upload_id=csv_upload_id
-        )
+            all_candidates = self.filter_candidates_by_valid_skus(
+                all_candidates, valid_skus, varid_to_sku, csv_upload_id=csv_upload_id
+            )
             invalid_filtered = original_count - len(all_candidates)
             metrics["invalid_sku_candidates_filtered"] = invalid_filtered
 
