@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import logging
 from datetime import datetime, timedelta
 from decimal import Decimal
+from sqlalchemy.exc import ProgrammingError
 
 from database import (
     AsyncSessionLocal, User, CsvUpload, Order, OrderLine, Product,
@@ -126,15 +127,7 @@ class StorageService:
         """Generic key-value getter used by embedding cache."""
         async with self.get_session() as session:
             try:
-                record = await session.get(EmbeddingCache, key)
-                if not record:
-                    return None
-                if record.expires_at and record.expires_at < datetime.utcnow():
-                    await session.delete(record)
-                    await session.commit()
-                    return None
-                logger.debug("Embedding cache hit | key=%s", key)
-                return record.payload
+                return await self._embedding_cache_get(session, key)
             except Exception:
                 logger.exception("Failed to read embedding cache key=%s", key)
                 return None
@@ -150,27 +143,82 @@ class StorageService:
 
         async with self.get_session() as session:
             try:
-                record = await session.get(EmbeddingCache, key)
-                if record:
-                    record.payload = value
-                    record.expires_at = expires_at
-                    record.updated_at = datetime.utcnow()
-                else:
-                    record = EmbeddingCache(
-                        key=key,
-                        payload=value,
-                        expires_at=expires_at,
-                    )
-                    session.add(record)
-                await session.commit()
-                logger.debug(
-                    "Embedding cache write | key=%s ttl=%s",
-                    key,
-                    ttl,
-                )
+                await self._embedding_cache_set(session, key, value, expires_at)
             except Exception:
                 logger.exception("Failed to write embedding cache key=%s", key)
                 await session.rollback()
+
+    async def _ensure_embedding_cache_table(self, session: AsyncSession) -> None:
+        async def _create(sync_session):
+            EmbeddingCache.__table__.create(
+                bind=sync_session.bind, checkfirst=True
+            )
+
+        await session.run_sync(_create)
+
+    async def _embedding_cache_get(
+        self, session: AsyncSession, key: str, retried: bool = False
+    ) -> Optional[str]:
+        try:
+            record = await session.get(EmbeddingCache, key)
+            if not record:
+                return None
+            if record.expires_at and record.expires_at < datetime.utcnow():
+                await session.delete(record)
+                await session.commit()
+                return None
+            logger.debug("Embedding cache hit | key=%s", key)
+            return record.payload
+        except ProgrammingError as exc:
+            if not retried and "embedding_cache" in str(exc).lower():
+                logger.info("Embedding cache table missing; creating now.")
+                await session.rollback()
+                await self._ensure_embedding_cache_table(session)
+                await session.commit()
+                return await self._embedding_cache_get(session, key, retried=True)
+            raise
+
+    async def _embedding_cache_set(
+        self,
+        session: AsyncSession,
+        key: str,
+        value: str,
+        expires_at: Optional[datetime],
+        retried: bool = False,
+    ) -> None:
+        try:
+            record = await session.get(EmbeddingCache, key)
+            if record:
+                record.payload = value
+                record.expires_at = expires_at
+                record.updated_at = datetime.utcnow()
+            else:
+                record = EmbeddingCache(
+                    key=key,
+                    payload=value,
+                    expires_at=expires_at,
+                )
+                session.add(record)
+            await session.commit()
+            ttl_hint = (
+                max(0, int((expires_at - datetime.utcnow()).total_seconds()))
+                if expires_at
+                else None
+            )
+            logger.debug(
+                "Embedding cache write | key=%s ttl=%s",
+                key,
+                ttl_hint,
+            )
+        except ProgrammingError as exc:
+            if not retried and "embedding_cache" in str(exc).lower():
+                logger.info("Embedding cache table missing on write; creating now.")
+                await session.rollback()
+                await self._ensure_embedding_cache_table(session)
+                await session.commit()
+                await self._embedding_cache_set(session, key, value, expires_at, retried=True)
+            else:
+                raise
     # ---------------- Run helpers ----------------
     async def get_run_id_for_upload(self, csv_upload_id: str) -> Optional[str]:
         try:

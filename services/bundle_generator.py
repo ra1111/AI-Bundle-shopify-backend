@@ -125,9 +125,6 @@ class BundleGenerator:
         end_time: Optional[datetime],
         resume_used: bool,
     ) -> bool:
-        if not self.async_defer_enabled or resume_used:
-            return False
-
         time_remaining: Optional[float] = None
         if end_time:
             time_remaining = (end_time - datetime.now()).total_seconds()
@@ -138,22 +135,24 @@ class BundleGenerator:
         tier = dataset_profile.get("tier")
         candidate_count = dataset_profile.get("candidate_count", 0)
 
+        should_defer = False
         if tier == "large":
-            return True
+            should_defer = True
+        elif not self.async_defer_large_tier_only:
+            if candidate_count >= self.async_defer_candidate_threshold:
+                should_defer = True
+            elif (
+                time_remaining is not None
+                and time_remaining <= max(0, self.async_defer_min_time_remaining)
+            ):
+                should_defer = True
 
-        if self.async_defer_large_tier_only:
+        dataset_profile["defer_candidate"] = should_defer
+
+        if not self.async_defer_enabled or resume_used:
             return False
 
-        if candidate_count >= self.async_defer_candidate_threshold:
-            return True
-
-        if (
-            time_remaining is not None
-            and time_remaining <= max(0, self.async_defer_min_time_remaining)
-        ):
-            return True
-
-        return False
+        return should_defer
 
     def _derive_allocation_plan(self, dataset_profile: Dict[str, Any]) -> Dict[str, Any]:
         plan = {
@@ -164,14 +163,92 @@ class BundleGenerator:
         tier = dataset_profile.get("tier")
         if tier == "small":
             plan["phase3_concurrency"] = max(2, min(self.phase3_concurrency_limit, 3))
-            plan["llm_candidate_target"] = 12
+            plan["llm_candidate_target"] = 9
         elif tier == "medium":
             plan["phase3_concurrency"] = min(self.phase3_concurrency_limit, 5)
-            plan["llm_candidate_target"] = 18
+            plan["llm_candidate_target"] = 15
         elif tier == "large":
             plan["phase3_concurrency"] = max(self.phase3_concurrency_limit, 8)
             plan["llm_candidate_target"] = 24
         return plan
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "1", "yes", "on"}:
+                return True
+            if lowered in {"false", "0", "no", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int = 0, minimum: Optional[int] = None) -> int:
+        result = default
+        try:
+            result = int(value)
+        except (TypeError, ValueError):
+            result = default
+        if minimum is not None and result < minimum:
+            result = minimum
+        return result
+
+    def _extract_sku_list(self, recommendation: Dict[str, Any]) -> List[str]:
+        """
+        Normalize the products payload on a recommendation into a list of SKUs.
+        Handles both simple string lists and richer dict payloads.
+        """
+        skus: List[str] = []
+        products = recommendation.get("products") or []
+        for entry in products:
+            candidate: Optional[str] = None
+            if isinstance(entry, dict):
+                candidate = (
+                    entry.get("sku")
+                    or entry.get("id")
+                    or entry.get("variant_id")
+                    or entry.get("product_id")
+                )
+            else:
+                candidate = str(entry)
+
+            if candidate:
+                candidate_str = str(candidate).strip()
+                if candidate_str:
+                    skus.append(candidate_str)
+        return skus
+
+    def _parse_stage_thresholds(self, raw: Any) -> List[int]:
+        if isinstance(raw, list):
+            candidates = raw
+        elif isinstance(raw, str):
+            stripped = raw.strip().strip("[]")
+            if not stripped:
+                candidates = []
+            else:
+                candidates = [token.strip() for token in stripped.split(",")]
+        else:
+            candidates = []
+
+        thresholds: List[int] = []
+        for token in candidates:
+            try:
+                num = int(token)
+                if num > 0:
+                    thresholds.append(num)
+            except (TypeError, ValueError):
+                continue
+
+        if not thresholds:
+            thresholds = [3, 5, 10, 20, 40]
+        thresholds = sorted(set(thresholds))
+        return thresholds
 
     def _warn_if_time_low(self, end_time: Optional[datetime], csv_upload_id: str, phase_label: str) -> None:
         if not end_time or self.soft_timeout_warning_seconds <= 0:
@@ -502,11 +579,26 @@ class BundleGenerator:
         self.medium_dataset_sku_threshold = int(os.getenv("DATASET_MEDIUM_SKU_THRESHOLD", "150"))
         self.large_dataset_sku_threshold = int(os.getenv("DATASET_LARGE_SKU_THRESHOLD", "350"))
         self.async_defer_enabled = os.getenv("BUNDLING_ASYNC_DEFER", "true").lower() != "false"
-        self.async_defer_min_time_remaining = int(os.getenv("ASYNC_DEFER_MIN_TIME", "120"))
+        self.async_defer_min_time_remaining = int(os.getenv("ASYNC_DEFER_MIN_TIME", "45"))
         self.async_defer_candidate_threshold = int(os.getenv("ASYNC_DEFER_CANDIDATE_THRESHOLD", "120"))
         self.async_defer_large_tier_only = os.getenv("ASYNC_DEFER_LARGE_ONLY", "false").lower() == "true"
         self.heartbeat_interval_seconds = int(os.getenv("BUNDLE_HEARTBEAT_SECONDS", "30"))
         self.soft_timeout_warning_seconds = int(os.getenv("BUNDLE_SOFT_TIMEOUT_WARNING", "45"))
+        self.staged_publish_enabled = self._coerce_bool(
+            feature_flags.get_flag("bundling.staged_publish_enabled", True), True
+        )
+        self.staged_thresholds = self._parse_stage_thresholds(
+            feature_flags.get_flag("bundling.staged_thresholds", [3, 5, 10, 20, 40])
+        )
+        self.staged_hard_cap = self._coerce_int(
+            feature_flags.get_flag("bundling.staged_hard_cap", 40), default=40, minimum=0
+        )
+        self.staged_prefer_high_score = self._coerce_bool(
+            feature_flags.get_flag("bundling.staged_prefer_high_score", True), True
+        )
+        self.staged_cycle_interval_seconds = self._coerce_int(
+            feature_flags.get_flag("bundling.staged_cycle_interval_seconds", 0), default=0, minimum=0
+        )
 
     def _check_circuit_breaker(self, operation_name: str, success: bool) -> bool:
         """ARCHITECT FIX: Circuit-breaker to detect consecutive failures and stop runaway behavior"""
@@ -1336,7 +1428,8 @@ class BundleGenerator:
             dataset_profile = self._build_dataset_profile(candidate_context, all_recommendations)
             metrics["dataset_profile"] = dataset_profile
 
-            if self._should_defer_async(dataset_profile, end_time, resume_used):
+            should_async_defer = self._should_defer_async(dataset_profile, end_time, resume_used)
+            if should_async_defer:
                 logger.info(
                     "[%s] Async deferral engaged | tier=%s candidates=%s time_remaining=%s",
                     csv_upload_id,
@@ -1371,6 +1464,34 @@ class BundleGenerator:
                     "async_deferred": True,
                     "dataset_profile": dataset_profile,
                 }
+            if (
+                not should_async_defer
+                and dataset_profile.get("defer_candidate")
+                and not self.async_defer_enabled
+                and not resume_used
+            ):
+                logger.warning(
+                    "[%s] Async deferral disabled but conditions met; performing graceful pause.",
+                    csv_upload_id,
+                )
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 3 (async disabled)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                await notify_partial_ready(csv_upload_id, len(all_recommendations))
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft exit: %s", csv_upload_id, exc)
+                return result
 
             self._warn_if_time_low(end_time, csv_upload_id, "Phase 4 (pre-deduplication)")
             if self._time_budget_exceeded(end_time):
@@ -2164,8 +2285,26 @@ class BundleGenerator:
 
                     pair_usage[pair_key] += 1
                     final_recommendations.append(rec)
-            
+
+            staged_enabled = self._coerce_bool(
+                feature_flags.get_flag("bundling.staged_publish_enabled", self.staged_publish_enabled),
+                self.staged_publish_enabled,
+            )
+            if staged_enabled and csv_upload_id:
+                return await self._publish_in_stages(
+                    final_recommendations,
+                    csv_upload_id,
+                    metrics,
+                    end_time=end_time,
+                )
+
             bundle_total = len(final_recommendations)
+            if final_recommendations:
+                await self.store_partial_recommendations(
+                    final_recommendations,
+                    csv_upload_id,
+                    stage="phase_6_pre_copy",
+                )
             await update_generation_progress(
                 csv_upload_id,
                 step="ai_descriptions",
@@ -2174,76 +2313,17 @@ class BundleGenerator:
                 message="Generating AI descriptions…" if bundle_total else "No bundles to describe.",
                 bundle_count=bundle_total if bundle_total else None,
             )
-            
+
             # Add AI-generated copy if available (BATCHED for speed)
             if final_recommendations and not self._time_budget_exceeded(end_time):
-                ai_copy_start = time.time()
-                batch_size = 5  # Process 5 bundles at a time to avoid rate limits
-                bundles_for_copy = final_recommendations[:10]  # Limit AI copy generation for cost
-
-                logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - STARTED | bundles={len(bundles_for_copy)} batch_size={batch_size}")
-
-                def _normalize_products(raw_products: Any) -> List[Dict[str, Any]]:
-                    if isinstance(raw_products, list):
-                        return raw_products
-                    if raw_products:
-                        return [raw_products]
-                    return []
-
-                for i in range(0, len(bundles_for_copy), batch_size):
-                    batch_start = time.time()
-                    batch = bundles_for_copy[i:i+batch_size]
-                    span_attrs = {
-                        "csv_upload_id": csv_upload_id,
-                        "batch_index": i // batch_size,
-                        "batch_size": len(batch),
-                    }
-                    with self._start_span("bundle_generator.ai_copy_batch", span_attrs):
-                        # Generate AI copy for batch in parallel
-                        try:
-                            copy_tasks = []
-                            copy_inputs = []
-                            for rec in batch:
-                                bundle_type = rec.get("bundle_type") or rec.get("type") or "MIX_MATCH"
-                                products = _normalize_products(rec.get("products"))
-                                objective = rec.get("objective", "")
-                                copy_tasks.append(
-                                    self.ai_generator.generate_bundle_copy(
-                                        products,
-                                        bundle_type,
-                                        objective,
-                                    )
-                                )
-                                copy_inputs.append((rec, products, bundle_type))
-                            copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
-                        except Exception as exc:
-                            logger.exception("Error scheduling AI copy generation batch")
-                            copy_inputs = [
-                                (
-                                    rec,
-                                    _normalize_products(rec.get("products")),
-                                    rec.get("bundle_type") or rec.get("type") or "MIX_MATCH",
-                                )
-                                for rec in batch
-                            ]
-                            copy_results = [exc] * len(copy_inputs)
-
-                        # Assign results back to recommendations
-                        for (rec, products, bundle_type), result in zip(copy_inputs, copy_results):
-                            if isinstance(result, Exception):
-                                logger.warning(f"Error generating AI copy for bundle type {bundle_type}: {result}")
-                                rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
-                            elif not result:
-                                logger.warning(f"Empty AI copy response for bundle type {bundle_type}; using fallback copy")
-                                rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
-                            else:
-                                rec["ai_copy"] = result
-
-                        batch_duration = int((time.time() - batch_start) * 1000)
-                        logger.info(f"[{csv_upload_id}] AI Copy batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size} completed in {batch_duration}ms")
-
-                ai_copy_duration = int((time.time() - ai_copy_start) * 1000)
-                logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - COMPLETED in {ai_copy_duration}ms")
+                ai_copy_duration = await self._generate_ai_copy_for_stage(
+                    final_recommendations,
+                    csv_upload_id,
+                    metrics,
+                    end_time,
+                    stage_index=0,
+                    total_stages=1,
+                )
                 metrics["phase_timings"]["phase_8_ai_copy"] = ai_copy_duration
 
                 await update_generation_progress(
@@ -2267,7 +2347,7 @@ class BundleGenerator:
                     message="Skipped AI descriptions due to time budget.",
                     bundle_count=bundle_total,
                 )
-            
+
             await update_generation_progress(
                 csv_upload_id,
                 step="finalization",
@@ -2316,6 +2396,792 @@ class BundleGenerator:
                 message=f"Finalization error: {e}",
             )
             return recommendations  # Return original recommendations if finalization fails
+
+    async def _publish_in_stages(
+        self,
+        recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        metrics: Dict[str, Any],
+        *,
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """Publish bundles in micro-batches so merchants see results sooner."""
+        if not recommendations:
+            await update_generation_progress(
+                csv_upload_id,
+                step="staged_publish",
+                progress=100,
+                status="completed",
+                message="No bundles to publish.",
+                bundle_count=0,
+            )
+            await storage.delete_partial_bundle_recommendations(csv_upload_id)
+            metrics["total_recommendations"] = 0
+            metrics.setdefault("staged_publish", {"enabled": True, "stages": [], "tracks": {}, "dropped": 0})
+            return []
+
+        metrics.setdefault("phase_timings", {})
+
+        prefer_high_score = self.staged_prefer_high_score
+        ordered: List[Dict[str, Any]]
+        if prefer_high_score:
+            ordered = sorted(
+                recommendations,
+                key=lambda rec: rec.get("ranking_score", rec.get("confidence", 0.0)),
+                reverse=True,
+            )
+        else:
+            ordered = list(recommendations)
+
+        hard_cap = self.staged_hard_cap if self.staged_hard_cap > 0 else None
+        if hard_cap is None:
+            staged_total_target = len(ordered)
+            ordered_effective = ordered
+        else:
+            staged_total_target = min(len(ordered), hard_cap)
+            ordered_effective = ordered[:staged_total_target]
+            if len(ordered) > hard_cap:
+                logger.info(
+                    "[%s] Staged publish hard-cap reached | cap=%d total=%d",
+                    csv_upload_id,
+                    hard_cap,
+                    len(ordered),
+                )
+
+        if not ordered_effective:
+            await update_generation_progress(
+                csv_upload_id,
+                step="staged_publish",
+                progress=100,
+                status="completed",
+                message="No bundles available after staging cap.",
+                bundle_count=0,
+            )
+            metrics.setdefault("staged_publish", {"enabled": True, "stages": [], "tracks": {}, "dropped": 0})
+            return []
+
+        thresholds = [threshold for threshold in self.staged_thresholds if threshold > 0]
+        if not thresholds:
+            thresholds = [staged_total_target]
+        thresholds = sorted(set(thresholds))
+        if thresholds[-1] < staged_total_target:
+            thresholds.append(staged_total_target)
+        else:
+            thresholds[-1] = staged_total_target
+
+        total_stages = len(thresholds)
+        total_candidates = staged_total_target
+        cursor = 0
+        published = 0
+        drops_total = 0
+
+        staged_results: List[Dict[str, Any]] = []
+        stage_metrics: List[Dict[str, Any]] = []
+
+        accumulated_copy_ms = 0
+        accumulated_storage_ms = 0
+        accumulated_pricing_ms = 0
+        accumulated_inventory_ms = 0
+        accumulated_compliance_ms = 0
+
+        staged_summary = metrics.setdefault("staged_publish", {})
+        staged_summary["enabled"] = True
+        staged_summary["stages"] = []
+        staged_summary["tracks"] = {}
+        staged_summary["target"] = staged_total_target
+        staged_summary["hard_cap"] = hard_cap
+        staged_summary["dropped"] = 0
+
+        logger.info(
+            "[%s] Starting staged publish | stages=%d target=%d thresholds=%s",
+            csv_upload_id,
+            total_stages,
+            staged_total_target,
+            thresholds,
+        )
+
+        for index, threshold in enumerate(thresholds):
+            desired_processed = min(threshold, total_candidates)
+            if cursor >= desired_processed:
+                continue
+
+            stage_slice = ordered_effective[cursor:desired_processed]
+            cursor = desired_processed
+            stage_label = f"stage_{index + 1}"
+            stage_start = time.time()
+
+            await self._emit_heartbeat(
+                csv_upload_id,
+                step="staged_publish",
+                progress=85,
+                message=f"Preparing stage {index + 1}/{total_stages}",
+                metadata={
+                    "stage_target": desired_processed,
+                    "processed": cursor,
+                    "total_target": staged_total_target,
+                },
+            )
+
+            await self.store_partial_recommendations(
+                stage_slice,
+                csv_upload_id,
+                stage=stage_label,
+            )
+
+            if self._time_budget_exceeded(end_time):
+                logger.warning(
+                    "[%s] Time budget exceeded before stage %s processing. Publishing partial results only.",
+                    csv_upload_id,
+                    stage_label,
+                )
+                break
+
+            with self._start_span(
+                "bundle_generator.stage_posts",
+                {
+                    "csv_upload_id": csv_upload_id,
+                    "stage": index + 1,
+                    "stage_size": len(stage_slice),
+                    "total_target": staged_total_target,
+                },
+            ):
+                processed_slice, track_summary = await self._run_post_filter_tracks(
+                    stage_slice,
+                    csv_upload_id,
+                    metrics,
+                    end_time,
+                    stage_index=index,
+                    total_stages=total_stages,
+                )
+
+            kept_count = len(processed_slice)
+            dropped_entries = track_summary.get("dropped", [])
+            dropped_count = len(dropped_entries)
+
+            published += kept_count
+            drops_total += dropped_count
+            staged_summary["dropped"] = drops_total
+            metrics["total_recommendations"] = published
+
+            copy_ms = track_summary.get("copy_ms", 0)
+            pricing_ms = track_summary.get("pricing_ms", 0)
+            inventory_ms = track_summary.get("inventory_ms", 0)
+            compliance_ms = track_summary.get("compliance_ms", 0)
+
+            accumulated_copy_ms += copy_ms
+            accumulated_pricing_ms += pricing_ms
+            accumulated_inventory_ms += inventory_ms
+            accumulated_compliance_ms += compliance_ms
+
+            storage_ms = 0
+            if processed_slice:
+                storage_start = time.time()
+                with self._start_span(
+                    "bundle_generator.stage_persist",
+                    {
+                        "csv_upload_id": csv_upload_id,
+                        "stage": index + 1,
+                        "stage_size": len(processed_slice),
+                    },
+                ):
+                    await self.store_recommendations(processed_slice, csv_upload_id)
+                storage_ms = int((time.time() - storage_start) * 1000)
+                accumulated_storage_ms += storage_ms
+                staged_results.extend(processed_slice)
+            else:
+                logger.info(
+                    "[%s] Stage %s produced no publishable bundles (kept=0 dropped=%d).",
+                    csv_upload_id,
+                    stage_label,
+                    dropped_count,
+                )
+
+            stage_duration = int((time.time() - stage_start) * 1000)
+            next_stage_target = None
+            if cursor < total_candidates and (index + 1) < len(thresholds):
+                next_stage_target = min(thresholds[index + 1], total_candidates)
+
+            stage_entry = {
+                "stage_index": index + 1,
+                "stage_target": desired_processed,
+                "processed_after_stage": cursor,
+                "published_after_stage": published,
+                "drops_after_stage": drops_total,
+                "kept": kept_count,
+                "dropped": dropped_count,
+                "copy_ms": copy_ms,
+                "pricing_ms": pricing_ms,
+                "inventory_ms": inventory_ms,
+                "compliance_ms": compliance_ms,
+                "persist_ms": storage_ms,
+                "duration_ms": stage_duration,
+                "drop_reasons": track_summary.get("drop_reasons", {}),
+                "next_stage_target": next_stage_target,
+            }
+            stage_metrics.append(stage_entry)
+            staged_summary["stages"].append(stage_entry)
+
+            progress_ratio = cursor / total_candidates if total_candidates else 1.0
+            progress_window = 14
+            progress = 85 + int(progress_ratio * progress_window)
+
+            metadata = {
+                "stage_index": index + 1,
+                "stage_target": desired_processed,
+                "processed": cursor,
+                "published": published,
+                "dropped": drops_total,
+                "total_target": staged_total_target,
+            }
+            if next_stage_target:
+                metadata["next_stage_target"] = next_stage_target
+            if track_summary.get("drop_reasons"):
+                metadata["drop_reasons"] = track_summary["drop_reasons"]
+            if self.staged_cycle_interval_seconds > 0 and next_stage_target:
+                metadata["next_stage_eta_seconds"] = self.staged_cycle_interval_seconds
+
+            progress_message = (
+                f"Published {published} bundles (stage {index + 1}/{total_stages}); "
+                f"filtered {dropped_count} this stage."
+            )
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="staged_publish",
+                progress=min(progress, 99),
+                status="in_progress",
+                message=progress_message,
+                bundle_count=published or None,
+                metadata=metadata,
+            )
+
+            if kept_count:
+                await notify_partial_ready(csv_upload_id, published)
+
+            if self._time_budget_exceeded(end_time):
+                logger.warning(
+                    "[%s] Time budget exceeded after stage %s. Stopping staged publishing early.",
+                    csv_upload_id,
+                    stage_label,
+                )
+                break
+
+            if (
+                cursor < total_candidates
+                and self.staged_cycle_interval_seconds > 0
+                and not self._time_budget_exceeded(end_time)
+            ):
+                try:
+                    await asyncio.sleep(self.staged_cycle_interval_seconds)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.debug("Sleep interrupted between stages: %s", exc)
+
+        staged_summary["tracks"] = {
+            "copy_ms": accumulated_copy_ms,
+            "pricing_ms": accumulated_pricing_ms,
+            "inventory_ms": accumulated_inventory_ms,
+            "compliance_ms": accumulated_compliance_ms,
+            "storage_ms": accumulated_storage_ms,
+        }
+        staged_summary["published"] = published
+        staged_summary["processed"] = cursor
+
+        if accumulated_copy_ms:
+            metrics["phase_timings"]["phase_8_ai_copy"] = (
+                metrics["phase_timings"].get("phase_8_ai_copy", 0) + accumulated_copy_ms
+            )
+        if accumulated_storage_ms:
+            metrics["phase_timings"]["phase_9_storage"] = (
+                metrics["phase_timings"].get("phase_9_storage", 0) + accumulated_storage_ms
+            )
+
+        await storage.delete_partial_bundle_recommendations(csv_upload_id)
+
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="completed",
+            message="Bundle generation complete.",
+            bundle_count=published or None,
+            metadata={
+                "staged_publish": True,
+                "published": published,
+                "dropped": drops_total,
+                "total_target": staged_total_target,
+            },
+        )
+
+        await notify_bundle_ready(csv_upload_id, published, resume_run=False)
+        return staged_results
+
+    async def _run_post_filter_tracks(
+        self,
+        stage_recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        metrics: Dict[str, Any],
+        end_time: Optional[datetime],
+        *,
+        stage_index: int,
+        total_stages: int,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        if not stage_recommendations:
+            return [], {
+                "copy_ms": 0,
+                "pricing_ms": 0,
+                "inventory_ms": 0,
+                "compliance_ms": 0,
+                "duration_ms": 0,
+                "dropped": [],
+                "drop_reasons": {},
+                "pricing_stats": {},
+                "inventory_stats": {},
+                "compliance_stats": {},
+            }
+
+        copy_task = asyncio.create_task(
+            self._generate_ai_copy_for_stage(
+                stage_recommendations,
+                csv_upload_id,
+                metrics,
+                end_time,
+                stage_index=stage_index,
+                total_stages=total_stages,
+            )
+        )
+        pricing_task = asyncio.create_task(
+            self._run_pricing_track(
+                stage_recommendations,
+                csv_upload_id,
+                end_time,
+                stage_index=stage_index,
+            )
+        )
+        inventory_task = asyncio.create_task(
+            self._run_inventory_track(
+                stage_recommendations,
+                csv_upload_id,
+                end_time,
+                stage_index=stage_index,
+            )
+        )
+
+        try:
+            copy_ms = await copy_task
+        except asyncio.CancelledError:
+            pricing_task.cancel()
+            inventory_task.cancel()
+            raise
+        except Exception as exc:
+            logger.warning("[%s] Copy track failed for stage %d: %s", csv_upload_id, stage_index + 1, exc)
+            copy_ms = 0
+
+        pricing_result_obj, inventory_result_obj = await asyncio.gather(
+            pricing_task, inventory_task, return_exceptions=True
+        )
+
+        if isinstance(pricing_result_obj, Exception):
+            logger.warning("[%s] Pricing track raised error: %s", csv_upload_id, pricing_result_obj)
+            pricing_result = {
+                "duration_ms": 0,
+                "updated": 0,
+                "skipped": len(stage_recommendations),
+                "fallbacks": 0,
+                "errors": 1,
+            }
+        else:
+            pricing_result = pricing_result_obj
+
+        if isinstance(inventory_result_obj, Exception):
+            logger.warning("[%s] Inventory track raised error: %s", csv_upload_id, inventory_result_obj)
+            inventory_result = {
+                "duration_ms": 0,
+                "dropped": [],
+                "reason_counts": {"error": len(stage_recommendations)},
+            }
+        else:
+            inventory_result = inventory_result_obj
+
+        try:
+            compliance_result = await self._run_compliance_track(stage_recommendations, stage_index=stage_index)
+        except Exception as exc:
+            logger.warning("[%s] Compliance track raised error: %s", csv_upload_id, exc)
+            compliance_result = {
+                "duration_ms": 0,
+                "dropped": [],
+                "reason_counts": {"error": len(stage_recommendations)},
+                "trimmed_fields": 0,
+            }
+
+        drop_map: Dict[str, set[str]] = defaultdict(set)
+        for entry in inventory_result.get("dropped", []):
+            rec_id = entry.get("id")
+            if not rec_id:
+                continue
+            reasons = entry.get("reasons") or ["inventory"]
+            for reason in reasons:
+                drop_map[rec_id].add(f"inventory:{reason}")
+
+        for entry in compliance_result.get("dropped", []):
+            rec_id = entry.get("id")
+            if not rec_id:
+                continue
+            reasons = entry.get("reasons") or ["compliance"]
+            for reason in reasons:
+                drop_map[rec_id].add(f"compliance:{reason}")
+
+        combined_drops = [
+            {"id": rec_id, "reasons": sorted(reasons)}
+            for rec_id, reasons in drop_map.items()
+        ]
+
+        drop_reasons_counter: Dict[str, int] = defaultdict(int)
+        for reasons in drop_map.values():
+            for reason in reasons:
+                drop_reasons_counter[reason] += 1
+
+        filtered_recommendations = [
+            rec for rec in stage_recommendations if rec.get("id") not in drop_map
+        ]
+
+        duration_ms = copy_ms + pricing_result.get("duration_ms", 0) + inventory_result.get("duration_ms", 0)
+        duration_ms += compliance_result.get("duration_ms", 0)
+
+        metrics.setdefault("staged_publish", {}).setdefault("track_stats", []).append(
+            {
+                "stage_index": stage_index + 1,
+                "copy_ms": copy_ms,
+                "pricing_ms": pricing_result.get("duration_ms", 0),
+                "inventory_ms": inventory_result.get("duration_ms", 0),
+                "compliance_ms": compliance_result.get("duration_ms", 0),
+                "drops": drop_reasons_counter,
+            }
+        )
+
+        summary = {
+            "copy_ms": copy_ms,
+            "pricing_ms": pricing_result.get("duration_ms", 0),
+            "inventory_ms": inventory_result.get("duration_ms", 0),
+            "compliance_ms": compliance_result.get("duration_ms", 0),
+            "duration_ms": duration_ms,
+            "dropped": combined_drops,
+            "drop_reasons": dict(drop_reasons_counter),
+            "pricing_stats": pricing_result,
+            "inventory_stats": inventory_result,
+            "compliance_stats": compliance_result,
+        }
+
+        return filtered_recommendations, summary
+
+    async def _run_pricing_track(
+        self,
+        stage_recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        end_time: Optional[datetime],
+        *,
+        stage_index: int,
+    ) -> Dict[str, Any]:
+        start = time.time()
+        updated = 0
+        skipped = 0
+        fallbacks = 0
+        errors = 0
+
+        for recommendation in stage_recommendations:
+            if self._time_budget_exceeded(end_time):
+                logger.warning(
+                    "[%s] Pricing track stopping early due to time budget (stage %d).",
+                    csv_upload_id,
+                    stage_index + 1,
+                )
+                break
+
+            pricing_payload = recommendation.get("pricing") or {}
+            if pricing_payload and pricing_payload.get("bundle_price"):
+                skipped += 1
+                continue
+
+            skus = self._extract_sku_list(recommendation)
+            if len(skus) < 2:
+                skipped += 1
+                continue
+
+            try:
+                result = await self.pricing_engine.compute_bundle_pricing(
+                    skus,
+                    recommendation.get("objective", "increase_aov"),
+                    csv_upload_id,
+                    recommendation.get("bundle_type", "FBT"),
+                )
+                if result.get("success"):
+                    recommendation["pricing"] = result.get("pricing", {})
+                    updated += 1
+                else:
+                    recommendation.setdefault("pricing", result.get("pricing", {}))
+                    fallbacks += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors += 1
+                logger.warning(
+                    "[%s] Pricing track error for %s: %s",
+                    csv_upload_id,
+                    recommendation.get("id"),
+                    exc,
+                )
+
+        duration_ms = int((time.time() - start) * 1000)
+        return {
+            "duration_ms": duration_ms,
+            "updated": updated,
+            "skipped": skipped,
+            "fallbacks": fallbacks,
+            "errors": errors,
+        }
+
+    async def _run_inventory_track(
+        self,
+        stage_recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        end_time: Optional[datetime],
+        *,
+        stage_index: int,
+    ) -> Dict[str, Any]:
+        start = time.time()
+        dropped: List[Dict[str, Any]] = []
+        reason_counts: Dict[str, int] = defaultdict(int)
+
+        try:
+            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+        except Exception as exc:
+            logger.warning("[%s] Inventory track failed to load catalog map: %s", csv_upload_id, exc)
+            duration_ms = int((time.time() - start) * 1000)
+            return {
+                "duration_ms": duration_ms,
+                "dropped": [],
+                "reason_counts": {"catalog_error": len(stage_recommendations)},
+            }
+
+        if not catalog_map:
+            duration_ms = int((time.time() - start) * 1000)
+            return {
+                "duration_ms": duration_ms,
+                "dropped": [],
+                "reason_counts": {"catalog_missing": len(stage_recommendations)},
+            }
+
+        for recommendation in stage_recommendations:
+            if self._time_budget_exceeded(end_time):
+                logger.warning(
+                    "[%s] Inventory track stopping early due to time budget (stage %d).",
+                    csv_upload_id,
+                    stage_index + 1,
+                )
+                break
+
+            rec_id = recommendation.get("id")
+            skus = self._extract_sku_list(recommendation)
+
+            missing: List[str] = []
+            out_of_stock: List[str] = []
+            inactive: List[str] = []
+
+            for sku in skus:
+                snapshot = catalog_map.get(sku)
+                if not snapshot:
+                    missing.append(sku)
+                    continue
+
+                available = getattr(snapshot, "available_total", None)
+                if available is not None and available <= 0:
+                    out_of_stock.append(sku)
+                    continue
+
+                status = (getattr(snapshot, "product_status", "") or "").lower()
+                if status and status not in {"active", "available"}:
+                    inactive.append(sku)
+
+            reasons: List[str] = []
+            if missing:
+                reasons.append("missing_catalog")
+            if out_of_stock:
+                reasons.append("out_of_stock")
+            if inactive:
+                reasons.append("inactive_product")
+
+            if reasons and rec_id:
+                dropped.append(
+                    {
+                        "id": rec_id,
+                        "reasons": reasons,
+                        "missing": missing,
+                        "out_of_stock": out_of_stock,
+                        "inactive": inactive,
+                    }
+                )
+                for reason in reasons:
+                    reason_counts[reason] += 1
+            else:
+                reason_counts["ok"] += 1
+
+        duration_ms = int((time.time() - start) * 1000)
+        return {
+            "duration_ms": duration_ms,
+            "dropped": dropped,
+            "reason_counts": dict(reason_counts),
+        }
+
+    async def _run_compliance_track(
+        self,
+        stage_recommendations: List[Dict[str, Any]],
+        *,
+        stage_index: int,
+    ) -> Dict[str, Any]:
+        start = time.time()
+        banned_terms = {
+            "100% guarantee",
+            "risk-free",
+            "free money",
+            "instant weight loss",
+            "miracle cure",
+        }
+        field_limits = {
+            "title": 60,
+            "description": 220,
+            "valueProposition": 160,
+        }
+
+        dropped: List[Dict[str, Any]] = []
+        reason_counts: Dict[str, int] = defaultdict(int)
+        trimmed_fields = 0
+
+        for recommendation in stage_recommendations:
+            ai_copy = recommendation.get("ai_copy")
+            if not ai_copy:
+                recommendation["ai_copy"] = self.ai_generator.generate_fallback_copy(
+                    [],
+                    recommendation.get("bundle_type", "FBT"),
+                )
+                ai_copy = recommendation["ai_copy"]
+
+            for field, limit in field_limits.items():
+                value = ai_copy.get(field)
+                if isinstance(value, str) and len(value) > limit:
+                    ai_copy[field] = value[:limit].strip()
+                    trimmed_fields += 1
+
+            text_fragments: List[str] = []
+            for value in ai_copy.values():
+                if isinstance(value, str):
+                    text_fragments.append(value.lower())
+                elif isinstance(value, list):
+                    text_fragments.extend(str(item).lower() for item in value)
+
+            text_blob = " ".join(text_fragments)
+            flagged_terms = [term for term in banned_terms if term in text_blob]
+            if flagged_terms:
+                dropped.append(
+                    {
+                        "id": recommendation.get("id"),
+                        "reasons": ["policy_violation"],
+                        "flagged_terms": flagged_terms,
+                    }
+                )
+                reason_counts["policy_violation"] += 1
+            else:
+                reason_counts["ok"] += 1
+
+        duration_ms = int((time.time() - start) * 1000)
+        return {
+            "duration_ms": duration_ms,
+            "dropped": dropped,
+            "reason_counts": dict(reason_counts),
+            "trimmed_fields": trimmed_fields,
+        }
+
+    async def _generate_ai_copy_for_stage(
+        self,
+        stage_recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        metrics: Dict[str, Any],
+        end_time: Optional[datetime],
+        *,
+        stage_index: int,
+        total_stages: int,
+    ) -> int:
+        """Generate AI copy for a micro-batch and update recommendations in place."""
+        if not stage_recommendations:
+            return 0
+
+        start = time.time()
+        tasks_executed = 0
+        for offset, recommendation in enumerate(stage_recommendations):
+            if self._time_budget_exceeded(end_time):
+                logger.warning(
+                    "[%s] Time budget exceeded while generating copy for stage %d bundle %d.",
+                    csv_upload_id,
+                    stage_index + 1,
+                    offset + 1,
+                )
+                break
+
+            products_raw = recommendation.get("products") or []
+            normalized_products: List[Dict[str, Any]] = []
+            for entry in products_raw:
+                if isinstance(entry, dict):
+                    normalized_products.append(entry)
+                else:
+                    normalized_products.append({"name": str(entry), "sku": str(entry)})
+
+            bundle_type = recommendation.get("bundle_type", "FBT")
+            context = f"Objective: {recommendation.get('objective', 'increase_aov')}"
+
+            try:
+                ai_copy = await self.ai_generator.generate_bundle_copy(
+                    normalized_products,
+                    bundle_type,
+                    context=context,
+                )
+                recommendation["ai_copy"] = ai_copy
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Failed to generate AI copy for stage %d bundle %d: %s",
+                    csv_upload_id,
+                    stage_index + 1,
+                    offset + 1,
+                    exc,
+                )
+                try:
+                    recommendation["ai_copy"] = self.ai_generator.generate_fallback_copy(
+                        normalized_products,
+                        bundle_type,
+                    )
+                except Exception:
+                    recommendation.setdefault(
+                        "ai_copy",
+                        {
+                            "title": "Bundle Deal",
+                            "description": "Recommended bundle offer.",
+                            "valueProposition": "Great savings when purchasing together.",
+                            "explanation": "Generated as part of bundle staging pipeline.",
+                        },
+                    )
+            tasks_executed += 1
+
+        duration_ms = int((time.time() - start) * 1000)
+        metrics.setdefault("staged_publish", {}).setdefault("copy", []).append(
+            {
+                "stage_index": stage_index + 1,
+                "processed": tasks_executed,
+                "attempted": len(stage_recommendations),
+                "duration_ms": duration_ms,
+            }
+        )
+        return duration_ms
     
     async def store_partial_recommendations(
         self,
