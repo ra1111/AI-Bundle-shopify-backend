@@ -2,11 +2,12 @@
 ML Candidate Generator Service
 Implements LLM embeddings (replacing item2vec) and FPGrowth algorithm for better candidate generation
 """
-from typing import List, Dict, Any, Optional, Tuple, Set
+from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
 import logging
+import os
 import numpy as np
 from decimal import Decimal
-from collections import defaultdict
+from collections import defaultdict, Counter
 from itertools import combinations
 import hashlib
 import json
@@ -27,6 +28,11 @@ class CandidateGenerationContext:
     transactions: List[Set[str]]
     sequences: List[List[str]]
     embeddings: Dict[str, np.ndarray]
+    catalog_products: Dict[str, Dict[str, Any]]
+    catalog_subset: List[Dict[str, Any]]
+    embedding_targets: Set[str]
+    sku_frequency: Dict[str, int]
+    llm_candidate_target: int
     llm_only: bool = False
 
 class CandidateGenerator:
@@ -38,6 +44,9 @@ class CandidateGenerator:
         self.min_frequency = 2
         self.use_fpgrowth = True  # Feature flag for FPGrowth vs Apriori
         self.small_store_relax_threshold = 30  # Allow looser filtering when catalog is tiny
+        self.max_embedding_targets = int(os.getenv("MAX_EMBED_TARGETS", "400"))
+        self.min_embedding_targets = int(os.getenv("MIN_EMBED_TARGETS", "75"))
+        self.anchor_prefetch_extra = int(os.getenv("EMBED_ANCHOR_EXTRA", "50"))
     
     async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
         """Prefetch expensive data needed by candidate generation."""
@@ -47,38 +56,74 @@ class CandidateGenerator:
         run_id = await storage.get_run_id_for_upload(csv_upload_id)
         valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
         varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
-        transactions = await self.get_transactions_for_mining(csv_upload_id)
-        sequences = await self.get_purchase_sequences(csv_upload_id)
+        raw_transactions = await self.get_transactions_for_mining(csv_upload_id)
+        raw_sequences = await self.get_purchase_sequences(csv_upload_id)
+
+        transactions = self._normalize_transactions(raw_transactions, varid_to_sku, valid_skus)
+        sequences = self._normalize_sequences(raw_sequences, varid_to_sku, valid_skus)
+        sku_frequency = self._compute_sku_frequency(transactions)
 
         # NEW: Generate LLM embeddings (replaces item2vec)
         # Expected time: 2-3 seconds (vs 60-120s for item2vec)
-        embeddings = {}
+        embeddings: Dict[str, np.ndarray] = {}
+        catalog_products: List[Dict[str, Any]] = []
+        catalog_map: Dict[str, Dict[str, Any]] = {}
+        catalog_subset: List[Dict[str, Any]] = []
+        embedding_targets: Set[str] = set()
         try:
             # Get catalog products for embedding generation
-            catalog = await storage.get_catalog_snapshots_by_run(run_id)
-            catalog_list = [
-                {
-                    'sku': getattr(item, 'sku', ''),
-                    'title': getattr(item, 'title', ''),
-                    'product_category': getattr(item, 'product_category', ''),
-                    'brand': getattr(item, 'brand', ''),
-                    'vendor': getattr(item, 'vendor', ''),
-                    'product_type': getattr(item, 'product_type', ''),
-                    'description': getattr(item, 'description', ''),
-                    'tags': getattr(item, 'tags', ''),
-                }
-                for item in catalog
+            catalog_entries = await storage.get_catalog_snapshots_by_run(run_id)
+            catalog_products = self._materialize_catalog_products(catalog_entries)
+            catalog_map = {item["sku"]: item for item in catalog_products if item.get("sku")}
+            embedding_targets = set(
+                self._choose_embedding_targets(
+                    valid_skus=valid_skus,
+                    catalog_map=catalog_map,
+                    sku_frequency=sku_frequency,
+                )
+            )
+            catalog_subset = [
+                catalog_map[sku]
+                for sku in embedding_targets
+                if sku in catalog_map
             ]
-            with_sku = sum(1 for item in catalog_list if item.get('sku'))
+
+            if not catalog_subset and catalog_products:
+                fallback_subset = catalog_products[: min(self.max_embedding_targets, len(catalog_products))]
+                catalog_subset = fallback_subset
+                embedding_targets = {item["sku"] for item in fallback_subset if item.get("sku")}
+
+            with_sku = sum(1 for item in catalog_products if item.get("sku"))
             logger.info(
                 "[%s] Preparing LLM embeddings | catalog_items=%d with_sku=%d",
                 csv_upload_id,
-                len(catalog_list),
+                len(catalog_products),
                 with_sku,
             )
 
-            logger.info(f"Generating LLM embeddings for {len(catalog_list)} products...")
-            embeddings = await llm_embedding_engine.get_embeddings_batch(catalog_list, use_cache=True)
+            logger.info(
+                "[%s] LLM embeddings targets | shortlist=%d (max=%d) unique_catalog=%d",
+                csv_upload_id,
+                len(catalog_subset),
+                self.max_embedding_targets,
+                len(catalog_map),
+            )
+
+            embeddings = await llm_embedding_engine.get_embeddings_batch(catalog_subset, use_cache=True)
+
+            missing_targets = [
+                sku
+                for sku in embedding_targets
+                if sku not in embeddings and sku in catalog_map
+            ]
+            if missing_targets:
+                supplemental_products = [catalog_map[sku] for sku in missing_targets if sku in catalog_map]
+                if supplemental_products:
+                    supplemental = await llm_embedding_engine.get_embeddings_batch(
+                        supplemental_products, use_cache=True
+                    )
+                    embeddings.update(supplemental)
+
             logger.info(f"LLM embeddings generated in {time.time() - start_time:.2f}s")
             logger.info(
                 "[%s] Embedding result | embeddings_available=%d",
@@ -89,15 +134,367 @@ class CandidateGenerator:
         except Exception as e:
             logger.warning(f"Failed to generate LLM embeddings: {e}. Continuing without embeddings.")
             embeddings = {}
+            catalog_products = catalog_products or []
+            catalog_map = catalog_map or {}
+            catalog_subset = catalog_subset or []
+            embedding_targets = embedding_targets or set()
 
-        return CandidateGenerationContext(
+        context = CandidateGenerationContext(
             run_id=run_id,
             valid_skus=valid_skus,
             varid_to_sku=varid_to_sku,
             transactions=transactions,
             sequences=sequences,
             embeddings=embeddings or {},
+            catalog_products=catalog_map,
+            catalog_subset=catalog_subset,
+            embedding_targets=embedding_targets,
+            sku_frequency=dict(sku_frequency),
+            llm_candidate_target=20,
         )
+        logger.info(
+            "[%s] Candidate context prepared | txns=%d sequences=%d embeddings=%d catalog_subset=%d targets=%d",
+            csv_upload_id,
+            len(context.transactions),
+            len(context.sequences),
+            len(context.embeddings),
+            len(context.catalog_subset),
+            len(context.embedding_targets),
+        )
+        return context
+
+    def _normalize_transactions(
+        self,
+        transactions: Optional[List[Set[str]]],
+        varid_to_sku: Dict[str, str],
+        valid_skus: Set[str],
+    ) -> List[Set[str]]:
+        if not transactions:
+            return []
+        normalized: List[Set[str]] = []
+        for raw_items in transactions:
+            cast_items: Set[str] = set()
+            for raw in raw_items:
+                resolved = varid_to_sku.get(raw, raw)
+                if not resolved:
+                    continue
+                sku = str(resolved).strip()
+                if not sku:
+                    continue
+                if valid_skus and sku not in valid_skus:
+                    continue
+                cast_items.add(sku)
+            if len(cast_items) >= 2:
+                normalized.append(cast_items)
+        logger.debug(
+            "Transactions normalized | input=%d retained=%d",
+            len(transactions),
+            len(normalized),
+        )
+        return normalized
+
+    def _normalize_sequences(
+        self,
+        sequences: Optional[List[List[str]]],
+        varid_to_sku: Dict[str, str],
+        valid_skus: Set[str],
+    ) -> List[List[str]]:
+        if not sequences:
+            return []
+        normalized: List[List[str]] = []
+        for raw_seq in sequences:
+            seq: List[str] = []
+            for raw in raw_seq:
+                resolved = varid_to_sku.get(raw, raw)
+                if not resolved:
+                    continue
+                sku = str(resolved).strip()
+                if not sku:
+                    continue
+                if valid_skus and sku not in valid_skus:
+                    continue
+                seq.append(sku)
+            if len(seq) >= 2:
+                normalized.append(seq)
+        logger.debug(
+            "Sequences normalized | input=%d retained=%d",
+            len(sequences),
+            len(normalized),
+        )
+        return normalized
+
+    @staticmethod
+    def _compute_sku_frequency(transactions: Optional[List[Set[str]]]) -> Counter:
+        ctr: Counter = Counter()
+        if not transactions:
+            return ctr
+        for tx in transactions:
+            for sku in tx:
+                ctr[sku] += 1
+        logger.debug(
+            "SKU frequency computed | transactions=%d distinct_skus=%d",
+            len(transactions),
+            len(ctr),
+        )
+        return ctr
+
+    def _materialize_catalog_products(self, catalog_entries: Optional[List[Any]]) -> List[Dict[str, Any]]:
+        products: List[Dict[str, Any]] = []
+        if not catalog_entries:
+            return products
+        for entry in catalog_entries:
+            sku = getattr(entry, "sku", None)
+            if not sku:
+                continue
+            sku_str = str(sku).strip()
+            if not sku_str:
+                continue
+            product: Dict[str, Any] = {
+                "sku": sku_str,
+                "title": getattr(entry, "product_title", None) or getattr(entry, "title", "") or getattr(entry, "variant_title", ""),
+                "product_type": getattr(entry, "product_type", None) or getattr(entry, "category", None),
+                "product_category": getattr(entry, "product_type", None) or getattr(entry, "category", None),
+                "brand": getattr(entry, "brand", None),
+                "vendor": getattr(entry, "vendor", None),
+                "description": getattr(entry, "description", None) or getattr(entry, "product_description", None),
+                "tags": getattr(entry, "tags", None),
+                "available_total": getattr(entry, "available_total", None),
+                "is_slow_mover": getattr(entry, "is_slow_mover", False),
+                "is_new_launch": getattr(entry, "is_new_launch", False),
+                "is_seasonal": getattr(entry, "is_seasonal", False),
+                "is_high_margin": getattr(entry, "is_high_margin", False),
+            }
+            price = getattr(entry, "price", None)
+            compare_at = getattr(entry, "compare_at_price", None)
+            if price is not None:
+                try:
+                    product["price"] = float(price)
+                except (TypeError, ValueError):
+                    pass
+            if compare_at is not None:
+                try:
+                    product["compare_at_price"] = float(compare_at)
+                except (TypeError, ValueError):
+                    pass
+            products.append(product)
+        logger.debug(
+            "Materialized catalog entries | input=%d usable=%d",
+            len(catalog_entries),
+            len(products),
+        )
+        return products
+
+    def _choose_embedding_targets(
+        self,
+        *,
+        valid_skus: Set[str],
+        catalog_map: Dict[str, Dict[str, Any]],
+        sku_frequency: Counter,
+    ) -> List[str]:
+        prioritized: List[str] = []
+        if sku_frequency:
+            prioritized.extend(
+                [sku for sku, _ in sku_frequency.most_common(self.max_embedding_targets + self.anchor_prefetch_extra)]
+            )
+        flagged = [
+            sku
+            for sku, meta in catalog_map.items()
+            if meta.get("is_slow_mover") or meta.get("is_new_launch") or meta.get("is_seasonal") or meta.get("is_high_margin")
+        ]
+        prioritized.extend(flagged)
+        if len(valid_skus) <= self.max_embedding_targets:
+            prioritized.extend(valid_skus)
+        deduped: List[str] = []
+        seen: Set[str] = set()
+        for sku in prioritized:
+            sku_key = (sku or "").strip()
+            if not sku_key or sku_key in seen or sku_key not in catalog_map:
+                continue
+            deduped.append(sku_key)
+            seen.add(sku_key)
+            if len(deduped) >= self.max_embedding_targets:
+                break
+        if len(deduped) < self.min_embedding_targets:
+            for sku in catalog_map.keys():
+                if sku in seen:
+                    continue
+                deduped.append(sku)
+                seen.add(sku)
+                if len(deduped) >= self.min_embedding_targets or len(deduped) >= self.max_embedding_targets:
+                    break
+        logger.info(
+            "Embedding targets finalized | distinct=%d frequency_prioritized=%d flagged=%d valid_skus=%d",
+            len(deduped),
+            len(sku_frequency),
+            len(flagged),
+            len(valid_skus),
+        )
+        return deduped
+
+    def _derive_similarity_seed_skus(
+        self,
+        apriori_candidates: List[Dict[str, Any]],
+        fpgrowth_candidates: List[Dict[str, Any]],
+        top_pair_candidates: List[Dict[str, Any]],
+        *,
+        context: Optional[CandidateGenerationContext],
+        objective: str,
+    ) -> List[str]:
+        seeds: Set[str] = set()
+        varid_to_sku = context.varid_to_sku if context else {}
+        valid_skus = context.valid_skus if context else set()
+
+        def _resolve(identifier: Any) -> Optional[str]:
+            value = varid_to_sku.get(identifier, identifier)
+            if not value:
+                return None
+            sku = str(value).strip()
+            if not sku:
+                return None
+            if valid_skus and sku not in valid_skus:
+                return None
+            return sku
+
+        for candidate_group in (apriori_candidates, fpgrowth_candidates, top_pair_candidates):
+            for candidate in candidate_group or []:
+                for prod in candidate.get("products", []):
+                    sku = _resolve(prod)
+                    if sku:
+                        seeds.add(sku)
+
+        if context and context.embedding_targets:
+            seeds.update(context.embedding_targets)
+
+        objective_skus = []
+        if context and context.catalog_products:
+            objective_skus = self._objective_specific_skus(context.catalog_products, objective)
+            seeds.update(objective_skus)
+
+        frequency = context.sku_frequency if context else {}
+
+        ordered: List[str] = []
+        seen: Set[str] = set()
+
+        def _append_candidates(candidates: Iterable[str]) -> None:
+            for sku in candidates:
+                if not sku or sku in seen or sku not in seeds:
+                    continue
+                ordered.append(sku)
+                seen.add(sku)
+                if len(ordered) >= self.max_embedding_targets:
+                    return
+
+        if context and context.embedding_targets:
+            _append_candidates(context.embedding_targets)
+
+        freq_sorted = sorted(seeds, key=lambda sku: (-frequency.get(sku, 0), sku))
+        _append_candidates(freq_sorted)
+        _append_candidates(objective_skus)
+
+        if len(ordered) < self.min_embedding_targets and context and context.catalog_products:
+            _append_candidates(context.catalog_products.keys())
+
+        logger.info(
+            "Similarity seed SKUs derived | seeds=%d ordered=%d objective=%s",
+            len(seeds),
+            len(ordered),
+            objective,
+        )
+        return ordered[: self.max_embedding_targets]
+
+    async def _ensure_embeddings_for_seed_skus(
+        self,
+        embeddings: Dict[str, np.ndarray],
+        catalog_map: Dict[str, Dict[str, Any]],
+        seed_skus: Set[str],
+    ) -> Dict[str, np.ndarray]:
+        missing = [
+            sku
+            for sku in seed_skus
+            if sku not in embeddings and sku in catalog_map
+        ]
+        if not missing:
+            return embeddings
+        products = [catalog_map[sku] for sku in missing if sku in catalog_map]
+        if not products:
+            return embeddings
+        supplemental = await llm_embedding_engine.get_embeddings_batch(products, use_cache=True)
+        embeddings.update(supplemental)
+        logger.debug(
+            "Seed embedding supplementation | requested=%d fetched=%d total_embeddings=%d",
+            len(missing),
+            len(supplemental),
+            len(embeddings),
+        )
+        return embeddings
+
+    def _prioritize_catalog_subset(
+        self,
+        catalog_subset: List[Dict[str, Any]],
+        seed_skus: List[str],
+        catalog_map: Dict[str, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not catalog_subset and catalog_map:
+            catalog_subset = list(catalog_map.values())
+
+        seed_set = {sku for sku in seed_skus if sku}
+        prioritized: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+
+        for sku in seed_skus:
+            product = catalog_map.get(sku)
+            if not product:
+                continue
+            if sku in seen:
+                continue
+            prioritized.append(product)
+            seen.add(sku)
+            if len(prioritized) >= self.max_embedding_targets:
+                break
+
+        if len(prioritized) < self.max_embedding_targets:
+            for product in catalog_subset:
+                sku = product.get("sku")
+                if not sku or sku in seen:
+                    continue
+                prioritized.append(product)
+                seen.add(sku)
+                if len(prioritized) >= self.max_embedding_targets:
+                    break
+
+        if len(prioritized) < self.max_embedding_targets and catalog_map:
+            for sku, product in catalog_map.items():
+                if sku in seen:
+                    continue
+                prioritized.append(product)
+                seen.add(sku)
+                if len(prioritized) >= self.max_embedding_targets:
+                    break
+
+        logger.debug(
+            "Catalog subset prioritised | seed_count=%d prioritized=%d",
+            len(seed_skus),
+            len(prioritized),
+        )
+        return prioritized[: self.max_embedding_targets]
+
+    def _objective_specific_skus(
+        self,
+        catalog_map: Dict[str, Dict[str, Any]],
+        objective: str,
+    ) -> List[str]:
+        objective = (objective or "").lower()
+        if not catalog_map:
+            return []
+        if objective == "clear_slow_movers":
+            return [sku for sku, meta in catalog_map.items() if meta.get("is_slow_mover")]
+        if objective == "new_launch":
+            return [sku for sku, meta in catalog_map.items() if meta.get("is_new_launch")]
+        if objective == "seasonal_promo":
+            return [sku for sku, meta in catalog_map.items() if meta.get("is_seasonal")]
+        if objective == "margin_guard":
+            return [sku for sku, meta in catalog_map.items() if meta.get("is_high_margin")]
+        return []
     
     async def generate_candidates(
         self,
@@ -144,6 +541,13 @@ class CandidateGenerator:
                 )
                 apriori_candidates = self.convert_rules_to_candidates(association_rules, bundle_type)
                 metrics["apriori_candidates"] = len(apriori_candidates)
+                logger.info(
+                    "[%s] Apriori candidates generated | count=%d objective=%s bundle=%s",
+                    csv_upload_id,
+                    len(apriori_candidates),
+                    objective,
+                    bundle_type,
+                )
                 
                 # 2. FPGrowth algorithm (more efficient)
                 if self.use_fpgrowth:
@@ -154,25 +558,56 @@ class CandidateGenerator:
                         transactions=transactions,
                     )
                     metrics["fpgrowth_candidates"] = len(fpgrowth_candidates)
+                    logger.info(
+                        "[%s] FPGrowth candidates generated | count=%d transactions=%d",
+                        csv_upload_id,
+                        len(fpgrowth_candidates),
+                        len(transactions) if transactions else 0,
+                    )
             else:
                 metrics["apriori_candidates"] = 0
                 metrics["fpgrowth_candidates"] = 0
+                logger.info("[%s] Transactional candidate sources skipped (LLM-only mode)", csv_upload_id)
             
             # 3. LLM embeddings (semantic similarity) - REPLACES item2vec
             embeddings = context.embeddings if context else {}
+            llm_target = getattr(context, "llm_candidate_target", 20) if context else 20
+            catalog_map = context.catalog_products if context else {}
+            catalog_subset = context.catalog_subset if context else []
             llm_candidates = []
             if embeddings:
                 try:
-                    # Get catalog for LLM candidate generation
-                    catalog = await storage.get_catalog_snapshots_by_run(run_id)
-                    catalog_list = [
-                        {
-                            'sku': getattr(item, 'sku', ''),
-                            'title': getattr(item, 'title', ''),
-                            'product_category': getattr(item, 'product_category', ''),
-                        }
-                        for item in catalog
-                    ]
+                    if not catalog_map or not catalog_subset:
+                        fallback_catalog = (
+                            await storage.get_catalog_snapshots_by_run(run_id)
+                            if run_id
+                            else await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+                        )
+                        fallback_products = self._materialize_catalog_products(fallback_catalog)
+                        catalog_map = {item["sku"]: item for item in fallback_products if item.get("sku")}
+                        catalog_subset = fallback_products[: min(self.max_embedding_targets, len(fallback_products))]
+
+                    seed_skus = self._derive_similarity_seed_skus(
+                        apriori_candidates,
+                        fpgrowth_candidates,
+                        top_pair_candidates,
+                        context=context,
+                        objective=objective,
+                    )
+                    embeddings = await self._ensure_embeddings_for_seed_skus(
+                        embeddings,
+                        catalog_map,
+                        set(seed_skus),
+                    )
+                    prioritized_catalog = self._prioritize_catalog_subset(
+                        catalog_subset,
+                        seed_skus,
+                        catalog_map,
+                    )
+                    if context is not None:
+                        context.catalog_products = catalog_map
+                        context.catalog_subset = prioritized_catalog
+                        context.embeddings = embeddings
 
                     orders_count = (
                         len(context.transactions)
@@ -183,12 +618,21 @@ class CandidateGenerator:
                         csv_upload_id=csv_upload_id,
                         bundle_type=bundle_type,
                         objective=objective,
-                        catalog=catalog_list,
+                        catalog=prioritized_catalog,
                         embeddings=embeddings,
-                        num_candidates=20,
+                        num_candidates=llm_target,
                         orders_count=orders_count,
+                        seed_skus=seed_skus if seed_skus else None,
                     )
-                    logger.info(f"Generated {len(llm_candidates)} LLM-based candidates")
+                    metrics["llm_candidates_seeded"] = len(seed_skus)
+                    logger.info(
+                        "[%s] Generated %d LLM-based candidates (target=%d seed_skus=%d catalog_subset=%d)",
+                        csv_upload_id,
+                        len(llm_candidates),
+                        llm_target,
+                        len(seed_skus),
+                        len(prioritized_catalog),
+                    )
                     if llm_candidates:
                         for candidate in llm_candidates:
                             candidate.setdefault("objective", objective)

@@ -31,7 +31,11 @@ from services.ml.fallback_ladder import FallbackLadder
 # Import observability and feature flag systems (PR-8)
 from services.obs.metrics import metrics_collector
 from services.feature_flags import feature_flags
-from services.progress_tracker import update_generation_progress
+from services.notifications import notify_bundle_ready, notify_partial_ready
+from services.progress_tracker import (
+    update_generation_progress,
+    get_generation_checkpoint,
+)
 
 try:
     from opentelemetry import trace
@@ -79,6 +83,326 @@ class BundleGenerator:
                 for key, value in attributes.items():
                     span.set_attribute(key, value)
             yield span
+
+    def _time_budget_exceeded(self, end_time: Optional[datetime]) -> bool:
+        """Check whether the global time budget has been exhausted."""
+        return bool(end_time and datetime.now() >= end_time)
+
+    def _build_dataset_profile(
+        self,
+        context: Optional[CandidateGenerationContext],
+        recommendations: Optional[List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        transactions = len(getattr(context, "transactions", []) or [])
+        sku_count = len(getattr(context, "valid_skus", []) or [])
+        candidate_count = len(recommendations or [])
+        tier = "small"
+        if (
+            transactions >= self.large_dataset_txn_threshold
+            or sku_count >= self.large_dataset_sku_threshold
+        ):
+            tier = "large"
+        elif (
+            transactions >= self.medium_dataset_txn_threshold
+            or sku_count >= self.medium_dataset_sku_threshold
+        ):
+            tier = "medium"
+
+        avg_txn_per_sku = (
+            float(transactions) / float(sku_count) if transactions and sku_count else 0.0
+        )
+        return {
+            "tier": tier,
+            "transaction_count": transactions,
+            "unique_sku_count": sku_count,
+            "candidate_count": candidate_count,
+            "avg_transactions_per_sku": avg_txn_per_sku,
+        }
+
+    def _should_defer_async(
+        self,
+        dataset_profile: Dict[str, Any],
+        end_time: Optional[datetime],
+        resume_used: bool,
+    ) -> bool:
+        if not self.async_defer_enabled or resume_used:
+            return False
+
+        time_remaining: Optional[float] = None
+        if end_time:
+            time_remaining = (end_time - datetime.now()).total_seconds()
+            if time_remaining is not None and time_remaining < 0:
+                time_remaining = 0.0
+        dataset_profile["time_remaining_seconds"] = time_remaining
+
+        tier = dataset_profile.get("tier")
+        candidate_count = dataset_profile.get("candidate_count", 0)
+
+        if tier == "large":
+            return True
+
+        if self.async_defer_large_tier_only:
+            return False
+
+        if candidate_count >= self.async_defer_candidate_threshold:
+            return True
+
+        if (
+            time_remaining is not None
+            and time_remaining <= max(0, self.async_defer_min_time_remaining)
+        ):
+            return True
+
+        return False
+
+    def _derive_allocation_plan(self, dataset_profile: Dict[str, Any]) -> Dict[str, Any]:
+        plan = {
+            "phase3_concurrency": self.phase3_concurrency_limit,
+            "llm_candidate_target": 20,
+        }
+
+        tier = dataset_profile.get("tier")
+        if tier == "small":
+            plan["phase3_concurrency"] = max(2, min(self.phase3_concurrency_limit, 3))
+            plan["llm_candidate_target"] = 12
+        elif tier == "medium":
+            plan["phase3_concurrency"] = min(self.phase3_concurrency_limit, 5)
+            plan["llm_candidate_target"] = 18
+        elif tier == "large":
+            plan["phase3_concurrency"] = max(self.phase3_concurrency_limit, 8)
+            plan["llm_candidate_target"] = 24
+        return plan
+
+    def _warn_if_time_low(self, end_time: Optional[datetime], csv_upload_id: str, phase_label: str) -> None:
+        if not end_time or self.soft_timeout_warning_seconds <= 0:
+            return
+        remaining = (end_time - datetime.now()).total_seconds()
+        if remaining is None:
+            return
+        if remaining <= self.soft_timeout_warning_seconds:
+            warned = getattr(self, "_soft_timeout_warned", set())
+            if phase_label in warned:
+                return
+            warned.add(phase_label)
+            self._soft_timeout_warned = warned
+            logger.warning(
+                "[%s] Soft timeout warning | phase=%s remaining=%.1fs threshold=%ss",
+                csv_upload_id,
+                phase_label,
+                max(remaining, 0),
+                self.soft_timeout_warning_seconds,
+            )
+
+    async def _emit_heartbeat(
+        self,
+        csv_upload_id: str,
+        *,
+        step: str,
+        progress: int,
+        message: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self.heartbeat_interval_seconds <= 0:
+            return
+        now = time.time()
+        last = getattr(self, "_last_heartbeat_ts", 0.0)
+        if now - last < self.heartbeat_interval_seconds:
+            return
+        self._last_heartbeat_ts = now
+        try:
+            await update_generation_progress(
+                csv_upload_id,
+                step=step,
+                progress=progress,
+                status="in_progress",
+                message=message,
+                metadata=metadata,
+            )
+            logger.debug(
+                "[%s] Heartbeat emitted | step=%s progress=%d",
+                csv_upload_id,
+                step,
+                progress,
+            )
+        except Exception as exc:  # pragma: no cover - heartbeat best-effort
+            logger.debug("[%s] Heartbeat update failed: %s", csv_upload_id, exc)
+
+    async def _finalize_soft_timeout(
+        self,
+        csv_upload_id: str,
+        phase_name: str,
+        metrics: Dict[str, Any],
+        pipeline_start: float,
+        partial_recommendations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Gracefully terminate when the soft time budget is exceeded.
+        Returns a result payload without attempting further heavy processing.
+        """
+        total_pipeline_duration = int((time.time() - pipeline_start) * 1000)
+        metrics["processing_time_ms"] = total_pipeline_duration
+        metrics["timeout_error"] = True
+        metrics["timeout_phase"] = phase_name
+        metrics["soft_timeout"] = True
+        metrics["total_recommendations"] = len(partial_recommendations or [])
+
+        logger.warning(
+            f"[{csv_upload_id}] Soft timeout reached during {phase_name}. "
+            f"Elapsed={total_pipeline_duration/1000:.1f}s, "
+            f"candidates_retained={metrics['total_recommendations']}"
+        )
+
+        # Persist latest partial recommendations for potential resume attempts.
+        await self.store_partial_recommendations(
+            partial_recommendations or [],
+            csv_upload_id,
+            stage="soft_timeout",
+        )
+
+        await update_generation_progress(
+            csv_upload_id,
+            step="finalization",
+            progress=100,
+            status="failed",
+            message=f"Bundle generation stopped during {phase_name} due to time budget.",
+            bundle_count=metrics["total_recommendations"] or None,
+            metadata={"checkpoint": {"phase": phase_name, "timestamp": datetime.utcnow().isoformat()}},
+        )
+
+        # Persist the latest checkpoint details on the upload record for resumability.
+        await self._update_upload_checkpoint(
+            csv_upload_id,
+            {
+                "phase": phase_name,
+                "soft_timeout": True,
+                "timestamp": datetime.utcnow().isoformat(),
+                "bundle_count": metrics["total_recommendations"],
+            },
+            metrics_snapshot={
+                "total_recommendations": metrics["total_recommendations"],
+                "timeout_phase": phase_name,
+            },
+        )
+
+        return {
+            "recommendations": partial_recommendations or [],
+            "metrics": metrics,
+            "v2_pipeline": True,
+            "csv_upload_id": csv_upload_id,
+        }
+
+    async def _update_upload_checkpoint(
+        self,
+        csv_upload_id: str,
+        checkpoint: Dict[str, Any],
+        metrics_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist checkpoint data to the CSV upload record while preserving history."""
+        try:
+            upload = await storage.get_csv_upload(csv_upload_id)
+            existing_metrics: Dict[str, Any] = {}
+            if upload and getattr(upload, "bundle_generation_metrics", None):
+                existing_metrics = dict(upload.bundle_generation_metrics)
+
+            checkpoints = list(existing_metrics.get("checkpoints", []))
+            checkpoints.append(checkpoint)
+            # Keep only the most recent 10 checkpoints to avoid unbounded growth.
+            existing_metrics["checkpoints"] = checkpoints[-10:]
+            existing_metrics["last_checkpoint"] = checkpoint
+            if metrics_snapshot:
+                existing_metrics["latest_metrics_snapshot"] = metrics_snapshot
+
+            await storage.update_csv_upload(
+                csv_upload_id, {"bundle_generation_metrics": existing_metrics}
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{csv_upload_id}] Failed to persist checkpoint metadata: {exc}"
+            )
+
+    async def _record_checkpoint(
+        self,
+        csv_upload_id: str,
+        phase: str,
+        *,
+        bundle_count: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        metrics_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Construct and persist a checkpoint entry."""
+        checkpoint: Dict[str, Any] = {
+            "phase": phase,
+            "timestamp": datetime.utcnow().isoformat(),
+        }
+        if bundle_count is not None:
+            checkpoint["bundle_count"] = bundle_count
+        if metadata:
+            checkpoint.update(metadata)
+
+        await self._update_upload_checkpoint(
+            csv_upload_id, checkpoint, metrics_snapshot=metrics_snapshot
+        )
+        return checkpoint
+
+    async def _load_resume_state(
+        self, csv_upload_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Inspect saved checkpoints/partials to decide if we can resume mid-pipeline."""
+        try:
+            checkpoint = await get_generation_checkpoint(csv_upload_id)
+        except Exception as exc:
+            logger.warning(
+                f"[{csv_upload_id}] Unable to load generation checkpoint: {exc}"
+            )
+            return None
+
+        if not checkpoint:
+            return None
+
+        phase = checkpoint.get("phase")
+        if phase not in {"phase_3_candidates", "phase_4_dedup"}:
+            # Only resume in phases where we know how to rehydrate state.
+            return None
+
+        partial_recs = await storage.get_partial_bundle_recommendations(csv_upload_id)
+        if not partial_recs:
+            return None
+
+        recommendations: List[Dict[str, Any]] = []
+        for rec in partial_recs:
+            try:
+                recommendations.append(self._db_recommendation_to_internal(rec))
+            except Exception as exc:
+                logger.warning(
+                    f"[{csv_upload_id}] Failed to convert partial recommendation {getattr(rec, 'id', 'unknown')}: {exc}"
+                )
+
+        if not recommendations:
+            return None
+
+        logger.info(
+            f"[{csv_upload_id}] Resuming bundle generation from checkpoint {phase} "
+            f"with {len(recommendations)} persisted candidates."
+        )
+        return {"phase": phase, "recommendations": recommendations}
+
+    def _db_recommendation_to_internal(self, record: Any) -> Dict[str, Any]:
+        """Convert a BundleRecommendation ORM instance into the internal dict format."""
+        return {
+            "id": record.id,
+            "bundle_type": record.bundle_type,
+            "objective": record.objective,
+            "products": record.products,
+            "pricing": record.pricing,
+            "ai_copy": record.ai_copy,
+            "confidence": float(record.confidence) if record.confidence is not None else 0.0,
+            "predicted_lift": float(record.predicted_lift) if record.predicted_lift is not None else 0.0,
+            "support": float(record.support) if record.support is not None else None,
+            "lift": float(record.lift) if record.lift is not None else None,
+            "ranking_score": float(record.ranking_score) if record.ranking_score is not None else 0.0,
+            "discount_reference": None,
+            "is_resumed": True,
+        }
 
     def _initialize_configuration(self) -> None:
         # Bundle configuration
@@ -173,6 +497,16 @@ class BundleGenerator:
         # New caps for optimization and diversity safeguards
         self.min_candidates_for_optimization = 5
         self.max_bundles_per_pair = 2
+        self.medium_dataset_txn_threshold = int(os.getenv("DATASET_MEDIUM_TXN_THRESHOLD", "200"))
+        self.large_dataset_txn_threshold = int(os.getenv("DATASET_LARGE_TXN_THRESHOLD", "500"))
+        self.medium_dataset_sku_threshold = int(os.getenv("DATASET_MEDIUM_SKU_THRESHOLD", "150"))
+        self.large_dataset_sku_threshold = int(os.getenv("DATASET_LARGE_SKU_THRESHOLD", "350"))
+        self.async_defer_enabled = os.getenv("BUNDLING_ASYNC_DEFER", "true").lower() != "false"
+        self.async_defer_min_time_remaining = int(os.getenv("ASYNC_DEFER_MIN_TIME", "120"))
+        self.async_defer_candidate_threshold = int(os.getenv("ASYNC_DEFER_CANDIDATE_THRESHOLD", "120"))
+        self.async_defer_large_tier_only = os.getenv("ASYNC_DEFER_LARGE_ONLY", "false").lower() == "true"
+        self.heartbeat_interval_seconds = int(os.getenv("BUNDLE_HEARTBEAT_SECONDS", "30"))
+        self.soft_timeout_warning_seconds = int(os.getenv("BUNDLE_SOFT_TIMEOUT_WARNING", "45"))
 
     def _check_circuit_breaker(self, operation_name: str, success: bool) -> bool:
         """ARCHITECT FIX: Circuit-breaker to detect consecutive failures and stop runaway behavior"""
@@ -583,7 +917,37 @@ class BundleGenerator:
             "phase_timings": {}
         }
 
+        resume_state = await self._load_resume_state(csv_upload_id)
+        resume_recommendations = resume_state["recommendations"] if resume_state else None
+        resume_phase = resume_state["phase"] if resume_state else None
+
         start_time = datetime.now()
+        self._last_heartbeat_ts = time.time()
+        self._soft_timeout_warned = set()
+
+        feature_flag_snapshot = {
+            "data_mapping": self.enable_data_mapping,
+            "objective_scoring": self.enable_objective_scoring,
+            "ml_candidates": self.enable_ml_candidates,
+            "bayesian_pricing": self.enable_bayesian_pricing,
+            "weight_ranking": self.enable_weighted_ranking,
+            "deduplication": self.enable_deduplication,
+            "explainability": self.enable_explainability,
+        }
+        pipeline_run_id = f"bundle:{csv_upload_id}"
+        pipeline_started = False
+        pipeline_finished = False
+        if not resume_recommendations:
+            try:
+                metrics_collector.start_pipeline(
+                    pipeline_run_id,
+                    csv_upload_id,
+                    "bundle_generation",
+                    feature_flag_snapshot,
+                )
+                pipeline_started = True
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning("[%s] Unable to start pipeline metrics tracking: %s", csv_upload_id, exc)
 
         # Set hard timeout
         end_time = start_time + timedelta(seconds=self.max_time_budget_seconds)
@@ -604,6 +968,12 @@ class BundleGenerator:
                 metrics["data_mapping"] = {"enabled": True, "metrics": enrichment_metrics, "duration_ms": phase_duration}
                 metrics["total_order_lines"] = total_order_lines  # Track for Phase 3 FallbackLadder decision
                 metrics["phase_timings"]["phase_1_data_mapping"] = phase_duration
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_1_enrichment_completed",
+                    bundle_count=total_order_lines,
+                    metrics_snapshot={"data_mapping": enrichment_metrics},
+                )
                 await update_generation_progress(
                     csv_upload_id,
                     step="enrichment",
@@ -613,14 +983,22 @@ class BundleGenerator:
                         "Enrichment complete – "
                         f"{enrichment_metrics.get('resolved_variants', 0)} variants resolved."
                     ),
+                    bundle_count=total_order_lines if total_order_lines else None,
+                    metadata={"checkpoint": checkpoint},
                 )
             else:
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_1_enrichment_skipped",
+                    metrics_snapshot={"data_mapping": {"enabled": False}},
+                )
                 await update_generation_progress(
                     csv_upload_id,
                     step="enrichment",
                     progress=25,
                     status="in_progress",
                     message="Enrichment skipped (disabled).",
+                    metadata={"checkpoint": checkpoint},
                 )
             
             await update_generation_progress(
@@ -653,195 +1031,300 @@ class BundleGenerator:
                            f"objectives_computed={len(self.objectives)}")
                 metrics["objective_scoring"] = {"enabled": True, "metrics": objective_metrics, "duration_ms": phase_duration}
                 metrics["phase_timings"]["phase_2_objective_scoring"] = phase_duration
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_2_objective_scoring_completed",
+                    metrics_snapshot={"objective_scoring": objective_metrics},
+                )
                 await update_generation_progress(
                     csv_upload_id,
                     step="scoring",
                     progress=45,
                     status="in_progress",
                     message="Objective scoring complete.",
+                    metadata={"checkpoint": checkpoint},
                 )
             else:
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_2_objective_scoring_skipped",
+                    metrics_snapshot={"objective_scoring": {"enabled": False}},
+                )
                 await update_generation_progress(
                     csv_upload_id,
                     step="scoring",
                     progress=45,
                     status="in_progress",
                     message="Objective scoring skipped (disabled).",
+                    metadata={"checkpoint": checkpoint},
                 )
             
+            phase3_checkpoint_start = await self._record_checkpoint(
+                csv_upload_id,
+                "phase_3_candidates_started",
+                metrics_snapshot={"resume_phase": resume_phase} if resume_phase else None,
+            )
             await update_generation_progress(
                 csv_upload_id,
                 step="ml_generation",
                 progress=50,
                 status="in_progress",
                 message="Generating ML candidates…",
+                metadata={"checkpoint": phase3_checkpoint_start},
             )
 
             # Phase 3: Generate candidates for each objective with loop prevention
             phase3_start = time.time()
-            all_recommendations = []
+            all_recommendations: List[Dict[str, Any]] = []
             objectives_processed = 0
+            resume_used = bool(resume_recommendations)
 
-            # PARETO OPTIMIZATION: Prepare context and check if we should skip ML phase
-            candidate_context: CandidateGenerationContext = await self.candidate_generator.prepare_context(csv_upload_id)
+            candidate_context: Optional[CandidateGenerationContext] = None
 
-            # Early termination check
-            should_skip, skip_reason = self._should_skip_ml_phase(candidate_context, csv_upload_id)
-            if should_skip:
-                logger.warning(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - SKIPPED | reason={skip_reason}")
+            if resume_recommendations:
+                all_recommendations = resume_recommendations
                 metrics["ml_candidates"] = {
-                    "enabled": False,
-                    "skipped": True,
-                    "skip_reason": skip_reason,
-                    "duration_ms": 0
+                    "enabled": True,
+                    "resume_used": True,
+                    "duration_ms": 0,
+                    "candidates_generated": len(all_recommendations),
                 }
                 metrics["phase_timings"]["phase_3_ml_candidates"] = 0
+                candidate_count = len(all_recommendations)
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_3_candidates_resumed",
+                    bundle_count=candidate_count,
+                    metadata={"resume_phase": resume_phase},
+                    metrics_snapshot={"resume_candidates": candidate_count},
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ml_generation",
+                    progress=65,
+                    status="in_progress",
+                    message=f"Resumed from saved candidates ({candidate_count} ready).",
+                    bundle_count=candidate_count,
+                    metadata={"checkpoint": checkpoint, "partial_bundle_count": candidate_count},
+                )
+            else:
+                candidate_context = await self.candidate_generator.prepare_context(csv_upload_id)
+
+                # Early termination check
+                should_skip, skip_reason = self._should_skip_ml_phase(candidate_context, csv_upload_id)
+                if should_skip:
+                    logger.warning(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - SKIPPED | reason={skip_reason}")
+                    metrics["ml_candidates"] = {
+                        "enabled": False,
+                        "skipped": True,
+                        "skip_reason": skip_reason,
+                        "duration_ms": 0
+                    }
+                    metrics["phase_timings"]["phase_3_ml_candidates"] = 0
+                    checkpoint = await self._record_checkpoint(
+                        csv_upload_id,
+                        "phase_3_candidates_skipped",
+                        metadata={"skip_reason": skip_reason},
+                    )
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ml_generation",
+                        progress=70,
+                        status="in_progress",
+                        message=f"ML generation skipped: {skip_reason}",
+                        metadata={"checkpoint": checkpoint},
+                    )
+                else:
+                    # PARETO OPTIMIZATION: Select top objectives dynamically based on dataset size
+                    selected_objectives = self._select_objectives_for_dataset(candidate_context)
+                    logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - STARTED | "
+                               f"selected_objectives={len(selected_objectives)} (Pareto optimized from {len(self.objectives)})")
+                    dataset_profile_phase3 = self._build_dataset_profile(candidate_context, [])
+                    allocation_plan = self._derive_allocation_plan(dataset_profile_phase3)
+                    metrics["dataset_profile_phase3"] = dataset_profile_phase3
+                    metrics["allocation_plan"] = allocation_plan
+                    if candidate_context:
+                        candidate_context.llm_candidate_target = allocation_plan.get("llm_candidate_target", 20)
+                    phase3_concurrency_limit = allocation_plan.get("phase3_concurrency", self.phase3_concurrency_limit)
+
+                    # PARALLEL EXECUTION...
+                    generation_tasks = []
+                    try:
+                        for objective_name in selected_objectives:
+                            bundle_types_for_objective = self._get_bundle_types_for_objective(objective_name)
+                            for bundle_type in bundle_types_for_objective:
+                                task = self.generate_objective_bundles(
+                                    csv_upload_id,
+                                    objective_name,
+                                    bundle_type,
+                                    metrics,
+                                    end_time,
+                                    candidate_context,
+                                )
+                                generation_tasks.append((objective_name, bundle_type, task))
+                                logger.debug(
+                                    f"PARETO: Task created | "
+                                    f"objective={objective_name}, bundle_type={bundle_type}"
+                                )
+
+                        old_task_count = len(self.objectives) * len(self.bundle_types)
+                        new_task_count = len(generation_tasks)
+                        reduction_pct = int((1 - new_task_count / old_task_count) * 100) if old_task_count > 0 else 0
+
+                        logger.info(
+                            f"[{csv_upload_id}] PARETO: Task creation complete | "
+                            f"old_task_count={old_task_count} (8 objectives × 5 types) → "
+                            f"new_task_count={new_task_count} | "
+                            f"reduction={reduction_pct}% | "
+                            f"selected_objectives={selected_objectives}"
+                        )
+                        logger.info(
+                            f"[{csv_upload_id}] PARETO: Starting parallel execution | "
+                            f"tasks={new_task_count}, concurrency_limit={phase3_concurrency_limit}"
+                        )
+
+                    except Exception as e:
+                        logger.error(
+                            f"[{csv_upload_id}] PARETO: Error building generation tasks: {e} | "
+                            f"Proceeding with {len(generation_tasks)} tasks created so far",
+                            exc_info=True
+                        )
+
+                    parallel_start = time.time()
+
+                    try:
+                        tasks_only = [task for _, _, task in generation_tasks]
+
+                        logger.info(
+                            f"[{csv_upload_id}] PARETO: Executing parallel tasks | "
+                            f"task_count={len(tasks_only)}"
+                        )
+
+                        await self._emit_heartbeat(
+                            csv_upload_id,
+                            step="ml_generation",
+                            progress=58,
+                            message="Generating ML candidates…",
+                            metadata={"active_tasks": len(tasks_only)},
+                        )
+
+                        results = await self._gather_with_concurrency(phase3_concurrency_limit, tasks_only)
+
+                        parallel_duration = int((time.time() - parallel_start) * 1000)
+                        logger.info(
+                            f"[{csv_upload_id}] PARETO: Parallel execution complete | "
+                            f"wall_clock_time={parallel_duration}ms, "
+                            f"avg_time_per_task={parallel_duration // len(tasks_only) if tasks_only else 0}ms"
+                        )
+
+                        success_count = 0
+                        failure_count = 0
+                        empty_count = 0
+
+                        for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
+                            if isinstance(result, Exception):
+                                logger.warning(
+                                    f"[{csv_upload_id}] PARETO: Task failed | "
+                                    f"objective={objective_name}, bundle_type={bundle_type}, "
+                                    f"error={str(result)[:100]}"
+                                )
+                                self.generation_stats['failed_attempts'] += 1
+                                failure_count += 1
+                            elif isinstance(result, list):
+                                all_recommendations.extend(result)
+                                if len(result) > 0:
+                                    objectives_processed += 1
+                                    success_count += 1
+                                    logger.info(
+                                        f"[{csv_upload_id}] PARETO: Task succeeded | "
+                                        f"objective={objective_name}, bundle_type={bundle_type}, "
+                                        f"bundles_generated={len(result)}"
+                                    )
+                                else:
+                                    empty_count += 1
+                                    logger.debug(
+                                        f"PARETO: Task completed but generated 0 bundles | "
+                                        f"objective={objective_name}, bundle_type={bundle_type}"
+                                    )
+
+                        logger.info(
+                            f"[{csv_upload_id}] PARETO: Result processing complete | "
+                            f"total_candidates={len(all_recommendations)}, "
+                            f"successful_combinations={objectives_processed}, "
+                            f"success={success_count}, empty={empty_count}, failed={failure_count}"
+                        )
+
+                    except Exception as e:
+                        parallel_duration = int((time.time() - parallel_start) * 1000)
+                        logger.error(
+                            f"[{csv_upload_id}] PARETO: Error during parallel execution: {e} | "
+                            f"partial_results={len(all_recommendations)} candidates | "
+                            f"duration={parallel_duration}ms",
+                            exc_info=True
+                        )
+
+                    phase3_duration = int((time.time() - phase3_start) * 1000)
+                    logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
+                               f"candidates_generated={len(all_recommendations)} "
+                               f"objectives_processed={objectives_processed} "
+                               f"attempts={self.generation_stats['total_attempts']} "
+                               f"successes={self.generation_stats['successful_generations']} "
+                               f"duplicates_skipped={self.generation_stats['skipped_duplicates']}")
+                    metrics["ml_candidates"] = {"enabled": True, "duration_ms": phase3_duration,
+                                                "candidates_generated": len(all_recommendations)}
+                    metrics["phase_timings"]["phase_3_ml_candidates"] = phase3_duration
+                    candidate_count = len(all_recommendations)
+                    checkpoint = await self._record_checkpoint(
+                        csv_upload_id,
+                        "phase_3_candidates_completed",
+                        bundle_count=candidate_count,
+                        metrics_snapshot={"ml_candidates": metrics["ml_candidates"]},
+                    )
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ml_generation",
+                        progress=70,
+                        status="in_progress",
+                        message=f"ML candidate generation complete – {candidate_count} candidates ready.",
+                        bundle_count=candidate_count if candidate_count else None,
+                        metadata={"checkpoint": checkpoint},
+                    )
+
+            if resume_recommendations:
+                candidate_count = len(all_recommendations)
+                await self.store_partial_recommendations(
+                    all_recommendations, csv_upload_id, stage="phase_3_resume"
+                )
+            elif not resume_used and metrics["ml_candidates"]["enabled"]:
+                candidate_count = len(all_recommendations)
+                await self.store_partial_recommendations(
+                    all_recommendations, csv_upload_id, stage="phase_3"
+                )
+            else:
+                candidate_count = len(all_recommendations)
+
+            if resume_recommendations:
                 await update_generation_progress(
                     csv_upload_id,
                     step="ml_generation",
                     progress=70,
                     status="in_progress",
-                    message=f"ML generation skipped: {skip_reason}",
+                    message=f"Resumed candidates ready – {candidate_count} available.",
+                    bundle_count=candidate_count,
+                    metadata={"checkpoint": checkpoint},
                 )
-            else:
-                # PARETO OPTIMIZATION: Select top objectives dynamically based on dataset size
-                selected_objectives = self._select_objectives_for_dataset(candidate_context)
-                logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - STARTED | "
-                           f"selected_objectives={len(selected_objectives)} (Pareto optimized from {len(self.objectives)})")
-
-                # PARALLEL EXECUTION: Generate selected objective/bundle_type combinations concurrently
-                # Build list of tasks using intelligent bundle type mapping
-                generation_tasks = []
-                try:
-                    for objective_name in selected_objectives:
-                        # Get best-fit bundle types for this objective (1-2 types instead of all 5)
-                        bundle_types_for_objective = self._get_bundle_types_for_objective(objective_name)
-                        for bundle_type in bundle_types_for_objective:
-                            task = self.generate_objective_bundles(
-                                csv_upload_id,
-                                objective_name,
-                                bundle_type,
-                                metrics,
-                                end_time,
-                                candidate_context,
-                            )
-                            generation_tasks.append((objective_name, bundle_type, task))
-                            logger.debug(
-                                f"PARETO: Task created | "
-                                f"objective={objective_name}, bundle_type={bundle_type}"
-                            )
-
-                    # Log reduction
-                    old_task_count = len(self.objectives) * len(self.bundle_types)  # 40 tasks
-                    new_task_count = len(generation_tasks)
-                    reduction_pct = int((1 - new_task_count / old_task_count) * 100) if old_task_count > 0 else 0
-
-                    logger.info(
-                        f"[{csv_upload_id}] PARETO: Task creation complete | "
-                        f"old_task_count={old_task_count} (8 objectives × 5 types) → "
-                        f"new_task_count={new_task_count} | "
-                        f"reduction={reduction_pct}% | "
-                        f"selected_objectives={selected_objectives}"
-                    )
-                    logger.info(
-                        f"[{csv_upload_id}] PARETO: Starting parallel execution | "
-                        f"tasks={new_task_count}, concurrency_limit={self.phase3_concurrency_limit}"
-                    )
-
-                except Exception as e:
-                    logger.error(
-                        f"[{csv_upload_id}] PARETO: Error building generation tasks: {e} | "
-                        f"Proceeding with {len(generation_tasks)} tasks created so far",
-                        exc_info=True
-                    )
-                    # Continue with whatever tasks were successfully created
-
-                parallel_start = time.time()
-
-                # Execute all tasks concurrently
-                try:
-                    tasks_only = [task for _, _, task in generation_tasks]
-
-                    logger.info(
-                        f"[{csv_upload_id}] PARETO: Executing parallel tasks | "
-                        f"task_count={len(tasks_only)}"
-                    )
-
-                    results = await self._gather_with_concurrency(self.phase3_concurrency_limit, tasks_only)
-
-                    parallel_duration = int((time.time() - parallel_start) * 1000)
-                    logger.info(
-                        f"[{csv_upload_id}] PARETO: Parallel execution complete | "
-                        f"wall_clock_time={parallel_duration}ms, "
-                        f"avg_time_per_task={parallel_duration // len(tasks_only) if tasks_only else 0}ms"
-                    )
-
-                    # Process results and count successes/failures
-                    success_count = 0
-                    failure_count = 0
-                    empty_count = 0
-
-                    for (objective_name, bundle_type, _), result in zip(generation_tasks, results):
-                        if isinstance(result, Exception):
-                            logger.warning(
-                                f"[{csv_upload_id}] PARETO: Task failed | "
-                                f"objective={objective_name}, bundle_type={bundle_type}, "
-                                f"error={str(result)[:100]}"
-                            )
-                            self.generation_stats['failed_attempts'] += 1
-                            failure_count += 1
-                        elif isinstance(result, list):
-                            all_recommendations.extend(result)
-                            if len(result) > 0:
-                                objectives_processed += 1
-                                success_count += 1
-                                logger.info(
-                                    f"[{csv_upload_id}] PARETO: Task succeeded | "
-                                    f"objective={objective_name}, bundle_type={bundle_type}, "
-                                    f"bundles_generated={len(result)}"
-                                )
-                            else:
-                                empty_count += 1
-                                logger.debug(
-                                    f"PARETO: Task completed but generated 0 bundles | "
-                                    f"objective={objective_name}, bundle_type={bundle_type}"
-                                )
-
-                    logger.info(
-                        f"[{csv_upload_id}] PARETO: Result processing complete | "
-                        f"total_candidates={len(all_recommendations)}, "
-                        f"successful_combinations={objectives_processed}, "
-                        f"success={success_count}, empty={empty_count}, failed={failure_count}"
-                    )
-
-                except Exception as e:
-                    parallel_duration = int((time.time() - parallel_start) * 1000)
-                    logger.error(
-                        f"[{csv_upload_id}] PARETO: Error during parallel execution: {e} | "
-                        f"partial_results={len(all_recommendations)} candidates | "
-                        f"duration={parallel_duration}ms",
-                        exc_info=True
-                    )
-
-                phase3_duration = int((time.time() - phase3_start) * 1000)
-                logger.info(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - COMPLETED in {phase3_duration}ms | "
-                           f"candidates_generated={len(all_recommendations)} "
-                           f"objectives_processed={objectives_processed} "
-                           f"attempts={self.generation_stats['total_attempts']} "
-                           f"successes={self.generation_stats['successful_generations']} "
-                           f"duplicates_skipped={self.generation_stats['skipped_duplicates']}")
-                metrics["ml_candidates"] = {"enabled": True, "duration_ms": phase3_duration,
-                                            "candidates_generated": len(all_recommendations)}
-                metrics["phase_timings"]["phase_3_ml_candidates"] = phase3_duration
-            candidate_count = len(all_recommendations)
-            await update_generation_progress(
-                csv_upload_id,
-                step="ml_generation",
-                progress=70,
-                status="in_progress",
-                message=f"ML candidate generation complete – {candidate_count} candidates ready.",
-                bundle_count=candidate_count if candidate_count else None,
-            )
+            elif not metrics["ml_candidates"].get("enabled"):
+                candidate_count = 0
+            if not resume_recommendations and metrics["ml_candidates"].get("enabled"):
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ml_generation",
+                    progress=70,
+                    status="in_progress",
+                    message=f"ML candidate generation complete – {candidate_count} candidates ready.",
+                    bundle_count=candidate_count if candidate_count else None,
+                    metadata={"partial_bundle_count": candidate_count, "checkpoint": checkpoint},
+                )
             await update_generation_progress(
                 csv_upload_id,
                 step="optimization",
@@ -849,6 +1332,65 @@ class BundleGenerator:
                 status="in_progress",
                 message="Optimizing bundle candidates…",
             )
+
+            dataset_profile = self._build_dataset_profile(candidate_context, all_recommendations)
+            metrics["dataset_profile"] = dataset_profile
+
+            if self._should_defer_async(dataset_profile, end_time, resume_used):
+                logger.info(
+                    "[%s] Async deferral engaged | tier=%s candidates=%s time_remaining=%s",
+                    csv_upload_id,
+                    dataset_profile.get("tier"),
+                    dataset_profile.get("candidate_count"),
+                    dataset_profile.get("time_remaining_seconds"),
+                )
+                await self.store_partial_recommendations(
+                    all_recommendations, csv_upload_id, stage="phase_3_deferred"
+                )
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_3_async_deferred",
+                    bundle_count=len(all_recommendations),
+                    metadata={"dataset_profile": dataset_profile},
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="optimization",
+                    progress=78,
+                    status="in_progress",
+                    message="Phase 3 complete. Continuing heavy phases asynchronously…",
+                    bundle_count=len(all_recommendations) if all_recommendations else None,
+                    metadata={"checkpoint": checkpoint, "dataset_profile": dataset_profile},
+                )
+                metrics["async_deferred"] = True
+                metrics["processing_time_ms"] = int((time.time() - pipeline_start) * 1000)
+                await notify_partial_ready(csv_upload_id, len(all_recommendations))
+                return {
+                    "recommendations": all_recommendations,
+                    "metrics": metrics,
+                    "async_deferred": True,
+                    "dataset_profile": dataset_profile,
+                }
+
+            self._warn_if_time_low(end_time, csv_upload_id, "Phase 4 (pre-deduplication)")
+            if self._time_budget_exceeded(end_time):
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 4 (pre-deduplication)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft timeout: %s", csv_upload_id, exc)
+                return result
 
             # Phase 4: Deduplication
             if self.enable_deduplication and all_recommendations:
@@ -863,7 +1405,52 @@ class BundleGenerator:
                            f"duplicates_removed={dedupe_metrics.get('duplicates_removed', 0)}")
                 metrics["deduplication"] = {"enabled": True, "metrics": dedupe_metrics, "duration_ms": phase_duration}
                 metrics["phase_timings"]["phase_4_deduplication"] = phase_duration
+                await self.store_partial_recommendations(
+                    all_recommendations, csv_upload_id, stage="phase_4"
+                )
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_4_deduplication_completed",
+                    bundle_count=len(all_recommendations),
+                    metrics_snapshot={"deduplication": dedupe_metrics},
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="optimization",
+                    progress=80,
+                    status="in_progress",
+                    message="Deduplication complete.",
+                    bundle_count=len(all_recommendations) if all_recommendations else None,
+                    metadata={"checkpoint": checkpoint},
+                )
+                await self._emit_heartbeat(
+                    csv_upload_id,
+                    step="optimization",
+                    progress=80,
+                    message="Post-deduplication heartbeat",
+                    metadata={"remaining_bundles": len(all_recommendations)},
+                )
             
+            self._warn_if_time_low(end_time, csv_upload_id, "Phase 5 (pre-enterprise optimization)")
+            if self._time_budget_exceeded(end_time):
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 5 (pre-enterprise optimization)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft timeout: %s", csv_upload_id, exc)
+                return result
+
             # Phase 5a: Global Enterprise Optimization (across all bundle types)
             if self.enable_enterprise_optimization and all_recommendations and len(all_recommendations) > 10:
                 phase_start = time.time()
@@ -925,6 +1512,48 @@ class BundleGenerator:
                 metrics["global_enterprise_optimization"] = {"enabled": False}
                 metrics["weighted_ranking"] = {"enabled": False}
 
+            await self.store_partial_recommendations(
+                all_recommendations, csv_upload_id, stage="phase_5"
+            )
+            checkpoint = await self._record_checkpoint(
+                csv_upload_id,
+                "phase_5_optimization_completed",
+                bundle_count=len(all_recommendations),
+                metrics_snapshot={
+                    "weighted_ranking": metrics.get("weighted_ranking"),
+                    "enterprise_optimization": metrics.get("global_enterprise_optimization"),
+                },
+            )
+            await update_generation_progress(
+                csv_upload_id,
+                step="optimization",
+                progress=82,
+                status="in_progress",
+                message="Optimization pass complete.",
+                bundle_count=len(all_recommendations) if all_recommendations else None,
+                metadata={"checkpoint": checkpoint},
+            )
+
+            self._warn_if_time_low(end_time, csv_upload_id, "Phase 5c (pre-fallback injection)")
+            if self._time_budget_exceeded(end_time):
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 5c (pre-fallback injection)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft timeout: %s", csv_upload_id, exc)
+                return result
+
             # Phase 5c: Ensure minimum pair coverage via forced fallbacks
             phase_start = time.time()
             bundles_before = len(all_recommendations)
@@ -934,6 +1563,44 @@ class BundleGenerator:
                 phase_duration = int((time.time() - phase_start) * 1000)
                 logger.info(f"[{csv_upload_id}] Phase 5c: Fallback Injection - COMPLETED in {phase_duration}ms | injected={injected}")
                 metrics["phase_timings"]["phase_5c_fallback"] = phase_duration
+                await self.store_partial_recommendations(
+                    all_recommendations, csv_upload_id, stage="phase_5c"
+                )
+                checkpoint = await self._record_checkpoint(
+                    csv_upload_id,
+                    "phase_5_fallback_completed",
+                    bundle_count=len(all_recommendations),
+                    metrics_snapshot={"fallback_injected": injected},
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="optimization",
+                    progress=83,
+                    status="in_progress",
+                    message=f"Fallback bundles injected (+{injected}).",
+                    bundle_count=len(all_recommendations),
+                    metadata={"checkpoint": checkpoint},
+                )
+
+            self._warn_if_time_low(end_time, csv_upload_id, "Phase 6 (pre-explainability)")
+            if self._time_budget_exceeded(end_time):
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 6 (pre-explainability)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft timeout: %s", csv_upload_id, exc)
+                return result
 
             # Phase 6: Explainability
             if self.enable_explainability and all_recommendations:
@@ -959,13 +1626,44 @@ class BundleGenerator:
                 status="in_progress",
                 message="Optimization complete. Preparing AI descriptions…",
             )
+            await self._emit_heartbeat(
+                csv_upload_id,
+                step="optimization",
+                progress=85,
+                message="Preparing AI descriptions…",
+            )
+
+            self._warn_if_time_low(end_time, csv_upload_id, "Phase 7 (pre-pricing/finalization)")
+            if self._time_budget_exceeded(end_time):
+                result = await self._finalize_soft_timeout(
+                    csv_upload_id,
+                    "Phase 7 (pre-pricing/finalization)",
+                    metrics,
+                    pipeline_start,
+                    all_recommendations,
+                )
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(result.get("recommendations", [])),
+                        success=False,
+                    )
+                except Exception as exc:
+                    logger.warning("[%s] Failed to finish pipeline metrics on soft timeout: %s", csv_upload_id, exc)
+                pipeline_finished = True
+                return result
 
             # Phase 7: Pricing (part of finalization)
             pricing_start = time.time()
             logger.info(f"[{csv_upload_id}] Phase 7: Pricing & Finalization - STARTED | bundles={len(all_recommendations)}")
 
             # Phase 8: AI Copy Generation & Phase 9: Storage happen in finalize_recommendations
-            final_recommendations = await self.finalize_recommendations(all_recommendations, csv_upload_id, metrics)
+            final_recommendations = await self.finalize_recommendations(
+                all_recommendations,
+                csv_upload_id,
+                metrics,
+                end_time=end_time,
+            )
 
             finalization_duration = int((time.time() - pricing_start) * 1000)
             logger.info(f"[{csv_upload_id}] Phase 7-9: Pricing, AI Copy & Storage - COMPLETED in {finalization_duration}ms")
@@ -1005,7 +1703,24 @@ class BundleGenerator:
             for phase_name, duration in sorted(metrics["phase_timings"].items()):
                 percentage = (duration / total_pipeline_duration * 100) if total_pipeline_duration > 0 else 0
                 logger.info(f"[{csv_upload_id}]   - {phase_name}: {duration}ms ({percentage:.1f}%)")
-            
+
+            if not pipeline_finished:
+                try:
+                    metrics_collector.record_phase_timings(metrics.get("phase_timings", {}))
+                except Exception as exc:
+                    logger.warning("[%s] Failed to record phase timings: %s", csv_upload_id, exc)
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        len(final_recommendations),
+                        success=True,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to record final pipeline metrics: %s", csv_upload_id, exc)
+
+            await notify_bundle_ready(csv_upload_id, len(final_recommendations), resume_used)
+
             return {
                 "recommendations": final_recommendations,
                 "metrics": metrics,
@@ -1035,6 +1750,22 @@ class BundleGenerator:
                        f"failures={self.generation_stats['failed_attempts']}")
 
             logger.error(f"[{csv_upload_id}] ================================================================")
+
+            if not pipeline_finished:
+                try:
+                    if metrics.get("phase_timings"):
+                        metrics_collector.record_phase_timings(metrics["phase_timings"])
+                except Exception as exc:
+                    logger.warning("[%s] Failed to record phase timings on failure: %s", csv_upload_id, exc)
+                try:
+                    metrics_collector.finish_pipeline(
+                        pipeline_run_id,
+                        metrics.get("total_recommendations", 0),
+                        success=False,
+                    )
+                    pipeline_finished = True
+                except Exception as exc:
+                    logger.warning("[%s] Failed to record failure metrics: %s", csv_upload_id, exc)
 
             await update_generation_progress(
                 csv_upload_id,
@@ -1380,7 +2111,13 @@ class BundleGenerator:
             self.generation_stats['failed_attempts'] += 1
             return []
     
-    async def finalize_recommendations(self, recommendations: List[Dict[str, Any]], csv_upload_id: str, metrics: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def finalize_recommendations(
+        self,
+        recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        metrics: Dict[str, Any],
+        end_time: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         """Finalize recommendations and prepare for storage"""
         try:
             final_recommendations = []
@@ -1439,7 +2176,7 @@ class BundleGenerator:
             )
             
             # Add AI-generated copy if available (BATCHED for speed)
-            if final_recommendations:
+            if final_recommendations and not self._time_budget_exceeded(end_time):
                 ai_copy_start = time.time()
                 batch_size = 5  # Process 5 bundles at a time to avoid rate limits
                 bundles_for_copy = final_recommendations[:10]  # Limit AI copy generation for cost
@@ -1517,6 +2254,19 @@ class BundleGenerator:
                     message="AI descriptions ready.",
                     bundle_count=bundle_total,
                 )
+            elif final_recommendations:
+                logger.warning(
+                    f"[{csv_upload_id}] Skipping AI copy generation due to soft time budget proximity."
+                )
+                metrics["phase_timings"]["phase_8_ai_copy"] = 0
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ai_descriptions",
+                    progress=92,
+                    status="in_progress",
+                    message="Skipped AI descriptions due to time budget.",
+                    bundle_count=bundle_total,
+                )
             
             await update_generation_progress(
                 csv_upload_id,
@@ -1526,6 +2276,10 @@ class BundleGenerator:
                 message="Finalizing bundle recommendations…",
                 bundle_count=bundle_total if bundle_total else None,
             )
+
+            # Remove any partial recommendations before persisting the final set
+            if csv_upload_id:
+                await storage.delete_partial_bundle_recommendations(csv_upload_id)
 
             # Store recommendations in database
             if final_recommendations and csv_upload_id:
@@ -1563,17 +2317,31 @@ class BundleGenerator:
             )
             return recommendations  # Return original recommendations if finalization fails
     
-    async def store_partial_recommendations(self, recommendations: List[Dict[str, Any]], csv_upload_id: str) -> None:
+    async def store_partial_recommendations(
+        self,
+        recommendations: List[Dict[str, Any]],
+        csv_upload_id: str,
+        stage: str = "phase_3",
+    ) -> None:
         """Store partial recommendations during processing to prevent data loss"""
         try:
             if not recommendations:
                 return
-                
-            # Store a subset of recommendations as partial results
-            partial_recs = recommendations[-20:]  # Store last 20 recommendations
-            
+
+            # Select up to 50 top recommendations based on ranking/confidence
+            sorted_recs = sorted(
+                recommendations,
+                key=lambda rec: rec.get("ranking_score", rec.get("confidence", 0.0)),
+                reverse=True,
+            )
+            partial_recs = sorted_recs[:50]
+            if not partial_recs:
+                return
+
+            await storage.delete_partial_bundle_recommendations(csv_upload_id)
+
             db_recommendations = []
-            for rec in partial_recs:
+            for index, rec in enumerate(partial_recs):
                 try:
                     # Use same conversion logic as main store method
                     confidence = self._safe_decimal(rec.get("confidence", 0), 0.5)
@@ -1598,6 +2366,7 @@ class BundleGenerator:
                     db_rec = {
                         "id": rec["id"],
                         "csv_upload_id": csv_upload_id,
+                        "shop_id": rec.get("shop_id"),
                         "bundle_type": rec.get("bundle_type", "FBT"),
                         "objective": rec.get("objective", "increase_aov"),
                         "products": rec.get("products", []),
@@ -1608,8 +2377,10 @@ class BundleGenerator:
                         "support": self._safe_decimal(rec.get("support", 0), None),
                         "lift": self._safe_decimal(rec.get("lift", 1), None),
                         "ranking_score": ranking_score,
+                        "discount_reference": f"__partial__:{stage}",
                         "is_approved": False,
-                        "is_used": False
+                        "is_used": False,
+                        "rank_position": index + 1,
                     }
                     
                     # Remove None values for optional fields
@@ -1622,7 +2393,9 @@ class BundleGenerator:
             
             if db_recommendations:
                 await storage.create_bundle_recommendations(db_recommendations)
-                logger.info(f"Stored {len(db_recommendations)} partial recommendations")
+                logger.info(
+                    f"Stored {len(db_recommendations)} partial recommendations for {csv_upload_id} (stage={stage})"
+                )
             
         except Exception as e:
             logger.warning(f"Error storing partial recommendations: {e}")

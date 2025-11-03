@@ -12,8 +12,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from database import (
-    AsyncSessionLocal, User, CsvUpload, Order, OrderLine, Product, 
-    Variant, InventoryLevel, CatalogSnapshot,
+    AsyncSessionLocal, User, CsvUpload, Order, OrderLine, Product,
+    Variant, InventoryLevel, CatalogSnapshot, EmbeddingCache,
     AssociationRule, Bundle, BundleRecommendation, ShopSyncStatus
 )
 from settings import resolve_shop_id, sanitize_shop_id, DEFAULT_SHOP_ID
@@ -122,6 +122,55 @@ class StorageService:
         """Get database session context manager"""
         return AsyncSessionLocal()
 
+    async def get(self, key: str) -> Optional[str]:
+        """Generic key-value getter used by embedding cache."""
+        async with self.get_session() as session:
+            try:
+                record = await session.get(EmbeddingCache, key)
+                if not record:
+                    return None
+                if record.expires_at and record.expires_at < datetime.utcnow():
+                    await session.delete(record)
+                    await session.commit()
+                    return None
+                logger.debug("Embedding cache hit | key=%s", key)
+                return record.payload
+            except Exception:
+                logger.exception("Failed to read embedding cache key=%s", key)
+                return None
+
+    async def set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
+        """Generic key-value setter used by embedding cache."""
+        expires_at = None
+        if ttl:
+            try:
+                expires_at = datetime.utcnow() + timedelta(seconds=int(ttl))
+            except Exception:
+                expires_at = None
+
+        async with self.get_session() as session:
+            try:
+                record = await session.get(EmbeddingCache, key)
+                if record:
+                    record.payload = value
+                    record.expires_at = expires_at
+                    record.updated_at = datetime.utcnow()
+                else:
+                    record = EmbeddingCache(
+                        key=key,
+                        payload=value,
+                        expires_at=expires_at,
+                    )
+                    session.add(record)
+                await session.commit()
+                logger.debug(
+                    "Embedding cache write | key=%s ttl=%s",
+                    key,
+                    ttl,
+                )
+            except Exception:
+                logger.exception("Failed to write embedding cache key=%s", key)
+                await session.rollback()
     # ---------------- Run helpers ----------------
     async def get_run_id_for_upload(self, csv_upload_id: str) -> Optional[str]:
         try:
@@ -471,6 +520,14 @@ class StorageService:
                 )
 
             filtered_rows = self._filter_columns(BundleRecommendation.__table__, normalized_rows)
+
+            # Remove any existing recommendations with matching IDs to support upsert-like behaviour
+            existing_ids = [row.get("id") for row in filtered_rows if row.get("id")]
+            if existing_ids:
+                await session.execute(
+                    delete(BundleRecommendation).where(BundleRecommendation.id.in_(existing_ids))
+                )
+
             recommendations = [BundleRecommendation(**row) for row in filtered_rows]
             session.add_all(recommendations)
             await session.commit()
@@ -478,6 +535,42 @@ class StorageService:
             for rec in recommendations:
                 await session.refresh(rec)
             return recommendations
+
+    async def delete_partial_bundle_recommendations(self, csv_upload_id: str) -> None:
+        """Remove any partially persisted recommendations for an upload."""
+        if not csv_upload_id:
+            return
+        async with self.get_session() as session:
+            await session.execute(
+                delete(BundleRecommendation).where(
+                    BundleRecommendation.csv_upload_id == csv_upload_id,
+                    BundleRecommendation.discount_reference.isnot(None),
+                    BundleRecommendation.discount_reference.like("__partial__%"),
+                )
+            )
+            await session.commit()
+
+    async def get_partial_bundle_recommendations(self, csv_upload_id: str) -> List[BundleRecommendation]:
+        """Fetch partially persisted recommendations used for resume checkpoints."""
+        if not csv_upload_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(BundleRecommendation)
+                .where(
+                    BundleRecommendation.csv_upload_id == csv_upload_id,
+                    BundleRecommendation.discount_reference.isnot(None),
+                    BundleRecommendation.discount_reference.like("__partial__%"),
+                )
+                .order_by(
+                    BundleRecommendation.rank_position.asc().nulls_last(),
+                    desc(BundleRecommendation.ranking_score),
+                    desc(BundleRecommendation.confidence),
+                    desc(BundleRecommendation.created_at),
+                )
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
     
     async def get_bundle_recommendations_by_upload(
         self,
@@ -1295,3 +1388,4 @@ class StorageService:
 
 # Global storage instance
 storage = StorageService()
+storage.client = storage

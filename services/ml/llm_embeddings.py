@@ -14,7 +14,7 @@ import os
 import json
 import hashlib
 import logging
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional, Set
 import contextlib
 
 import numpy as np
@@ -507,6 +507,7 @@ class LLMEmbeddingEngine:
         embeddings: Dict[str, np.ndarray],
         num_candidates: int = 20,
         orders_count: Optional[int] = None,
+        seed_skus: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not catalog or not embeddings:
             return []
@@ -516,8 +517,36 @@ class LLMEmbeddingEngine:
             "bundle_type": bt,
             "objective": objective,
             "catalog_size": len(catalog),
+            "seed_skus": len(seed_skus) if seed_skus else 0,
         }
         with self._start_span("llm_embeddings.generate_candidates", span_attrs):
+            if seed_skus:
+                prioritized: List[Dict[str, Any]] = []
+                seen: Set[str] = set()
+                catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
+                for sku in seed_skus:
+                    item = catalog_lookup.get(sku)
+                    if not item:
+                        continue
+                    if sku in seen:
+                        continue
+                    prioritized.append(item)
+                    seen.add(sku)
+                if prioritized:
+                    for item in catalog:
+                        sku = item.get("sku")
+                        if not sku or sku in seen:
+                            continue
+                        prioritized.append(item)
+                    catalog = prioritized
+                logger.info(
+                    "[%s] Similarity pipeline seed info | bundle=%s objective=%s seed_skus=%d prioritized_catalog=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(seed_skus),
+                    len(catalog),
+                )
             fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
             if bt == "FBT":
                 results = await self._gen_fbt(

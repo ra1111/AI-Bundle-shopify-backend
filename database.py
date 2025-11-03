@@ -394,6 +394,16 @@ class CatalogSnapshot(Base):
     csv_upload = relationship("CsvUpload")
 
 
+class EmbeddingCache(Base):
+    __tablename__ = "embedding_cache"
+
+    key: Mapped[str] = mapped_column(String, primary_key=True)
+    payload: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class AssociationRule(Base):
     __tablename__ = "association_rules"
 

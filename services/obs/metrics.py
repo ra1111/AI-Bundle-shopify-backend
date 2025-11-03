@@ -186,6 +186,12 @@ class MetricsCollector:
             
             # Return metrics summary
             return self._generate_metrics_summary(pipeline)
+
+    def record_phase_timings(self, timings: Dict[str, float]) -> None:
+        """Record externally computed phase timings."""
+        with self._lock:
+            for phase_name, duration in timings.items():
+                self.phase_timings[phase_name].append(duration)
     
     def get_phase_diagnostics(self, phase_name: Optional[str] = None) -> Dict[str, Any]:
         """Get detailed phase performance diagnostics"""

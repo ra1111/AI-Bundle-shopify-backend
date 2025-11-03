@@ -4,7 +4,7 @@ Generation progress persistence helpers.
 from __future__ import annotations
 
 import logging
-from typing import Literal, Optional, Union
+from typing import Dict, Literal, Optional, Union
 from uuid import UUID
 
 from sqlalchemy import func, select
@@ -42,6 +42,7 @@ async def update_generation_progress(
     message: Optional[str] = None,
     bundle_count: Optional[int] = None,
     time_remaining: Optional[int] = None,
+    metadata: Optional[Dict[str, object]] = None,
 ) -> None:
     """
     Upsert the latest generation progress snapshot for an upload.
@@ -56,6 +57,8 @@ async def update_generation_progress(
         }.items()
         if value is not None
     }
+    if metadata:
+        metadata_payload.update(metadata)
 
     async with AsyncSessionLocal() as session:
         try:
@@ -156,9 +159,9 @@ async def update_generation_progress(
                 # For other database errors, log but don't crash
                 logger.error(
                     "Database error updating progress for upload %s: %s",
-                    upload_id_str,
-                    exc
-                )
+                upload_id_str,
+                exc
+            )
 
         except Exception as exc:
             # Catch-all for any other errors - log but don't crash
@@ -167,3 +170,37 @@ async def update_generation_progress(
                 upload_id_str,
                 exc
             )
+
+
+async def get_generation_checkpoint(upload_id: Union[UUID, str]) -> Optional[Dict[str, object]]:
+    """
+    Fetch the most recent checkpoint metadata for a given upload, if any.
+    """
+    upload_id_str = str(upload_id)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(
+                GenerationProgress.metadata_json,
+                GenerationProgress.step,
+                GenerationProgress.progress,
+            ).where(GenerationProgress.upload_id == upload_id_str)
+        )
+        row = result.one_or_none()
+        if not row:
+            return None
+
+        metadata = row.metadata_json or {}
+        checkpoint = metadata.get("checkpoint")
+        if isinstance(checkpoint, dict):
+            checkpoint = checkpoint.copy()
+            checkpoint.setdefault("step", row.step)
+            checkpoint.setdefault("progress", row.progress)
+            return checkpoint
+
+        if metadata:
+            fallback = metadata.copy()
+            fallback.setdefault("step", row.step)
+            fallback.setdefault("progress", row.progress)
+            return fallback
+
+    return None
