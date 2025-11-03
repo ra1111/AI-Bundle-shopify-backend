@@ -83,6 +83,12 @@ class DataMapper:
                 "latency_history": deque(maxlen=20),
             }
             self._tuning_state[scope] = state
+            logger.info(
+                "DataMapper tuning state initialized | scope=%s batch_size=%d concurrency=%d",
+                scope,
+                state["batch_size"],
+                state["concurrency"],
+            )
         return state["batch_size"], state["concurrency"]
 
     def _update_tuning_state(
@@ -104,6 +110,8 @@ class DataMapper:
         p95 = durations_ms[index_95]
         state["latency_history"].append(p95)
         target_ms = feature_flags.get_flag("data_mapping.target_chunk_p95_ms", 800) or 800
+        original_batch = state["batch_size"]
+        original_concurrency = state["concurrency"]
         if p95 > target_ms * 1.5:
             state["concurrency"] = max(1, int(state["concurrency"] * 0.8))
             state["batch_size"] = max(10, int(state["batch_size"] * 0.8))
@@ -112,6 +120,24 @@ class DataMapper:
             state["batch_size"] = min(500, int(state["batch_size"] * 1.1))
         state["batch_size"] = max(10, min(state["batch_size"], 1000))
         state["concurrency"] = max(1, min(state["concurrency"], default_concurrency))
+        if (state["batch_size"], state["concurrency"]) != (original_batch, original_concurrency):
+            logger.info(
+                "DataMapper tuning adjusted | scope=%s p95_ms=%.1f batch=%d->%d concurrency=%d->%d",
+                scope,
+                p95,
+                original_batch,
+                state["batch_size"],
+                original_concurrency,
+                state["concurrency"],
+            )
+        else:
+            logger.debug(
+                "DataMapper tuning stable | scope=%s p95_ms=%.1f batch=%d concurrency=%d",
+                scope,
+                p95,
+                state["batch_size"],
+                state["concurrency"],
+            )
 
     async def resolve_variant_from_sku(self, sku: str, csv_upload_id: str) -> Optional[str]:
         """Resolve variant_id from SKU with caching"""
@@ -225,6 +251,15 @@ class DataMapper:
             if not concurrency_enabled:
                 concurrency_limit = 1
             semaphore = asyncio.Semaphore(concurrency_limit) if concurrency_enabled else None
+            logger.info(
+                "DataMapper mapping start | upload=%s scope=%s batch_size=%d concurrency_limit=%d (pool_cap=%d default=%d)",
+                csv_upload_id,
+                scope,
+                batch_size,
+                concurrency_limit,
+                pool_cap,
+                default_concurrency,
+            )
 
             mapping_start = time.perf_counter() if timing_enabled else None
             results: List[Dict[str, Any]] = []
@@ -260,6 +295,16 @@ class DataMapper:
                         chunk_durations.append(time.perf_counter() - chunk_start_time)
 
                     results.extend(chunk_results)
+                    if timing_enabled and chunk_start_time is not None:
+                        elapsed_ms = (time.perf_counter() - chunk_start_time) * 1000
+                        logger.info(
+                            "DataMapper chunk processed | upload=%s chunk=%d size=%d concurrency=%d elapsed_ms=%.1f",
+                            csv_upload_id,
+                            span_attrs["chunk_index"],
+                            span_attrs["chunk_size"],
+                            concurrency_limit,
+                            elapsed_ms,
+                        )
 
             if timing_enabled and mapping_start is not None:
                 mapping_duration = time.perf_counter() - mapping_start
@@ -365,6 +410,15 @@ class DataMapper:
                     self._inventory_map_by_scope[scope] = self._build_inventory_data_map(result)
                 elif key == "catalog_map":
                     self._catalog_map_by_scope[scope] = result
+
+        logger.info(
+            "DataMapper prefetch summary | scope=%s variants=%d inventory=%d catalog=%d tasks_started=%d",
+            scope,
+            len(self._variant_map_by_scope.get(scope, {})),
+            len(self._inventory_map_by_scope.get(scope, {})),
+            len(self._catalog_map_by_scope.get(scope, {})),
+            len(tasks),
+        )
 
         catalog_map = self._catalog_map_by_scope.get(scope, {})
         if catalog_map:

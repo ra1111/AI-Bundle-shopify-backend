@@ -520,7 +520,7 @@ class LLMEmbeddingEngine:
         with self._start_span("llm_embeddings.generate_candidates", span_attrs):
             fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
             if bt == "FBT":
-                return await self._gen_fbt(
+                results = await self._gen_fbt(
                     catalog,
                     embeddings,
                     num_candidates,
@@ -529,8 +529,16 @@ class LLMEmbeddingEngine:
                     fbt_min=fbt_min,
                     too_similar=too_similar,
                 )
+                logger.info(
+                    "LLM candidates generated | upload=%s type=%s objective=%s count=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(results),
+                )
+                return results
             if bt == "VOLUME_DISCOUNT":
-                return await self._gen_volume(
+                results = await self._gen_volume(
                     catalog,
                     embeddings,
                     num_candidates,
@@ -538,8 +546,16 @@ class LLMEmbeddingEngine:
                     orders_count=orders_count,
                     volume_min=volume_min,
                 )
+                logger.info(
+                    "LLM candidates generated | upload=%s type=%s objective=%s count=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(results),
+                )
+                return results
             if bt == "MIX_MATCH":
-                return await self._gen_mixmatch(
+                results = await self._gen_mixmatch(
                     catalog,
                     embeddings,
                     num_candidates,
@@ -547,8 +563,16 @@ class LLMEmbeddingEngine:
                     orders_count=orders_count,
                     volume_min=volume_min,
                 )
+                logger.info(
+                    "LLM candidates generated | upload=%s type=%s objective=%s count=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(results),
+                )
+                return results
             if bt == "BXGY":
-                return await self._gen_bxgy(
+                results = await self._gen_bxgy(
                     catalog,
                     embeddings,
                     num_candidates,
@@ -557,8 +581,16 @@ class LLMEmbeddingEngine:
                     fbt_min=fbt_min,
                     too_similar=too_similar,
                 )
+                logger.info(
+                    "LLM candidates generated | upload=%s type=%s objective=%s count=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(results),
+                )
+                return results
             if bt == "FIXED":
-                return await self._gen_fixed(
+                results = await self._gen_fixed(
                     catalog,
                     embeddings,
                     objective,
@@ -568,6 +600,15 @@ class LLMEmbeddingEngine:
                     fbt_min=fbt_min,
                     too_similar=too_similar,
                 )
+                logger.info(
+                    "LLM candidates generated | upload=%s type=%s objective=%s count=%d",
+                    csv_upload_id,
+                    bt,
+                    objective,
+                    len(results),
+                )
+                return results
+            logger.warning("LLM candidate generation skipped: unsupported bundle type %s", bt)
             return []
 
     # ---- internal generators ----
@@ -587,19 +628,37 @@ class LLMEmbeddingEngine:
         price_b = self._safe_float(candidate.get("price"))
         if price_a is not None and price_b is not None:
             if price_a == 0:
+                logger.debug("LLM prefilter rejected due to zero price | anchor=%s candidate=%s", anchor.get("sku"), candidate.get("sku"))
                 return False
             delta = abs(price_a - price_b) / max(price_a, 1.0)
             if delta > self.PREFILTER_PRICE_DELTA:
+                logger.debug(
+                    "LLM prefilter price delta too high | anchor_price=%.2f candidate_price=%.2f delta=%.2f limit=%.2f",
+                    price_a,
+                    price_b,
+                    delta,
+                    self.PREFILTER_PRICE_DELTA,
+                )
                 return False
         if self.PREFILTER_REQUIRE_VENDOR:
             vendor_a = anchor.get("vendor")
             vendor_b = candidate.get("vendor")
             if vendor_a and vendor_b and vendor_a != vendor_b:
+                logger.debug(
+                    "LLM prefilter vendor mismatch | anchor_vendor=%s candidate_vendor=%s",
+                    vendor_a,
+                    vendor_b,
+                )
                 return False
         if self.PREFILTER_REQUIRE_CATEGORY:
             category_a = anchor.get("product_type") or anchor.get("category")
             category_b = candidate.get("product_type") or candidate.get("category")
             if category_a and category_b and category_a != category_b:
+                logger.debug(
+                    "LLM prefilter category mismatch | anchor_category=%s candidate_category=%s",
+                    category_a,
+                    category_b,
+                )
                 return False
         return True
 
