@@ -174,13 +174,19 @@ class CandidateGenerator:
                         for item in catalog
                     ]
 
+                    orders_count = (
+                        len(context.transactions)
+                        if context and context.transactions is not None
+                        else None
+                    )
                     llm_candidates = await llm_embedding_engine.generate_candidates_by_similarity(
                         csv_upload_id=csv_upload_id,
                         bundle_type=bundle_type,
                         objective=objective,
                         catalog=catalog_list,
                         embeddings=embeddings,
-                        num_candidates=20
+                        num_candidates=20,
+                        orders_count=orders_count,
                     )
                     logger.info(f"Generated {len(llm_candidates)} LLM-based candidates")
                     if llm_candidates:
