@@ -1457,7 +1457,14 @@ class BundleGenerator:
                 )
                 metrics["async_deferred"] = True
                 metrics["processing_time_ms"] = int((time.time() - pipeline_start) * 1000)
-                await notify_partial_ready(csv_upload_id, len(all_recommendations))
+                await notify_partial_ready(
+                    csv_upload_id,
+                    len(all_recommendations),
+                    details={
+                        "phase": "phase_3_async_deferred",
+                        "dataset_profile": dataset_profile,
+                    },
+                )
                 return {
                     "recommendations": all_recommendations,
                     "metrics": metrics,
@@ -1481,7 +1488,14 @@ class BundleGenerator:
                     pipeline_start,
                     all_recommendations,
                 )
-                await notify_partial_ready(csv_upload_id, len(all_recommendations))
+                await notify_partial_ready(
+                    csv_upload_id,
+                    len(all_recommendations),
+                    details={
+                        "phase": "phase_3_soft_timeout",
+                        "dataset_profile": dataset_profile,
+                    },
+                )
                 try:
                     metrics_collector.finish_pipeline(
                         pipeline_run_id,
@@ -1840,7 +1854,26 @@ class BundleGenerator:
                 except Exception as exc:
                     logger.warning("[%s] Failed to record final pipeline metrics: %s", csv_upload_id, exc)
 
-            await notify_bundle_ready(csv_upload_id, len(final_recommendations), resume_used)
+            final_notify_details = {
+                "initial_bundle_count": initial_bundle_count,
+                "final_bundle_count": final_bundle_count,
+                "drops": drop_count,
+                "staged_publish": False,
+            }
+            if ai_metadata.get("drop_reasons"):
+                final_notify_details["drop_reasons"] = ai_metadata["drop_reasons"]
+            logger.info(
+                "[%s] Finalization complete | bundles=%d drops=%d staged=False",
+                csv_upload_id,
+                final_bundle_count,
+                drop_count,
+            )
+            await notify_bundle_ready(
+                csv_upload_id,
+                len(final_recommendations),
+                resume_used,
+                details=final_notify_details,
+            )
 
             return {
                 "recommendations": final_recommendations,
@@ -2290,6 +2323,13 @@ class BundleGenerator:
                 feature_flags.get_flag("bundling.staged_publish_enabled", self.staged_publish_enabled),
                 self.staged_publish_enabled,
             )
+            logger.info(
+                "[%s] Finalization entry | staged_enabled=%s initial_candidates=%d",
+                csv_upload_id,
+                staged_enabled,
+                len(final_recommendations),
+            )
+
             if staged_enabled and csv_upload_id:
                 return await self._publish_in_stages(
                     final_recommendations,
@@ -2298,55 +2338,113 @@ class BundleGenerator:
                     end_time=end_time,
                 )
 
-            bundle_total = len(final_recommendations)
+            initial_bundle_count = len(final_recommendations)
+            final_bundle_count = initial_bundle_count
+            drop_count = 0
+            ai_metadata: Dict[str, Any] = {}
+            ai_progress_message = "No bundles to describe."
+
             if final_recommendations:
+                logger.info(
+                    "[%s] Finalization pre-tracks | bundle_count=%d time_remaining=%s",
+                    csv_upload_id,
+                    initial_bundle_count,
+                    None
+                    if not end_time
+                    else f"{(end_time - datetime.now()).total_seconds():.1f}s",
+                )
+                metrics.setdefault("finalization", {})
+                metrics["finalization"]["initial_bundle_count"] = initial_bundle_count
+
                 await self.store_partial_recommendations(
                     final_recommendations,
                     csv_upload_id,
                     stage="phase_6_pre_copy",
                 )
+
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ai_descriptions",
+                    progress=88,
+                    status="in_progress",
+                    message="Preparing AI descriptions and pricing…",
+                    bundle_count=initial_bundle_count,
+                    metadata={"initial_bundle_count": initial_bundle_count},
+                )
+
+                if not self._time_budget_exceeded(end_time):
+                    processed_recommendations, track_summary = await self._run_post_filter_tracks(
+                        final_recommendations,
+                        csv_upload_id,
+                        metrics,
+                        end_time,
+                        stage_index=0,
+                        total_stages=1,
+                        staged_mode=False,
+                    )
+                    drop_count = len(track_summary.get("dropped", []))
+                    final_recommendations = processed_recommendations
+                    final_bundle_count = len(final_recommendations)
+                    logger.info(
+                        "[%s] Finalization tracks complete | kept=%d dropped=%d drop_reasons=%s",
+                        csv_upload_id,
+                        final_bundle_count,
+                        drop_count,
+                        track_summary.get("drop_reasons"),
+                    )
+
+                    metrics["phase_timings"]["phase_8_ai_copy"] = track_summary.get("copy_ms", 0)
+                    metrics.setdefault("finalization", {}).update(
+                        {
+                            "drops": drop_count,
+                            "pricing_ms": track_summary.get("pricing_ms", 0),
+                            "inventory_ms": track_summary.get("inventory_ms", 0),
+                            "compliance_ms": track_summary.get("compliance_ms", 0),
+                        }
+                    )
+                    metrics["total_recommendations"] = final_bundle_count
+
+                    if drop_count:
+                        ai_progress_message = f"AI descriptions ready. Filtered {drop_count} bundles."
+                    else:
+                        ai_progress_message = "AI descriptions ready."
+
+                    ai_metadata = {
+                        "initial_bundle_count": initial_bundle_count,
+                        "final_bundle_count": final_bundle_count,
+                        "dropped": drop_count,
+                        "drop_reasons": track_summary.get("drop_reasons"),
+                    }
+                    try:
+                        metrics_collector.record_drop_summary(
+                            track_summary.get("drop_reasons", {}),
+                            namespace="finalization",
+                        )
+                    except Exception as exc:
+                        logger.debug("[%s] Failed to record finalization drop summary: %s", csv_upload_id, exc)
+                else:
+                    logger.warning(
+                        f"[{csv_upload_id}] Skipping AI copy/pricing due to soft time budget proximity."
+                    )
+                    metrics["phase_timings"]["phase_8_ai_copy"] = 0
+                    ai_progress_message = "Skipped AI descriptions due to time budget."
+                    ai_metadata = {
+                        "initial_bundle_count": initial_bundle_count,
+                        "skipped": True,
+                    }
+            else:
+                metrics["phase_timings"]["phase_8_ai_copy"] = 0
+                metrics["total_recommendations"] = 0
+
             await update_generation_progress(
                 csv_upload_id,
                 step="ai_descriptions",
-                progress=90,
+                progress=92,
                 status="in_progress",
-                message="Generating AI descriptions…" if bundle_total else "No bundles to describe.",
-                bundle_count=bundle_total if bundle_total else None,
+                message=ai_progress_message,
+                bundle_count=final_bundle_count if final_bundle_count else None,
+                metadata=ai_metadata if ai_metadata else None,
             )
-
-            # Add AI-generated copy if available (BATCHED for speed)
-            if final_recommendations and not self._time_budget_exceeded(end_time):
-                ai_copy_duration = await self._generate_ai_copy_for_stage(
-                    final_recommendations,
-                    csv_upload_id,
-                    metrics,
-                    end_time,
-                    stage_index=0,
-                    total_stages=1,
-                )
-                metrics["phase_timings"]["phase_8_ai_copy"] = ai_copy_duration
-
-                await update_generation_progress(
-                    csv_upload_id,
-                    step="ai_descriptions",
-                    progress=92,
-                    status="in_progress",
-                    message="AI descriptions ready.",
-                    bundle_count=bundle_total,
-                )
-            elif final_recommendations:
-                logger.warning(
-                    f"[{csv_upload_id}] Skipping AI copy generation due to soft time budget proximity."
-                )
-                metrics["phase_timings"]["phase_8_ai_copy"] = 0
-                await update_generation_progress(
-                    csv_upload_id,
-                    step="ai_descriptions",
-                    progress=92,
-                    status="in_progress",
-                    message="Skipped AI descriptions due to time budget.",
-                    bundle_count=bundle_total,
-                )
 
             await update_generation_progress(
                 csv_upload_id,
@@ -2354,7 +2452,12 @@ class BundleGenerator:
                 progress=95,
                 status="in_progress",
                 message="Finalizing bundle recommendations…",
-                bundle_count=bundle_total if bundle_total else None,
+                bundle_count=final_bundle_count if final_bundle_count else None,
+                metadata={
+                    "initial_bundle_count": initial_bundle_count,
+                    "final_bundle_count": final_bundle_count,
+                    "dropped": drop_count,
+                },
             )
 
             # Remove any partial recommendations before persisting the final set
@@ -2373,6 +2476,8 @@ class BundleGenerator:
                 storage_duration = int((time.time() - storage_start) * 1000)
                 logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - COMPLETED in {storage_duration}ms")
                 metrics["phase_timings"]["phase_9_storage"] = storage_duration
+            elif final_bundle_count == 0:
+                metrics["phase_timings"]["phase_9_storage"] = 0
 
             await update_generation_progress(
                 csv_upload_id,
@@ -2380,7 +2485,7 @@ class BundleGenerator:
                 progress=100,
                 status="completed",
                 message="Bundle generation complete.",
-                bundle_count=bundle_total if bundle_total else None,
+                bundle_count=final_bundle_count if final_bundle_count else None,
                 time_remaining=0,
             )
             
@@ -2477,6 +2582,7 @@ class BundleGenerator:
 
         staged_results: List[Dict[str, Any]] = []
         stage_metrics: List[Dict[str, Any]] = []
+        cumulative_drop_reasons: Dict[str, int] = defaultdict(int)
 
         accumulated_copy_ms = 0
         accumulated_storage_ms = 0
@@ -2552,6 +2658,7 @@ class BundleGenerator:
                     end_time,
                     stage_index=index,
                     total_stages=total_stages,
+                    staged_mode=True,
                 )
 
             kept_count = len(processed_slice)
@@ -2620,6 +2727,15 @@ class BundleGenerator:
             }
             stage_metrics.append(stage_entry)
             staged_summary["stages"].append(stage_entry)
+            for reason, count in track_summary.get("drop_reasons", {}).items():
+                cumulative_drop_reasons[reason] += count
+            try:
+                metrics_collector.record_drop_summary(
+                    track_summary.get("drop_reasons", {}),
+                    namespace=f"staged_stage_{index + 1}",
+                )
+            except Exception as exc:
+                logger.debug("[%s] Failed to record staged drop summary: %s", csv_upload_id, exc)
 
             progress_ratio = cursor / total_candidates if total_candidates else 1.0
             progress_window = 14
@@ -2656,7 +2772,18 @@ class BundleGenerator:
             )
 
             if kept_count:
-                await notify_partial_ready(csv_upload_id, published)
+                await notify_partial_ready(
+                    csv_upload_id,
+                    published,
+                    details={
+                        "stage_index": index + 1,
+                        "stage_target": desired_processed,
+                        "kept_this_stage": kept_count,
+                        "dropped_this_stage": dropped_count,
+                        "drops_after_stage": drops_total,
+                        "total_target": staged_total_target,
+                    },
+                )
 
             if self._time_budget_exceeded(end_time):
                 logger.warning(
@@ -2687,6 +2814,20 @@ class BundleGenerator:
         }
         staged_summary["published"] = published
         staged_summary["processed"] = cursor
+        staged_summary["drop_reasons"] = dict(cumulative_drop_reasons)
+
+        try:
+            metrics_collector.record_staged_publish(staged_summary)
+        except Exception as exc:
+            logger.debug("[%s] Failed to record staged publish metrics: %s", csv_upload_id, exc)
+        logger.info(
+            "[%s] Staged publish summary | published=%d dropped=%d stages=%d drop_reasons=%s",
+            csv_upload_id,
+            staged_summary.get("published"),
+            staged_summary.get("dropped"),
+            len(staged_summary.get("stages", [])),
+            staged_summary.get("drop_reasons"),
+        )
 
         if accumulated_copy_ms:
             metrics["phase_timings"]["phase_8_ai_copy"] = (
@@ -2707,14 +2848,28 @@ class BundleGenerator:
             message="Bundle generation complete.",
             bundle_count=published or None,
             metadata={
-                "staged_publish": True,
-                "published": published,
-                "dropped": drops_total,
-                "total_target": staged_total_target,
+                "staged_publish": {
+                    "enabled": True,
+                    "published": published,
+                    "dropped": drops_total,
+                    "processed": cursor,
+                    "total_target": staged_total_target,
+                    "hard_cap": hard_cap,
+                    "stages": staged_summary.get("stages"),
+                    "tracks": staged_summary.get("tracks"),
+                    "drop_reasons": staged_summary.get("drop_reasons"),
+                },
             },
         )
 
-        await notify_bundle_ready(csv_upload_id, published, resume_run=False)
+        await notify_bundle_ready(
+            csv_upload_id,
+            published,
+            resume_run=False,
+            details={
+                "staged_publish": staged_summary,
+            },
+        )
         return staged_results
 
     async def _run_post_filter_tracks(
@@ -2726,6 +2881,7 @@ class BundleGenerator:
         *,
         stage_index: int,
         total_stages: int,
+        staged_mode: bool,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         if not stage_recommendations:
             return [], {
@@ -2741,6 +2897,14 @@ class BundleGenerator:
                 "compliance_stats": {},
             }
 
+        logger.info(
+            "[%s] Post-filter tracks start | staged=%s stage_index=%d batch_size=%d",
+            csv_upload_id,
+            staged_mode,
+            stage_index + 1,
+            len(stage_recommendations),
+        )
+
         copy_task = asyncio.create_task(
             self._generate_ai_copy_for_stage(
                 stage_recommendations,
@@ -2749,6 +2913,7 @@ class BundleGenerator:
                 end_time,
                 stage_index=stage_index,
                 total_stages=total_stages,
+                staged_mode=staged_mode,
             )
         )
         pricing_task = asyncio.create_task(
@@ -2849,16 +3014,20 @@ class BundleGenerator:
         duration_ms = copy_ms + pricing_result.get("duration_ms", 0) + inventory_result.get("duration_ms", 0)
         duration_ms += compliance_result.get("duration_ms", 0)
 
-        metrics.setdefault("staged_publish", {}).setdefault("track_stats", []).append(
-            {
-                "stage_index": stage_index + 1,
-                "copy_ms": copy_ms,
-                "pricing_ms": pricing_result.get("duration_ms", 0),
-                "inventory_ms": inventory_result.get("duration_ms", 0),
-                "compliance_ms": compliance_result.get("duration_ms", 0),
-                "drops": drop_reasons_counter,
-            }
-        )
+        track_stats_entry = {
+            "stage_index": stage_index + 1,
+            "copy_ms": copy_ms,
+            "pricing_ms": pricing_result.get("duration_ms", 0),
+            "inventory_ms": inventory_result.get("duration_ms", 0),
+            "compliance_ms": compliance_result.get("duration_ms", 0),
+            "drops": drop_reasons_counter,
+        }
+        if staged_mode:
+            metrics.setdefault("staged_publish", {}).setdefault("track_stats", []).append(
+                track_stats_entry
+            )
+        else:
+            metrics.setdefault("finalization_tracks", []).append(track_stats_entry)
 
         summary = {
             "copy_ms": copy_ms,
@@ -2872,6 +3041,19 @@ class BundleGenerator:
             "inventory_stats": inventory_result,
             "compliance_stats": compliance_result,
         }
+
+        logger.info(
+            "[%s] Post-filter tracks done | staged=%s stage=%d kept=%d dropped=%d copy_ms=%d pricing_ms=%d inventory_ms=%d compliance_ms=%d",
+            csv_upload_id,
+            staged_mode,
+            stage_index + 1,
+            len(filtered_recommendations),
+            len(combined_drops),
+            copy_ms,
+            pricing_result.get("duration_ms", 0),
+            inventory_result.get("duration_ms", 0),
+            compliance_result.get("duration_ms", 0),
+        )
 
         return filtered_recommendations, summary
 
@@ -2933,13 +3115,24 @@ class BundleGenerator:
                 )
 
         duration_ms = int((time.time() - start) * 1000)
-        return {
+        summary = {
             "duration_ms": duration_ms,
             "updated": updated,
             "skipped": skipped,
             "fallbacks": fallbacks,
             "errors": errors,
         }
+        logger.info(
+            "[%s] Pricing track summary | stage=%d updated=%d skipped=%d fallbacks=%d errors=%d duration_ms=%d",
+            csv_upload_id,
+            stage_index + 1,
+            updated,
+            skipped,
+            fallbacks,
+            errors,
+            duration_ms,
+        )
+        return summary
 
     async def _run_inventory_track(
         self,
@@ -3027,11 +3220,20 @@ class BundleGenerator:
                 reason_counts["ok"] += 1
 
         duration_ms = int((time.time() - start) * 1000)
-        return {
+        summary = {
             "duration_ms": duration_ms,
             "dropped": dropped,
             "reason_counts": dict(reason_counts),
         }
+        logger.info(
+            "[%s] Inventory track summary | stage=%d dropped=%d reasons=%s duration_ms=%d",
+            csv_upload_id,
+            stage_index + 1,
+            len(dropped),
+            dict(reason_counts),
+            duration_ms,
+        )
+        return summary
 
     async def _run_compliance_track(
         self,
@@ -3094,12 +3296,22 @@ class BundleGenerator:
                 reason_counts["ok"] += 1
 
         duration_ms = int((time.time() - start) * 1000)
-        return {
+        summary = {
             "duration_ms": duration_ms,
             "dropped": dropped,
             "reason_counts": dict(reason_counts),
             "trimmed_fields": trimmed_fields,
         }
+        logger.info(
+            "[%s] Compliance track summary | stage=%d dropped=%d trimmed=%d reasons=%s duration_ms=%d",
+            csv_upload_id,
+            stage_index + 1,
+            len(dropped),
+            trimmed_fields,
+            dict(reason_counts),
+            duration_ms,
+        )
+        return summary
 
     async def _generate_ai_copy_for_stage(
         self,
@@ -3110,6 +3322,7 @@ class BundleGenerator:
         *,
         stage_index: int,
         total_stages: int,
+        staged_mode: bool,
     ) -> int:
         """Generate AI copy for a micro-batch and update recommendations in place."""
         if not stage_recommendations:
@@ -3173,14 +3386,18 @@ class BundleGenerator:
             tasks_executed += 1
 
         duration_ms = int((time.time() - start) * 1000)
-        metrics.setdefault("staged_publish", {}).setdefault("copy", []).append(
-            {
-                "stage_index": stage_index + 1,
-                "processed": tasks_executed,
-                "attempted": len(stage_recommendations),
-                "duration_ms": duration_ms,
-            }
-        )
+        copy_entry = {
+            "stage_index": stage_index + 1,
+            "processed": tasks_executed,
+            "attempted": len(stage_recommendations),
+            "duration_ms": duration_ms,
+        }
+        if staged_mode:
+            metrics.setdefault("staged_publish", {}).setdefault("copy_batches", []).append(
+                copy_entry
+            )
+        else:
+            metrics.setdefault("finalization_copy_batches", []).append(copy_entry)
         return duration_ms
     
     async def store_partial_recommendations(

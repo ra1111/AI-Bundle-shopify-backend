@@ -56,6 +56,13 @@ class MetricsCollector:
         self.historical_metrics = deque(maxlen=1000)
         self.phase_timings = defaultdict(list)  # phase_name -> [duration_ms]
         self.drop_reasons = defaultdict(int)
+        self.staged_publish_counters = {
+            "runs": 0,
+            "published": 0,
+            "dropped": 0,
+            "stages": 0,
+        }
+        self.last_staged_publish: Optional[Dict[str, Any]] = None
         
         # Real-time counters
         self.counters = {
@@ -192,6 +199,26 @@ class MetricsCollector:
         with self._lock:
             for phase_name, duration in timings.items():
                 self.phase_timings[phase_name].append(duration)
+
+    def record_drop_summary(self, reason_counts: Dict[str, int], namespace: Optional[str] = None) -> None:
+        """Aggregate drop reasons coming from auxiliary tracks."""
+        if not reason_counts:
+            return
+        with self._lock:
+            for reason, count in reason_counts.items():
+                key = f"{namespace}:{reason}" if namespace else reason
+                self.drop_reasons[key] += count
+
+    def record_staged_publish(self, summary: Dict[str, Any]) -> None:
+        """Track staged publishing outcomes for observability dashboards."""
+        if not summary:
+            return
+        with self._lock:
+            self.staged_publish_counters["runs"] += 1
+            self.staged_publish_counters["published"] += int(summary.get("published", 0) or 0)
+            self.staged_publish_counters["dropped"] += int(summary.get("dropped", 0) or 0)
+            self.staged_publish_counters["stages"] += len(summary.get("stages", []) or [])
+            self.last_staged_publish = summary.copy()
     
     def get_phase_diagnostics(self, phase_name: Optional[str] = None) -> Dict[str, Any]:
         """Get detailed phase performance diagnostics"""
