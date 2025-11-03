@@ -67,6 +67,7 @@ class BundleGenerator:
         self.fallback_ladder = FallbackLadder(storage)
 
         self._tracer = trace.get_tracer(__name__) if trace else None
+        self._initialize_configuration()
 
     @contextlib.contextmanager
     def _start_span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -78,7 +79,8 @@ class BundleGenerator:
                 for key, value in attributes.items():
                     span.set_attribute(key, value)
             yield span
-        
+
+    def _initialize_configuration(self) -> None:
         # Bundle configuration
         self.bundle_types = ['FBT', 'VOLUME_DISCOUNT', 'MIX_MATCH', 'BXGY', 'FIXED']
 
