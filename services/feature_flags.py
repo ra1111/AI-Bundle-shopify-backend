@@ -57,6 +57,12 @@ class FeatureFlagsManager:
             "data_mapping.reset_cache_on_new_data": True,
             "data_mapping.unresolved_cache_ttl_seconds": 600,
             "data_mapping.enable_run_scope_fallback": True,
+            "data_mapping.prefetch_enabled": True,
+            "data_mapping.concurrent_mapping": True,
+            "data_mapping.concurrent_map_limit": 25,
+            "data_mapping.prefetch_batch_size": 100,
+            "data_mapping.vectorized_normalization": True,
+            "data_mapping.log_timings": True,
 
             # Bundling threshold + fallback tuning
             "bundling.relaxed_thresholds": True,
@@ -66,6 +72,7 @@ class FeatureFlagsManager:
             "bundling.max_per_bundle_type": 15,
             "bundling.fallback_force_top_pairs": True,
             "bundling.fallback_force_pair_limit": 12,
+            "bundling.llm_adaptive_similarity": True,
 
             # Analytics and insights
             "analytics.insights_engine": True,

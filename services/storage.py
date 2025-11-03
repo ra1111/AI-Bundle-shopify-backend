@@ -5,7 +5,7 @@ Provides database operations matching the TypeScript storage interface
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, delete, func, desc, and_, or_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from types import SimpleNamespace
 import logging
 from datetime import datetime, timedelta
@@ -670,6 +670,47 @@ class StorageService:
             result = await session.execute(query)
             return list(result.scalars().all())
 
+    async def get_variant_maps(self, csv_upload_id: str) -> Tuple[Dict[str, Variant], Dict[str, Variant]]:
+        """Return variants keyed by SKU and variant_id for a CSV upload."""
+        variants = await self.get_variants(csv_upload_id)
+        by_sku: Dict[str, Variant] = {}
+        by_id: Dict[str, Variant] = {}
+        for variant in variants:
+            sku = getattr(variant, "sku", None)
+            if sku:
+                by_sku[sku] = variant
+            variant_id = getattr(variant, "variant_id", None)
+            if variant_id:
+                by_id[variant_id] = variant
+        return by_sku, by_id
+
+    async def get_variants_for_run(self, run_id: str) -> List[Variant]:
+        """Get variants associated with all uploads in a run."""
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(Variant)
+                .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_variant_maps_by_run(self, run_id: str) -> Tuple[Dict[str, Variant], Dict[str, Variant]]:
+        """Return variants keyed by SKU and variant_id for a run."""
+        variants = await self.get_variants_for_run(run_id)
+        by_sku: Dict[str, Variant] = {}
+        by_id: Dict[str, Variant] = {}
+        for variant in variants:
+            sku = getattr(variant, "sku", None)
+            if sku:
+                by_sku[sku] = variant
+            variant_id = getattr(variant, "variant_id", None)
+            if variant_id:
+                by_id[variant_id] = variant
+        return by_sku, by_id
+
     async def get_variant_by_sku_run(self, sku: str, run_id: str) -> Optional[Variant]:
         if not sku or not run_id:
             return None
@@ -717,6 +758,41 @@ class StorageService:
             query = select(InventoryLevel).where(InventoryLevel.csv_upload_id == csv_upload_id)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_inventory_levels_map(self, csv_upload_id: str) -> Dict[str, List[InventoryLevel]]:
+        """Return inventory levels keyed by inventory_item_id for a CSV upload."""
+        levels = await self.get_inventory_levels(csv_upload_id)
+        inventory_map: Dict[str, List[InventoryLevel]] = {}
+        for level in levels:
+            item_id = getattr(level, "inventory_item_id", None)
+            if not item_id:
+                continue
+            inventory_map.setdefault(item_id, []).append(level)
+        return inventory_map
+
+    async def get_inventory_levels_for_run(self, run_id: str) -> List[InventoryLevel]:
+        """Get inventory levels associated with all uploads in a run."""
+        if not run_id:
+            return []
+        async with self.get_session() as session:
+            query = (
+                select(InventoryLevel)
+                .join(CsvUpload, InventoryLevel.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_inventory_levels_map_by_run(self, run_id: str) -> Dict[str, List[InventoryLevel]]:
+        """Return inventory levels keyed by inventory_item_id for a run."""
+        levels = await self.get_inventory_levels_for_run(run_id)
+        inventory_map: Dict[str, List[InventoryLevel]] = {}
+        for level in levels:
+            item_id = getattr(level, "inventory_item_id", None)
+            if not item_id:
+                continue
+            inventory_map.setdefault(item_id, []).append(level)
+        return inventory_map
 
     async def get_inventory_levels_by_item_id_run(self, inventory_item_id: str, run_id: str) -> List[InventoryLevel]:
         if not inventory_item_id or not run_id:

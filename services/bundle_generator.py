@@ -1423,19 +1423,54 @@ class BundleGenerator:
 
                 logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - STARTED | bundles={len(bundles_for_copy)} batch_size={batch_size}")
 
+                def _normalize_products(raw_products: Any) -> List[Dict[str, Any]]:
+                    if isinstance(raw_products, list):
+                        return raw_products
+                    if raw_products:
+                        return [raw_products]
+                    return []
+
                 for i in range(0, len(bundles_for_copy), batch_size):
                     batch_start = time.time()
                     batch = bundles_for_copy[i:i+batch_size]
 
                     # Generate AI copy for batch in parallel
-                    copy_tasks = [self.ai_generator.generate_bundle_copy(rec) for rec in batch]
-                    copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
+                    try:
+                        copy_tasks = []
+                        copy_inputs = []
+                        for rec in batch:
+                            bundle_type = rec.get("bundle_type") or rec.get("type") or "MIX_MATCH"
+                            products = _normalize_products(rec.get("products"))
+                            objective = rec.get("objective", "")
+                            copy_tasks.append(
+                                self.ai_generator.generate_bundle_copy(
+                                    products,
+                                    bundle_type,
+                                    objective,
+                                )
+                            )
+                            copy_inputs.append((rec, products, bundle_type))
+                        copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
+                    except Exception as exc:
+                        logger.exception("Error scheduling AI copy generation batch")
+                        copy_inputs = [
+                            (
+                                rec,
+                                _normalize_products(rec.get("products")),
+                                rec.get("bundle_type") or rec.get("type") or "MIX_MATCH",
+                            )
+                            for rec in batch
+                        ]
+                        copy_results = [exc] * len(copy_inputs)
 
                     # Assign results back to recommendations
-                    for rec, result in zip(batch, copy_results):
+                    for (rec, products, bundle_type), result in zip(copy_inputs, copy_results):
                         if isinstance(result, Exception):
-                            logger.warning(f"Error generating AI copy: {result}")
-                            rec["ai_copy"] = {"title": "Bundle Deal", "description": "Great products bundled together"}
+                            logger.warning(f"Error generating AI copy for bundle type {bundle_type}: {result}")
+                            rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
+                        elif not result:
+                            logger.warning(f"Empty AI copy response for bundle type {bundle_type}; using fallback copy")
+                            rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
                         else:
                             rec["ai_copy"] = result
 

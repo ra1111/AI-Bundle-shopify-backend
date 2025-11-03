@@ -20,6 +20,7 @@ import numpy as np
 import inspect
 from services.storage import storage  # must expose async get(key)->str|None and set(key, value, ttl=None)
 from services.ml.llm_utils import get_async_client, load_settings
+from services.feature_flags import feature_flags
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,37 @@ class LLMEmbeddingEngine:
 
         if not self._persist_ok:
             logger.info("EMBED_CACHE: persistent cache disabled (no compatible storage methods found)")
+
+    def _resolve_similarity_thresholds(self, catalog_size: int) -> Tuple[float, float, float]:
+        """
+        Determine similarity thresholds, optionally adapting based on catalog size.
+        Returns (fbt_min, too_similar, volume_min).
+        """
+        default = (self.FBT_MIN, self.TOO_SIM, self.VOLUME_MIN)
+
+        if not feature_flags.get_flag("bundling.llm_adaptive_similarity", False):
+            return default
+
+        if catalog_size <= 0:
+            return default
+
+        if catalog_size < 100:
+            thresholds = (0.25, 0.95, 0.45)
+        elif catalog_size < 1000:
+            thresholds = (0.30, 0.85, 0.55)
+        else:
+            thresholds = (0.35, 0.80, 0.65)
+
+        if thresholds != default:
+            logger.info(
+                "LLM_SIM adaptive thresholds applied | catalog_size=%d fbt_min=%.2f too_sim=%.2f volume_min=%.2f",
+                catalog_size,
+                thresholds[0],
+                thresholds[1],
+                thresholds[2],
+            )
+
+        return thresholds
 
     # --------- storage adapters ---------
     async def _storage_get(self, key: str) -> Optional[str]:
@@ -449,6 +481,7 @@ class LLMEmbeddingEngine:
         if not catalog or not embeddings:
             return []
         bt = (bundle_type or "").upper()
+        fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
         if bt == "FBT":
             return await self._gen_fbt(
                 catalog,
@@ -456,6 +489,8 @@ class LLMEmbeddingEngine:
                 num_candidates,
                 csv_upload_id=csv_upload_id,
                 orders_count=orders_count,
+                fbt_min=fbt_min,
+                too_similar=too_similar,
             )
         if bt == "VOLUME_DISCOUNT":
             return await self._gen_volume(
@@ -464,6 +499,7 @@ class LLMEmbeddingEngine:
                 num_candidates,
                 csv_upload_id=csv_upload_id,
                 orders_count=orders_count,
+                volume_min=volume_min,
             )
         if bt == "MIX_MATCH":
             return await self._gen_mixmatch(
@@ -472,6 +508,7 @@ class LLMEmbeddingEngine:
                 num_candidates,
                 csv_upload_id=csv_upload_id,
                 orders_count=orders_count,
+                volume_min=volume_min,
             )
         if bt == "BXGY":
             return await self._gen_bxgy(
@@ -480,6 +517,8 @@ class LLMEmbeddingEngine:
                 num_candidates,
                 csv_upload_id=csv_upload_id,
                 orders_count=orders_count,
+                fbt_min=fbt_min,
+                too_similar=too_similar,
             )
         if bt == "FIXED":
             return await self._gen_fixed(
@@ -489,6 +528,8 @@ class LLMEmbeddingEngine:
                 num_candidates,
                 csv_upload_id=csv_upload_id,
                 orders_count=orders_count,
+                fbt_min=fbt_min,
+                too_similar=too_similar,
             )
         return []
 
@@ -500,6 +541,8 @@ class LLMEmbeddingEngine:
         n: int,
         csv_upload_id: Optional[str] = None,
         orders_count: Optional[int] = None,
+        fbt_min: Optional[float] = None,
+        too_similar: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(50, len(catalog))]
@@ -513,6 +556,8 @@ class LLMEmbeddingEngine:
         relax_filters = (
             orders_count is not None and orders_count < self.RELAX_FILTER_ORDERS
         )
+        fbt_floor = self.FBT_MIN if fbt_min is None else fbt_min
+        too_sim_threshold = self.TOO_SIM if too_similar is None else too_similar
         if relax_filters:
             logger.info(
                 "[%s] LLM FBT: relaxing similarity filters (orders=%s < threshold=%s)",
@@ -533,22 +578,22 @@ class LLMEmbeddingEngine:
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=10,
-                min_similarity=0.0 if relax_filters else self.FBT_MIN,
+                min_similarity=0.0 if relax_filters else fbt_floor,
                 csv_upload_id=csv_upload_id,
             )
             for s_sku, sim in neigh[:5]:
                 logger.debug("LLM_CANDIDATE_SIM sku=%s candidate=%s sim=%.3f", sku, s_sku, sim)
                 neighbors_total += 1
-                if not relax_filters and sim > self.TOO_SIM:
+                if not relax_filters and sim > too_sim_threshold:
                     if logger.isEnabledFor(logging.DEBUG):
-                        delta = sim - self.TOO_SIM
+                        delta = sim - too_sim_threshold
                         logger.debug(
                             "[%s] SIM near-duplicate filtered | target=%s candidate=%s sim=%.3f limit=%.3f delta=%.3f",
                             scope,
                             sku,
                             s_sku,
                             sim,
-                            self.TOO_SIM,
+                            too_sim_threshold,
                             delta,
                         )
                     neighbors_too_similar += 1
@@ -588,6 +633,7 @@ class LLMEmbeddingEngine:
         n: int,
         csv_upload_id: Optional[str] = None,
         orders_count: Optional[int] = None,
+        volume_min: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(30, len(catalog))]
@@ -599,6 +645,7 @@ class LLMEmbeddingEngine:
         relax_filters = (
             orders_count is not None and orders_count < self.RELAX_FILTER_ORDERS
         )
+        volume_floor = self.VOLUME_MIN if volume_min is None else volume_min
         if relax_filters:
             logger.info(
                 "[%s] LLM volume: relaxing similarity filters (orders=%s < threshold=%s)",
@@ -616,7 +663,7 @@ class LLMEmbeddingEngine:
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=5,
-                min_similarity=0.0 if relax_filters else self.VOLUME_MIN,
+                min_similarity=0.0 if relax_filters else volume_floor,
                 csv_upload_id=csv_upload_id,
             )
             if len(neigh) >= 2:
@@ -651,6 +698,7 @@ class LLMEmbeddingEngine:
         n: int,
         csv_upload_id: Optional[str] = None,
         orders_count: Optional[int] = None,
+        volume_min: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         # Variety within category — start with volume-like, but you could add category gating later
         return await self._gen_volume(
@@ -659,6 +707,7 @@ class LLMEmbeddingEngine:
             n,
             csv_upload_id=csv_upload_id,
             orders_count=orders_count,
+            volume_min=volume_min,
         )
 
     async def _gen_bxgy(
@@ -668,6 +717,8 @@ class LLMEmbeddingEngine:
         n: int,
         csv_upload_id: Optional[str] = None,
         orders_count: Optional[int] = None,
+        fbt_min: Optional[float] = None,
+        too_similar: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         # Complementary pairing similar to FBT
         return await self._gen_fbt(
@@ -676,6 +727,8 @@ class LLMEmbeddingEngine:
             n,
             csv_upload_id=csv_upload_id,
             orders_count=orders_count,
+            fbt_min=fbt_min,
+            too_similar=too_similar,
         )
 
     async def _gen_fixed(
@@ -686,6 +739,8 @@ class LLMEmbeddingEngine:
         n: int,
         csv_upload_id: Optional[str] = None,
         orders_count: Optional[int] = None,
+        fbt_min: Optional[float] = None,
+        too_similar: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         # Placeholder: curate 2-item complementary sets; add objective-specific logic later
         return await self._gen_fbt(
@@ -694,6 +749,8 @@ class LLMEmbeddingEngine:
             n,
             csv_upload_id=csv_upload_id,
             orders_count=orders_count,
+            fbt_min=fbt_min,
+            too_similar=too_similar,
         )
 
 
