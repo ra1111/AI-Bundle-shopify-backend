@@ -214,9 +214,12 @@ class MetricsCollector:
         if not summary:
             return
         with self._lock:
+            totals = summary.get("totals") or {}
+            published = summary.get("published", totals.get("published", 0) or 0)
+            dropped = summary.get("dropped", totals.get("dropped", 0) or 0)
             self.staged_publish_counters["runs"] += 1
-            self.staged_publish_counters["published"] += int(summary.get("published", 0) or 0)
-            self.staged_publish_counters["dropped"] += int(summary.get("dropped", 0) or 0)
+            self.staged_publish_counters["published"] += int(published or 0)
+            self.staged_publish_counters["dropped"] += int(dropped or 0)
             self.staged_publish_counters["stages"] += len(summary.get("stages", []) or [])
             self.last_staged_publish = summary.copy()
     

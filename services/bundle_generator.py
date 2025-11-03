@@ -9,6 +9,7 @@ import uuid
 from decimal import Decimal
 from datetime import datetime, timedelta
 import random
+import math
 import time
 from collections import defaultdict
 import os
@@ -199,6 +200,24 @@ class BundleGenerator:
             result = minimum
         return result
 
+    @staticmethod
+    def _coerce_float(
+        value: Any,
+        default: float = 0.0,
+        *,
+        minimum: Optional[float] = None,
+        maximum: Optional[float] = None,
+    ) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            result = float(default)
+        if minimum is not None and result < minimum:
+            result = minimum
+        if maximum is not None and result > maximum:
+            result = maximum
+        return result
+
     def _extract_sku_list(self, recommendation: Dict[str, Any]) -> List[str]:
         """
         Normalize the products payload on a recommendation into a list of SKUs.
@@ -249,6 +268,200 @@ class BundleGenerator:
             thresholds = [3, 5, 10, 20, 40]
         thresholds = sorted(set(thresholds))
         return thresholds
+
+    async def _load_staged_wave_state(
+        self,
+        csv_upload_id: str,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        default_state: Dict[str, Any] = {
+            "version": 1,
+            "waves": [],
+            "totals": {"published": 0, "dropped": 0},
+            "cursor": {"stage_idx": 0, "published": 0, "last_bundle_id": None},
+            "backpressure": {"active": False, "reason": None, "last_event": None},
+            "resume": {},
+            "last_finalize_tx": None,
+        }
+        metrics_state: Dict[str, Any] = {}
+        try:
+            upload = await storage.get_csv_upload(csv_upload_id)
+        except Exception as exc:
+            logger.warning(
+                "[%s] Unable to load staged wave state (get_csv_upload failed): %s",
+                csv_upload_id,
+                exc,
+            )
+            return default_state, metrics_state
+
+        raw_metrics = {}
+        if upload and getattr(upload, "bundle_generation_metrics", None):
+            try:
+                raw_metrics = dict(upload.bundle_generation_metrics)
+            except Exception:
+                raw_metrics = upload.bundle_generation_metrics or {}
+        metrics_state = raw_metrics
+
+        staged_section = raw_metrics.get("staged_wave_state") or {}
+        merged_state = default_state.copy()
+        for key, value in staged_section.items():
+            if key in {"waves", "totals", "cursor", "backpressure", "resume"} and isinstance(
+                value, dict | list
+            ):
+                merged_state[key] = value
+            elif key in {"version", "last_finalize_tx"}:
+                merged_state[key] = value
+
+        # Ensure waves list sorted by index
+        waves = merged_state.get("waves", [])
+        if isinstance(waves, list):
+            try:
+                waves = sorted(waves, key=lambda item: item.get("index", 0))
+            except Exception:
+                pass
+        else:
+            waves = []
+        merged_state["waves"] = waves
+
+        # Normalise totals / cursor
+        totals = merged_state.get("totals") or {}
+        merged_state["totals"] = {
+            "published": int(totals.get("published", 0) or 0),
+            "dropped": int(totals.get("dropped", 0) or 0),
+        }
+        cursor = merged_state.get("cursor") or {}
+        merged_state["cursor"] = {
+            "stage_idx": int(cursor.get("stage_idx", len(waves)) or 0),
+            "published": int(cursor.get("published", merged_state["totals"]["published"]) or 0),
+            "last_bundle_id": cursor.get("last_bundle_id"),
+        }
+        backpressure = merged_state.get("backpressure") or {}
+        merged_state["backpressure"] = {
+            "active": bool(backpressure.get("active", False)),
+            "reason": backpressure.get("reason"),
+            "last_event": backpressure.get("last_event"),
+        }
+
+        try:
+            logger.info(
+                "[%s] Loaded staged state | waves=%d published=%d dropped=%d cursor=%s",
+                csv_upload_id,
+                len(merged_state["waves"]),
+                merged_state["totals"]["published"],
+                merged_state["totals"]["dropped"],
+                merged_state["cursor"],
+            )
+        except Exception:
+            logger.debug("[%s] Loaded staged state (summary logging failed)", csv_upload_id)
+
+        return merged_state, metrics_state
+
+    async def _persist_staged_wave_state(
+        self,
+        csv_upload_id: str,
+        staged_state: Dict[str, Any],
+        metrics_state: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        metrics_payload = dict(metrics_state or {})
+        metrics_payload["staged_wave_state"] = staged_state
+        try:
+            await storage.update_csv_upload(
+                csv_upload_id,
+                {"bundle_generation_metrics": metrics_payload},
+            )
+            logger.info(
+                "[%s] Persisted staged state | waves=%d totals=%s cursor=%s finalize_tx=%s",
+                csv_upload_id,
+                len(staged_state.get("waves", [])),
+                staged_state.get("totals"),
+                staged_state.get("cursor"),
+                staged_state.get("last_finalize_tx"),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] Failed to persist staged wave state: %s", csv_upload_id, exc
+            )
+
+    def _normalize_drop_reason(self, raw_reason: str, origin: str) -> str:
+        if not raw_reason:
+            return "FINALIZE_TX_FAIL"
+        key = raw_reason.lower()
+        origin_key = origin.lower()
+
+        if key in {"out_of_stock", "inventory_out"}:
+            return "OUT_OF_STOCK"
+        if key in {"missing_catalog", "missing_variant"}:
+            return "FINALIZE_TX_FAIL"
+        if key in {"inactive_product", "policy_violation"}:
+            return "POLICY_BLOCK"
+        if key in {"below_margin", "margin_violation"}:
+            return "BELOW_MARGIN"
+        if key in {"duplicate_sku", "duplicate"}:
+            return "DUPLICATE_SKU"
+        if key in {"score_low", "low_signal"}:
+            return "LOW_SCORE"
+        if key in {"pricing_error", "pricing_fallback"}:
+            return "PRICE_ANOMALY"
+        if key in {"copy_error", "llm_failure"} or origin_key == "copy":
+            return "COPY_FAIL"
+        if key in {"tx_fail", "persist_fail"}:
+            return "FINALIZE_TX_FAIL"
+        return "FINALIZE_TX_FAIL"
+
+    def _normalize_drop_reasons(
+        self,
+        drop_map: Dict[str, int],
+        origin: str,
+    ) -> Dict[str, int]:
+        normalized: Dict[str, int] = defaultdict(int)
+        for reason, count in (drop_map or {}).items():
+            normalized_reason = self._normalize_drop_reason(reason, origin)
+            normalized[normalized_reason] += int(count or 0)
+        return dict(normalized)
+
+    def _build_staged_progress_payload(
+        self,
+        run_id: str,
+        staged_state: Dict[str, Any],
+        *,
+        next_eta_seconds: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        waves_payload: List[Dict[str, Any]] = []
+        for wave in staged_state.get("waves", []) or []:
+            waves_payload.append(
+                {
+                    "index": wave.get("index"),
+                    "target": wave.get("target"),
+                    "published": wave.get("published"),
+                    "drops": wave.get("drops", {}),
+                    "took_ms": wave.get("duration_ms"),
+                    "finalize_tx": wave.get("finalize_tx"),
+                }
+            )
+        totals = staged_state.get("totals", {"published": 0, "dropped": 0})
+        cursor = staged_state.get("cursor", {})
+
+        payload = {
+            "run_id": run_id,
+            "staged": True,
+            "waves": waves_payload,
+            "totals": {
+                "published": totals.get("published", 0),
+                "dropped": totals.get("dropped", 0),
+            },
+            "cursor": {
+                "stage_idx": cursor.get("stage_idx"),
+                "published": cursor.get("published"),
+                "last_bundle_id": cursor.get("last_bundle_id"),
+            },
+            "backpressure": staged_state.get(
+                "backpressure", {"active": False, "reason": None}
+            ),
+            "next_wave_eta_sec": next_eta_seconds,
+        }
+        resume = staged_state.get("resume")
+        if resume:
+            payload["resume"] = resume
+        return payload
 
     def _warn_if_time_low(self, end_time: Optional[datetime], csv_upload_id: str, phase_label: str) -> None:
         if not end_time or self.soft_timeout_warning_seconds <= 0:
@@ -597,8 +810,69 @@ class BundleGenerator:
             feature_flags.get_flag("bundling.staged_prefer_high_score", True), True
         )
         self.staged_cycle_interval_seconds = self._coerce_int(
-            feature_flags.get_flag("bundling.staged_cycle_interval_seconds", 0), default=0, minimum=0
+            feature_flags.get_flag("bundling.staged_cycle_interval_seconds", 0),
+            default=0,
+            minimum=0,
         )
+        wave_cooldown_ms = self._coerce_int(
+            feature_flags.get_flag(
+                "bundling.staged.wave_cooldown_ms",
+                self.staged_cycle_interval_seconds * 1000,
+            ),
+            default=self.staged_cycle_interval_seconds * 1000,
+            minimum=0,
+        )
+        self.staged_wave_cooldown_seconds = wave_cooldown_ms / 1000.0
+        self.staged_auto_shrink_threshold = self._coerce_float(
+            feature_flags.get_flag("bundling.staged.auto_shrink_drop_threshold", 0.6),
+            default=0.6,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        self.staged_auto_shrink_factor = self._coerce_float(
+            feature_flags.get_flag("bundling.staged.auto_shrink_factor", 0.5),
+            default=0.5,
+            minimum=0.1,
+            maximum=1.0,
+        )
+        self.staged_soft_guard_seconds = self._coerce_int(
+            feature_flags.get_flag("bundling.staged.soft_guard_seconds", 45),
+            default=45,
+            minimum=0,
+        )
+        self.staged_backpressure_queue_threshold = self._coerce_int(
+            feature_flags.get_flag("bundling.staged.backpressure_queue_threshold", 0),
+            default=0,
+            minimum=0,
+        )
+        self.staged_backpressure_cooldown_waves = self._coerce_int(
+            feature_flags.get_flag("bundling.staged.backpressure_cooldown_waves", 1),
+            default=1,
+            minimum=1,
+        )
+        self.finalize_track_concurrency = {
+            "copy": self._coerce_int(
+                feature_flags.get_flag("bundling.finalize.concurrent_tracks.copy", 3),
+                default=3,
+                minimum=1,
+            ),
+            "pricing": self._coerce_int(
+                feature_flags.get_flag("bundling.finalize.concurrent_tracks.pricing", 2),
+                default=2,
+                minimum=1,
+            ),
+            "inventory": self._coerce_int(
+                feature_flags.get_flag(
+                    "bundling.finalize.concurrent_tracks.inventory", 3
+                ),
+                default=3,
+                minimum=1,
+            ),
+        }
+        if self.staged_cycle_interval_seconds == 0 and self.staged_wave_cooldown_seconds > 0:
+            self.staged_cycle_interval_seconds = int(
+                max(1, round(self.staged_wave_cooldown_seconds))
+            )
 
     def _check_circuit_breaker(self, operation_name: str, success: bool) -> bool:
         """ARCHITECT FIX: Circuit-breaker to detect consecutive failures and stop runaway behavior"""
@@ -1798,6 +2072,7 @@ class BundleGenerator:
                 csv_upload_id,
                 metrics,
                 end_time=end_time,
+                run_id=pipeline_run_id,
             )
 
             finalization_duration = int((time.time() - pricing_start) * 1000)
@@ -2271,6 +2546,7 @@ class BundleGenerator:
         csv_upload_id: str,
         metrics: Dict[str, Any],
         end_time: Optional[datetime] = None,
+        run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Finalize recommendations and prepare for storage"""
         try:
@@ -2324,8 +2600,9 @@ class BundleGenerator:
                 self.staged_publish_enabled,
             )
             logger.info(
-                "[%s] Finalization entry | staged_enabled=%s initial_candidates=%d",
+                "[%s] Finalization entry | run=%s staged_enabled=%s initial_candidates=%d",
                 csv_upload_id,
+                run_id or f"bundle:{csv_upload_id}",
                 staged_enabled,
                 len(final_recommendations),
             )
@@ -2336,6 +2613,7 @@ class BundleGenerator:
                     csv_upload_id,
                     metrics,
                     end_time=end_time,
+                    run_id=run_id,
                 )
 
             initial_bundle_count = len(final_recommendations)
@@ -2346,8 +2624,9 @@ class BundleGenerator:
 
             if final_recommendations:
                 logger.info(
-                    "[%s] Finalization pre-tracks | bundle_count=%d time_remaining=%s",
+                    "[%s] Finalization pre-tracks | run=%s bundle_count=%d time_remaining=%s",
                     csv_upload_id,
+                    run_id or f"bundle:{csv_upload_id}",
                     initial_bundle_count,
                     None
                     if not end_time
@@ -2509,9 +2788,36 @@ class BundleGenerator:
         metrics: Dict[str, Any],
         *,
         end_time: Optional[datetime] = None,
+        run_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Publish bundles in micro-batches so merchants see results sooner."""
+        run_identifier = run_id or f"bundle:{csv_upload_id}"
+        logger.info(
+            "[finalize.enter] run=%s staged=%s wave_targets=%s hard_cap=%s",
+            run_identifier,
+            True,
+            self.staged_thresholds,
+            self.staged_hard_cap,
+        )
+
+        staged_state, metrics_state = await self._load_staged_wave_state(csv_upload_id)
+        metrics.setdefault("phase_timings", {})
+        metrics.setdefault("staged_publish", {})["enabled"] = True
+
         if not recommendations:
+            staged_state.update(
+                {
+                    "waves": [],
+                    "totals": {"published": 0, "dropped": 0},
+                    "cursor": {"stage_idx": 0, "published": 0, "last_bundle_id": None},
+                    "backpressure": {"active": False, "reason": None, "last_event": None},
+                    "resume": {},
+                }
+            )
+            await self._persist_staged_wave_state(csv_upload_id, staged_state, metrics_state)
+            progress_payload = self._build_staged_progress_payload(
+                run_identifier, staged_state, next_eta_seconds=None
+            )
             await update_generation_progress(
                 csv_upload_id,
                 step="staged_publish",
@@ -2519,13 +2825,18 @@ class BundleGenerator:
                 status="completed",
                 message="No bundles to publish.",
                 bundle_count=0,
+                metadata=progress_payload,
             )
             await storage.delete_partial_bundle_recommendations(csv_upload_id)
             metrics["total_recommendations"] = 0
-            metrics.setdefault("staged_publish", {"enabled": True, "stages": [], "tracks": {}, "dropped": 0})
+            metrics["staged_publish"]["state"] = staged_state
+            await notify_bundle_ready(
+                csv_upload_id,
+                0,
+                resume_run=False,
+                details={"staged_publish": staged_state},
+            )
             return []
-
-        metrics.setdefault("phase_timings", {})
 
         prefer_high_score = self.staged_prefer_high_score
         ordered: List[Dict[str, Any]]
@@ -2554,6 +2865,12 @@ class BundleGenerator:
                 )
 
         if not ordered_effective:
+            staged_state["waves"] = []
+            staged_state["totals"] = {"published": 0, "dropped": 0}
+            staged_state["cursor"] = {"stage_idx": 0, "published": 0, "last_bundle_id": None}
+            progress_payload = self._build_staged_progress_payload(
+                run_identifier, staged_state, next_eta_seconds=None
+            )
             await update_generation_progress(
                 csv_upload_id,
                 step="staged_publish",
@@ -2561,28 +2878,33 @@ class BundleGenerator:
                 status="completed",
                 message="No bundles available after staging cap.",
                 bundle_count=0,
+                metadata=progress_payload,
             )
-            metrics.setdefault("staged_publish", {"enabled": True, "stages": [], "tracks": {}, "dropped": 0})
+            metrics["total_recommendations"] = 0
+            metrics["staged_publish"]["state"] = staged_state
             return []
 
         thresholds = [threshold for threshold in self.staged_thresholds if threshold > 0]
         if not thresholds:
             thresholds = [staged_total_target]
         thresholds = sorted(set(thresholds))
-        if thresholds[-1] < staged_total_target:
-            thresholds.append(staged_total_target)
+
+        dynamic_targets = [min(threshold, staged_total_target) for threshold in thresholds]
+        if dynamic_targets[-1] < staged_total_target:
+            dynamic_targets.append(staged_total_target)
         else:
-            thresholds[-1] = staged_total_target
+            dynamic_targets[-1] = staged_total_target
 
-        total_stages = len(thresholds)
+        total_stages = len(dynamic_targets)
         total_candidates = staged_total_target
-        cursor = 0
-        published = 0
-        drops_total = 0
 
+        completed_lookup = {wave.get("index"): wave for wave in staged_state.get("waves", [])}
+        published = staged_state.get("totals", {}).get("published", 0)
+        drops_total = staged_state.get("totals", {}).get("dropped", 0)
+        next_stage_index = max(
+            staged_state.get("cursor", {}).get("stage_idx", 0), len(completed_lookup)
+        )
         staged_results: List[Dict[str, Any]] = []
-        stage_metrics: List[Dict[str, Any]] = []
-        cumulative_drop_reasons: Dict[str, int] = defaultdict(int)
 
         accumulated_copy_ms = 0
         accumulated_storage_ms = 0
@@ -2590,40 +2912,102 @@ class BundleGenerator:
         accumulated_inventory_ms = 0
         accumulated_compliance_ms = 0
 
-        staged_summary = metrics.setdefault("staged_publish", {})
-        staged_summary["enabled"] = True
-        staged_summary["stages"] = []
-        staged_summary["tracks"] = {}
-        staged_summary["target"] = staged_total_target
-        staged_summary["hard_cap"] = hard_cap
-        staged_summary["dropped"] = 0
+        last_bundle_id = staged_state.get("cursor", {}).get("last_bundle_id")
+        staged_state.setdefault("resume", {})
 
         logger.info(
-            "[%s] Starting staged publish | stages=%d target=%d thresholds=%s",
+            "[%s] Starting staged publish | run=%s stages=%d target=%d thresholds=%s",
             csv_upload_id,
+            run_identifier,
             total_stages,
             staged_total_target,
-            thresholds,
+            dynamic_targets,
         )
 
-        for index, threshold in enumerate(thresholds):
-            desired_processed = min(threshold, total_candidates)
-            if cursor >= desired_processed:
+        for index, stage_target in enumerate(dynamic_targets):
+            if published >= staged_total_target:
+                break
+
+            if index < next_stage_index:
+                logger.info(
+                    "[%s] Skipping already-finalized stage %d | cursor=%s",
+                    csv_upload_id,
+                    index,
+                    staged_state.get("cursor"),
+                )
                 continue
 
-            stage_slice = ordered_effective[cursor:desired_processed]
-            cursor = desired_processed
-            stage_label = f"stage_{index + 1}"
-            stage_start = time.time()
+            if stage_target <= published:
+                logger.debug(
+                    "[%s] Stage %d target=%d already satisfied by published=%d; skipping.",
+                    csv_upload_id,
+                    index,
+                    stage_target,
+                    published,
+                )
+                continue
 
+            time_remaining = None
+            if end_time:
+                time_remaining = (end_time - datetime.now()).total_seconds()
+            if (
+                time_remaining is not None
+                and time_remaining <= self.staged_soft_guard_seconds
+            ):
+                staged_state["cursor"] = {
+                    "stage_idx": index,
+                    "published": published,
+                    "last_bundle_id": last_bundle_id,
+                }
+                staged_state["resume"] = {
+                    "stage_idx": index,
+                    "published": published,
+                    "reason": "watchdog_imminent",
+                    "timestamp": datetime.utcnow().isoformat(),
+                }
+                await self._persist_staged_wave_state(
+                    csv_upload_id, staged_state, metrics_state
+                )
+                logger.info(
+                    "[finalize.defer] run=%s reason=watchdog_imminent time_left_s=%.2f resume_cursor=%s",
+                    run_identifier,
+                    max(time_remaining, 0.0),
+                    staged_state["cursor"],
+                )
+                progress_payload = self._build_staged_progress_payload(
+                    run_identifier,
+                    staged_state,
+                    next_eta_seconds=None,
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="staged_publish",
+                    progress=88,
+                    status="in_progress",
+                    message="Watchdog approaching; deferring remaining waves.",
+                    bundle_count=published or None,
+                    metadata=progress_payload,
+                )
+                return staged_results
+
+            stage_slice = ordered_effective[published:stage_target]
+            if not stage_slice:
+                logger.debug(
+                    "[%s] Stage %d yielded empty slice after filtering; aborting staged publish loop.",
+                    csv_upload_id,
+                    index,
+                )
+                break
+
+            stage_start = time.time()
             await self._emit_heartbeat(
                 csv_upload_id,
                 step="staged_publish",
                 progress=85,
                 message=f"Preparing stage {index + 1}/{total_stages}",
                 metadata={
-                    "stage_target": desired_processed,
-                    "processed": cursor,
+                    "stage_target": stage_target,
+                    "processed": published,
                     "total_target": staged_total_target,
                 },
             )
@@ -2631,16 +3015,12 @@ class BundleGenerator:
             await self.store_partial_recommendations(
                 stage_slice,
                 csv_upload_id,
-                stage=stage_label,
+                stage=f"stage_{index + 1}",
             )
 
-            if self._time_budget_exceeded(end_time):
-                logger.warning(
-                    "[%s] Time budget exceeded before stage %s processing. Publishing partial results only.",
-                    csv_upload_id,
-                    stage_label,
-                )
-                break
+            finalize_tx = uuid.uuid4().hex
+            for rec in stage_slice:
+                rec["idempotency_key"] = f"{run_identifier}:{rec.get('id')}:{index}"
 
             with self._start_span(
                 "bundle_generator.stage_posts",
@@ -2662,25 +3042,21 @@ class BundleGenerator:
                 )
 
             kept_count = len(processed_slice)
-            dropped_entries = track_summary.get("dropped", [])
-            dropped_count = len(dropped_entries)
-
+            normalized_drops = track_summary.get("drop_reasons", {})
+            dropped_count = sum(normalized_drops.values())
             published += kept_count
             drops_total += dropped_count
-            staged_summary["dropped"] = drops_total
-            metrics["total_recommendations"] = published
+            staged_results.extend(processed_slice)
+            last_bundle_id = (
+                processed_slice[-1].get("id") if processed_slice else last_bundle_id
+            )
 
             copy_ms = track_summary.get("copy_ms", 0)
             pricing_ms = track_summary.get("pricing_ms", 0)
             inventory_ms = track_summary.get("inventory_ms", 0)
             compliance_ms = track_summary.get("compliance_ms", 0)
-
-            accumulated_copy_ms += copy_ms
-            accumulated_pricing_ms += pricing_ms
-            accumulated_inventory_ms += inventory_ms
-            accumulated_compliance_ms += compliance_ms
-
             storage_ms = 0
+
             if processed_slice:
                 storage_start = time.time()
                 with self._start_span(
@@ -2693,72 +3069,132 @@ class BundleGenerator:
                 ):
                     await self.store_recommendations(processed_slice, csv_upload_id)
                 storage_ms = int((time.time() - storage_start) * 1000)
-                accumulated_storage_ms += storage_ms
-                staged_results.extend(processed_slice)
-            else:
-                logger.info(
-                    "[%s] Stage %s produced no publishable bundles (kept=0 dropped=%d).",
-                    csv_upload_id,
-                    stage_label,
-                    dropped_count,
-                )
 
             stage_duration = int((time.time() - stage_start) * 1000)
-            next_stage_target = None
-            if cursor < total_candidates and (index + 1) < len(thresholds):
-                next_stage_target = min(thresholds[index + 1], total_candidates)
+            accumulated_copy_ms += copy_ms
+            accumulated_pricing_ms += pricing_ms
+            accumulated_inventory_ms += inventory_ms
+            accumulated_compliance_ms += compliance_ms
+            accumulated_storage_ms += storage_ms
 
-            stage_entry = {
-                "stage_index": index + 1,
-                "stage_target": desired_processed,
-                "processed_after_stage": cursor,
-                "published_after_stage": published,
-                "drops_after_stage": drops_total,
-                "kept": kept_count,
-                "dropped": dropped_count,
+            wave_entry = {
+                "index": index,
+                "target": stage_target,
+                "published": kept_count,
+                "drops": normalized_drops,
+                "duration_ms": stage_duration,
+                "persist_ms": storage_ms,
                 "copy_ms": copy_ms,
                 "pricing_ms": pricing_ms,
                 "inventory_ms": inventory_ms,
                 "compliance_ms": compliance_ms,
-                "persist_ms": storage_ms,
-                "duration_ms": stage_duration,
-                "drop_reasons": track_summary.get("drop_reasons", {}),
-                "next_stage_target": next_stage_target,
+                "dropped": dropped_count,
+                "published_ids": [rec.get("id") for rec in processed_slice],
+                "finalize_tx": finalize_tx,
+                "stage_version": len(staged_state.get("waves", [])) + 1,
             }
-            stage_metrics.append(stage_entry)
-            staged_summary["stages"].append(stage_entry)
-            for reason, count in track_summary.get("drop_reasons", {}).items():
-                cumulative_drop_reasons[reason] += count
+            completed_lookup[index] = wave_entry
+            staged_state["waves"] = [
+                completed_lookup[idx] for idx in sorted(completed_lookup.keys())
+            ]
+            staged_state["totals"] = {"published": published, "dropped": drops_total}
+            staged_state["cursor"] = {
+                "stage_idx": index + 1,
+                "published": published,
+                "last_bundle_id": last_bundle_id,
+            }
+            staged_state["resume"] = {
+                "stage_idx": index + 1,
+                "published": published,
+                "timestamp": datetime.utcnow().isoformat(),
+            }
+            staged_state["last_finalize_tx"] = finalize_tx
+
+            drop_summary_str = (
+                "{" + ",".join(f"{k}:{v}" for k, v in normalized_drops.items()) + "}"
+                if normalized_drops
+                else "{}"
+            )
+            logger.info(
+                "[finalize.wave.done] run=%s stage_idx=%d target=%d took_ms=%d kept=%d drops=%d %s",
+                run_identifier,
+                index,
+                stage_target,
+                stage_duration,
+                kept_count,
+                dropped_count,
+                drop_summary_str,
+            )
+
+            observed_total = kept_count + dropped_count
+            drop_rate = (dropped_count / observed_total) if observed_total else 0.0
+            next_eta_seconds: Optional[int] = int(self.staged_wave_cooldown_seconds) or None
+
+            if drop_rate >= self.staged_auto_shrink_threshold and index + 1 < len(dynamic_targets):
+                base_next = dynamic_targets[index + 1]
+                shrink_target = max(
+                    stage_target,
+                    min(
+                        staged_total_target,
+                        int(math.ceil(base_next * self.staged_auto_shrink_factor)),
+                    ),
+                )
+                dynamic_targets[index + 1] = max(shrink_target, stage_target)
+                logger.info(
+                    "[%s] Drop rate %.2f exceeded threshold %.2f; shrinking next target from %d to %d.",
+                    csv_upload_id,
+                    drop_rate,
+                    self.staged_auto_shrink_threshold,
+                    base_next,
+                    dynamic_targets[index + 1],
+                )
+                staged_state["backpressure"] = {
+                    "active": True,
+                    "reason": "drop_rate_high",
+                    "last_event": {
+                        "stage_idx": index,
+                        "drop_rate": round(drop_rate, 3),
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                }
+            else:
+                staged_state["backpressure"] = {
+                    "active": False,
+                    "reason": None,
+                    "last_event": staged_state.get("backpressure", {}).get("last_event"),
+                }
+                logger.debug(
+                    "[%s] Drop rate %.2f within threshold; next target remains %d.",
+                    csv_upload_id,
+                    drop_rate,
+                    dynamic_targets[index + 1]
+                    if index + 1 < len(dynamic_targets)
+                    else staged_total_target,
+                )
+
             try:
                 metrics_collector.record_drop_summary(
-                    track_summary.get("drop_reasons", {}),
-                    namespace=f"staged_stage_{index + 1}",
+                    normalized_drops, namespace=f"staged_stage_{index + 1}"
                 )
             except Exception as exc:
-                logger.debug("[%s] Failed to record staged drop summary: %s", csv_upload_id, exc)
+                logger.debug("[%s] Failed to record staged metrics: %s", csv_upload_id, exc)
 
-            progress_ratio = cursor / total_candidates if total_candidates else 1.0
-            progress_window = 14
-            progress = 85 + int(progress_ratio * progress_window)
+            await self._persist_staged_wave_state(
+                csv_upload_id,
+                staged_state,
+                metrics_state,
+            )
 
-            metadata = {
-                "stage_index": index + 1,
-                "stage_target": desired_processed,
-                "processed": cursor,
-                "published": published,
-                "dropped": drops_total,
-                "total_target": staged_total_target,
-            }
-            if next_stage_target:
-                metadata["next_stage_target"] = next_stage_target
-            if track_summary.get("drop_reasons"):
-                metadata["drop_reasons"] = track_summary["drop_reasons"]
-            if self.staged_cycle_interval_seconds > 0 and next_stage_target:
-                metadata["next_stage_eta_seconds"] = self.staged_cycle_interval_seconds
-
+            progress_ratio = published / staged_total_target if staged_total_target else 1.0
+            progress = 85 + int(progress_ratio * 14)
             progress_message = (
                 f"Published {published} bundles (stage {index + 1}/{total_stages}); "
                 f"filtered {dropped_count} this stage."
+            )
+            progress_payload = self._build_staged_progress_payload(
+                run_identifier,
+                staged_state,
+                next_eta_seconds=next_eta_seconds,
             )
 
             await update_generation_progress(
@@ -2768,7 +3204,7 @@ class BundleGenerator:
                 status="in_progress",
                 message=progress_message,
                 bundle_count=published or None,
-                metadata=metadata,
+                metadata=progress_payload,
             )
 
             if kept_count:
@@ -2776,58 +3212,38 @@ class BundleGenerator:
                     csv_upload_id,
                     published,
                     details={
-                        "stage_index": index + 1,
-                        "stage_target": desired_processed,
+                        "stage_index": index,
+                        "stage_target": stage_target,
                         "kept_this_stage": kept_count,
                         "dropped_this_stage": dropped_count,
                         "drops_after_stage": drops_total,
                         "total_target": staged_total_target,
+                        "drop_reasons": normalized_drops,
                     },
                 )
 
-            if self._time_budget_exceeded(end_time):
-                logger.warning(
-                    "[%s] Time budget exceeded after stage %s. Stopping staged publishing early.",
-                    csv_upload_id,
-                    stage_label,
-                )
-                break
-
             if (
-                cursor < total_candidates
-                and self.staged_cycle_interval_seconds > 0
-                and not self._time_budget_exceeded(end_time)
+                index + 1 < len(dynamic_targets)
+                and self.staged_wave_cooldown_seconds > 0
             ):
                 try:
-                    await asyncio.sleep(self.staged_cycle_interval_seconds)
+                    await asyncio.sleep(self.staged_wave_cooldown_seconds)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    logger.debug("Sleep interrupted between stages: %s", exc)
+                    logger.debug(
+                        "[%s] Interruption while cooling down between stages: %s",
+                        csv_upload_id,
+                        exc,
+                    )
 
-        staged_summary["tracks"] = {
-            "copy_ms": accumulated_copy_ms,
-            "pricing_ms": accumulated_pricing_ms,
-            "inventory_ms": accumulated_inventory_ms,
-            "compliance_ms": accumulated_compliance_ms,
-            "storage_ms": accumulated_storage_ms,
-        }
-        staged_summary["published"] = published
-        staged_summary["processed"] = cursor
-        staged_summary["drop_reasons"] = dict(cumulative_drop_reasons)
-
-        try:
-            metrics_collector.record_staged_publish(staged_summary)
-        except Exception as exc:
-            logger.debug("[%s] Failed to record staged publish metrics: %s", csv_upload_id, exc)
-        logger.info(
-            "[%s] Staged publish summary | published=%d dropped=%d stages=%d drop_reasons=%s",
-            csv_upload_id,
-            staged_summary.get("published"),
-            staged_summary.get("dropped"),
-            len(staged_summary.get("stages", [])),
-            staged_summary.get("drop_reasons"),
-        )
+            logger.debug(
+                "[%s] Stage cursor update | stage_idx=%d published=%d remaining=%d",
+                csv_upload_id,
+                staged_state["cursor"]["stage_idx"],
+                staged_state["cursor"]["published"],
+                staged_total_target - published,
+            )
 
         if accumulated_copy_ms:
             metrics["phase_timings"]["phase_8_ai_copy"] = (
@@ -2838,40 +3254,56 @@ class BundleGenerator:
                 metrics["phase_timings"].get("phase_9_storage", 0) + accumulated_storage_ms
             )
 
+        metrics["staged_publish"]["state"] = staged_state
+        metrics["staged_publish"]["tracks"] = {
+            "copy_ms": accumulated_copy_ms,
+            "pricing_ms": accumulated_pricing_ms,
+            "inventory_ms": accumulated_inventory_ms,
+            "compliance_ms": accumulated_compliance_ms,
+            "storage_ms": accumulated_storage_ms,
+        }
+        metrics["staged_publish"]["published"] = staged_state["totals"]["published"]
+        metrics["staged_publish"]["dropped"] = staged_state["totals"]["dropped"]
+        metrics["total_recommendations"] = staged_state["totals"]["published"]
+
+        try:
+            metrics_collector.record_staged_publish(staged_state)
+        except Exception as exc:
+            logger.debug("[%s] Failed to persist staged summary metrics: %s", csv_upload_id, exc)
+
         await storage.delete_partial_bundle_recommendations(csv_upload_id)
 
+        final_payload = self._build_staged_progress_payload(
+            run_identifier,
+            staged_state,
+            next_eta_seconds=None,
+        )
         await update_generation_progress(
             csv_upload_id,
             step="finalization",
             progress=100,
             status="completed",
             message="Bundle generation complete.",
-            bundle_count=published or None,
-            metadata={
-                "staged_publish": {
-                    "enabled": True,
-                    "published": published,
-                    "dropped": drops_total,
-                    "processed": cursor,
-                    "total_target": staged_total_target,
-                    "hard_cap": hard_cap,
-                    "stages": staged_summary.get("stages"),
-                    "tracks": staged_summary.get("tracks"),
-                    "drop_reasons": staged_summary.get("drop_reasons"),
-                },
-            },
+            bundle_count=staged_state["totals"]["published"] or None,
+            metadata=final_payload,
+        )
+
+        logger.info(
+            "[%s] Staged publish complete | run=%s published=%d dropped=%d waves=%d",
+            csv_upload_id,
+            run_identifier,
+            staged_state["totals"]["published"],
+            staged_state["totals"]["dropped"],
+            len(staged_state.get("waves", [])),
         )
 
         await notify_bundle_ready(
             csv_upload_id,
-            published,
+            staged_state["totals"]["published"],
             resume_run=False,
-            details={
-                "staged_publish": staged_summary,
-            },
+            details={"staged_publish": staged_state},
         )
         return staged_results
-
     async def _run_post_filter_tracks(
         self,
         stage_recommendations: List[Dict[str, Any]],
@@ -2981,31 +3413,28 @@ class BundleGenerator:
             }
 
         drop_map: Dict[str, set[str]] = defaultdict(set)
-        for entry in inventory_result.get("dropped", []):
-            rec_id = entry.get("id")
+        drop_totals: Dict[str, int] = defaultdict(int)
+
+        def _register_drop(rec_id: Optional[str], reasons: Optional[List[str]], origin: str) -> None:
             if not rec_id:
-                continue
-            reasons = entry.get("reasons") or ["inventory"]
-            for reason in reasons:
-                drop_map[rec_id].add(f"inventory:{reason}")
+                return
+            normalized = {
+                self._normalize_drop_reason(reason, origin) for reason in (reasons or [origin])
+            }
+            for reason in normalized:
+                drop_totals[reason] += 1
+            drop_map[rec_id].update(normalized)
+
+        for entry in inventory_result.get("dropped", []):
+            _register_drop(entry.get("id"), entry.get("reasons"), "inventory")
 
         for entry in compliance_result.get("dropped", []):
-            rec_id = entry.get("id")
-            if not rec_id:
-                continue
-            reasons = entry.get("reasons") or ["compliance"]
-            for reason in reasons:
-                drop_map[rec_id].add(f"compliance:{reason}")
+            _register_drop(entry.get("id"), entry.get("reasons"), "compliance")
 
         combined_drops = [
             {"id": rec_id, "reasons": sorted(reasons)}
             for rec_id, reasons in drop_map.items()
         ]
-
-        drop_reasons_counter: Dict[str, int] = defaultdict(int)
-        for reasons in drop_map.values():
-            for reason in reasons:
-                drop_reasons_counter[reason] += 1
 
         filtered_recommendations = [
             rec for rec in stage_recommendations if rec.get("id") not in drop_map
@@ -3020,7 +3449,7 @@ class BundleGenerator:
             "pricing_ms": pricing_result.get("duration_ms", 0),
             "inventory_ms": inventory_result.get("duration_ms", 0),
             "compliance_ms": compliance_result.get("duration_ms", 0),
-            "drops": drop_reasons_counter,
+            "drops": dict(drop_totals),
         }
         if staged_mode:
             metrics.setdefault("staged_publish", {}).setdefault("track_stats", []).append(
@@ -3036,14 +3465,17 @@ class BundleGenerator:
             "compliance_ms": compliance_result.get("duration_ms", 0),
             "duration_ms": duration_ms,
             "dropped": combined_drops,
-            "drop_reasons": dict(drop_reasons_counter),
+            "drop_reasons": dict(drop_totals),
             "pricing_stats": pricing_result,
             "inventory_stats": inventory_result,
             "compliance_stats": compliance_result,
+            "drop_rate": (
+                len(drop_map) / len(stage_recommendations) if stage_recommendations else 0.0
+            ),
         }
 
         logger.info(
-            "[%s] Post-filter tracks done | staged=%s stage=%d kept=%d dropped=%d copy_ms=%d pricing_ms=%d inventory_ms=%d compliance_ms=%d",
+            "[%s] Post-filter tracks done | staged=%s stage=%d kept=%d dropped=%d copy_ms=%d pricing_ms=%d inventory_ms=%d compliance_ms=%d drops=%s",
             csv_upload_id,
             staged_mode,
             stage_index + 1,
@@ -3053,6 +3485,7 @@ class BundleGenerator:
             pricing_result.get("duration_ms", 0),
             inventory_result.get("duration_ms", 0),
             compliance_result.get("duration_ms", 0),
+            dict(drop_totals),
         )
 
         return filtered_recommendations, summary

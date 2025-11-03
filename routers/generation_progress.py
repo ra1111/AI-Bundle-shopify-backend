@@ -41,11 +41,13 @@ async def get_generation_progress(
         raise HTTPException(status_code=410, detail="Generation progress expired")
 
     metadata = record.metadata_json or {}
-    staged_publish = None
+    staged_payload = None
     if isinstance(metadata.get("staged_publish"), dict):
-        staged_publish = metadata["staged_publish"]
+        staged_payload = metadata["staged_publish"]
+    elif isinstance(metadata, dict) and metadata.get("staged"):
+        staged_payload = metadata
 
-    response = {
+    response: Dict[str, Any] = {
         "upload_id": record.upload_id,
         "shop_domain": record.shop_domain,
         "step": record.step,
@@ -55,6 +57,12 @@ async def get_generation_progress(
         "metadata": metadata,
         "updated_at": updated_at.isoformat().replace("+00:00", "Z"),
     }
-    if staged_publish:
-        response["staged_publish"] = staged_publish
+    if staged_payload:
+        response["staged"] = staged_payload.get("staged", True)
+        response["staged_state"] = staged_payload
+        if staged_payload.get("run_id"):
+            response["run_id"] = staged_payload["run_id"]
+    elif isinstance(metadata, dict) and metadata.get("run_id"):
+        response["run_id"] = metadata["run_id"]
+
     return response

@@ -41,3 +41,14 @@ def test_record_staged_publish_counters():
     assert collector.staged_publish_counters["dropped"] == 3
     assert collector.staged_publish_counters["stages"] == 2
     assert collector.last_staged_publish == summary
+
+
+def test_record_staged_publish_with_totals_section():
+    collector = MetricsCollector()
+    state_summary = {
+        "totals": {"published": 5, "dropped": 2},
+        "waves": [{"index": 0}],
+    }
+    collector.record_staged_publish(state_summary)
+    assert collector.staged_publish_counters["published"] == 5
+    assert collector.staged_publish_counters["dropped"] == 2
