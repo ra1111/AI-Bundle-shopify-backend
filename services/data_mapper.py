@@ -8,10 +8,20 @@ import logging
 from decimal import Decimal
 from datetime import datetime, timedelta
 import time
+import contextlib
+import unicodedata
+from collections import deque
 
 from services.feature_flags import feature_flags
 
 from services.storage import storage
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind
+except ImportError:  # pragma: no cover - optional dependency
+    trace = None
+    SpanKind = None
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +37,81 @@ class DataMapper:
         self._inventory_map_by_scope: Dict[str, Dict[str, Any]] = {}
         self._catalog_map_by_scope: Dict[str, Dict[str, Any]] = {}
         self._product_meta_cache: Dict[str, Dict[str, Any]] = {}
+        self._cache_expiry: Dict[str, float] = {}
+        self._tuning_state: Dict[str, Dict[str, Any]] = {}
+        self._tracer = trace.get_tracer(__name__) if trace else None
 
     def _scope_key(self, csv_upload_id: str, run_id: Optional[str] = None) -> str:
         return f"run:{run_id}" if run_id else f"upload:{csv_upload_id}"
+
+    @contextlib.contextmanager
+    def _start_span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        if not self._tracer or not SpanKind:
+            yield None
+            return
+        with self._tracer.start_as_current_span(name, kind=SpanKind.INTERNAL) as span:
+            if attributes:
+                for key, value in attributes.items():
+                    span.set_attribute(key, value)
+            yield span
+
+    def _maybe_expire_scope(self, scope: str) -> None:
+        ttl_seconds = feature_flags.get_flag("data_mapping.cache_ttl_seconds", 1800) or 1800
+        last = self._cache_expiry.get(scope)
+        now = time.time()
+        if last and now - last > ttl_seconds:
+            self._variant_map_by_scope.pop(scope, None)
+            self._variant_id_map_by_scope.pop(scope, None)
+            self._inventory_map_by_scope.pop(scope, None)
+            self._catalog_map_by_scope.pop(scope, None)
+            keys_to_drop = [k for k in self._product_meta_cache if k.startswith(f"{scope}::")]
+            for key in keys_to_drop:
+                self._product_meta_cache.pop(key, None)
+            self._cache_expiry.pop(scope, None)
+
+    def _get_tuning_parameters(
+        self,
+        scope: str,
+        default_batch: int,
+        default_concurrency: int,
+    ) -> Tuple[int, int]:
+        state = self._tuning_state.get(scope)
+        if not state:
+            state = {
+                "batch_size": max(1, default_batch),
+                "concurrency": max(1, default_concurrency),
+                "latency_history": deque(maxlen=20),
+            }
+            self._tuning_state[scope] = state
+        return state["batch_size"], state["concurrency"]
+
+    def _update_tuning_state(
+        self,
+        scope: str,
+        chunk_durations: List[float],
+        default_batch: int,
+        default_concurrency: int,
+    ) -> None:
+        if not chunk_durations:
+            return
+        state = self._tuning_state.get(scope)
+        if not state:
+            return
+        durations_ms = sorted(d * 1000 for d in chunk_durations if d is not None)
+        if not durations_ms:
+            return
+        index_95 = max(0, int(len(durations_ms) * 0.95) - 1)
+        p95 = durations_ms[index_95]
+        state["latency_history"].append(p95)
+        target_ms = feature_flags.get_flag("data_mapping.target_chunk_p95_ms", 800) or 800
+        if p95 > target_ms * 1.5:
+            state["concurrency"] = max(1, int(state["concurrency"] * 0.8))
+            state["batch_size"] = max(10, int(state["batch_size"] * 0.8))
+        elif p95 < target_ms * 0.7:
+            state["concurrency"] = min(default_concurrency, state["concurrency"] + 1)
+            state["batch_size"] = min(500, int(state["batch_size"] * 1.1))
+        state["batch_size"] = max(10, min(state["batch_size"], 1000))
+        state["concurrency"] = max(1, min(state["concurrency"], default_concurrency))
 
     async def resolve_variant_from_sku(self, sku: str, csv_upload_id: str) -> Optional[str]:
         """Resolve variant_id from SKU with caching"""
@@ -91,10 +173,14 @@ class DataMapper:
             # Resolve run_id to correlate across files
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
             # Get all order lines for this upload (or entire run if available)
-            if run_id:
-                order_lines = await storage.get_order_lines_by_run(run_id)
-            else:
-                order_lines = await storage.get_order_lines_by_upload(csv_upload_id)
+            with self._start_span(
+                "data_mapping.fetch_order_lines",
+                {"csv_upload_id": csv_upload_id, "run_id": run_id or ""},
+            ):
+                if run_id:
+                    order_lines = await storage.get_order_lines_by_run(run_id)
+                else:
+                    order_lines = await storage.get_order_lines_by_upload(csv_upload_id)
 
             if timing_enabled and fetch_start is not None:
                 fetch_duration = time.perf_counter() - fetch_start
@@ -108,36 +194,78 @@ class DataMapper:
                     "enriched_lines": []
                 }
 
-            prefetch_start = time.perf_counter() if timing_enabled else None
-            prefetch_data = await self._prefetch_data(csv_upload_id, run_id, order_lines)
-            if timing_enabled and prefetch_start is not None:
-                prefetch_duration = time.perf_counter() - prefetch_start
+            with self._start_span(
+                "data_mapping.prefetch",
+                {
+                    "csv_upload_id": csv_upload_id,
+                    "run_id": run_id or "",
+                    "order_line_count": len(order_lines),
+                },
+            ):
+                prefetch_start = time.perf_counter() if timing_enabled else None
+                prefetch_data = await self._prefetch_data(csv_upload_id, run_id, order_lines)
+                if timing_enabled and prefetch_start is not None:
+                    prefetch_duration = time.perf_counter() - prefetch_start
+
+            scope = prefetch_data.get("scope", self._scope_key(csv_upload_id, run_id))
+            default_batch = feature_flags.get_flag("data_mapping.prefetch_batch_size", 100) or 100
+            default_concurrency = feature_flags.get_flag("data_mapping.concurrent_map_limit", 25) or 25
+            try:
+                default_batch = int(default_batch)
+            except (TypeError, ValueError):
+                default_batch = 100
+            try:
+                default_concurrency = int(default_concurrency)
+            except (TypeError, ValueError):
+                default_concurrency = 25
+            batch_size, tuned_concurrency = self._get_tuning_parameters(scope, default_batch, default_concurrency)
+            pool_cap = max(1, int(default_concurrency * 0.8))
+            concurrency_limit = max(1, min(tuned_concurrency, default_concurrency, pool_cap))
+            concurrency_enabled = feature_flags.get_flag("data_mapping.concurrent_mapping", True)
+            if not concurrency_enabled:
+                concurrency_limit = 1
+            semaphore = asyncio.Semaphore(concurrency_limit) if concurrency_enabled else None
 
             mapping_start = time.perf_counter() if timing_enabled else None
+            results: List[Dict[str, Any]] = []
+            chunk_durations: List[float] = []
+            enumerated_lines = list(enumerate(order_lines))
 
-            concurrency_enabled = feature_flags.get_flag("data_mapping.concurrent_mapping", True)
-            if concurrency_enabled and order_lines:
-                concurrency_limit = feature_flags.get_flag("data_mapping.concurrent_map_limit", 25) or 25
-                try:
-                    concurrency_limit = int(concurrency_limit)
-                except (TypeError, ValueError):
-                    concurrency_limit = 25
-                concurrency_limit = max(1, concurrency_limit)
-                semaphore = asyncio.Semaphore(concurrency_limit)
+            for chunk_index in range(0, len(enumerated_lines), batch_size):
+                chunk = enumerated_lines[chunk_index:chunk_index + batch_size]
+                span_attrs = {
+                    "csv_upload_id": csv_upload_id,
+                    "chunk_index": chunk_index // batch_size,
+                    "chunk_size": len(chunk),
+                    "concurrency_limit": concurrency_limit,
+                }
+                with self._start_span("data_mapping.map_chunk", span_attrs):
+                    chunk_start_time = time.perf_counter() if timing_enabled else None
 
-                async def map_line(item: Tuple[int, Any]) -> Dict[str, Any]:
-                    idx, order_line = item
-                    async with semaphore:
+                    async def map_line(item: Tuple[int, Any]) -> Dict[str, Any]:
+                        idx, order_line = item
+                        if semaphore:
+                            async with semaphore:
+                                return await self._map_order_line(idx, order_line, csv_upload_id, run_id, prefetch_data)
                         return await self._map_order_line(idx, order_line, csv_upload_id, run_id, prefetch_data)
 
-                results = await asyncio.gather(*[map_line(item) for item in enumerate(order_lines)])
-            else:
-                results = []
-                for idx, order_line in enumerate(order_lines):
-                    results.append(await self._map_order_line(idx, order_line, csv_upload_id, run_id, prefetch_data))
+                    if concurrency_enabled:
+                        chunk_results = await asyncio.gather(*[map_line(item) for item in chunk])
+                    else:
+                        chunk_results = []
+                        for item in chunk:
+                            chunk_results.append(await map_line(item))
+
+                    if timing_enabled and chunk_start_time is not None:
+                        chunk_durations.append(time.perf_counter() - chunk_start_time)
+
+                    results.extend(chunk_results)
 
             if timing_enabled and mapping_start is not None:
                 mapping_duration = time.perf_counter() - mapping_start
+
+            self._update_tuning_state(scope, chunk_durations, default_batch, default_concurrency)
+            self._cache_expiry[scope] = time.time()
 
             results.sort(key=lambda r: r["index"])
 
@@ -189,7 +317,9 @@ class DataMapper:
     async def _prefetch_data(self, csv_upload_id: str, run_id: Optional[str], _order_lines: List[Any]) -> Dict[str, Any]:
         """Prefetch catalog, variant, and inventory data to minimize per-row I/O."""
         scope = self._scope_key(csv_upload_id, run_id)
+        self._maybe_expire_scope(scope)
         if not feature_flags.get_flag("data_mapping.prefetch_enabled", True):
+            self._cache_expiry[scope] = time.time()
             return {
                 "scope": scope,
                 "variants_by_sku": self._variant_map_by_scope.get(scope, {}),
@@ -244,6 +374,8 @@ class DataMapper:
                 cache_key = self._product_cache_key(scope, sku)
                 if cache_key not in self._product_meta_cache:
                     self._product_meta_cache[cache_key] = self._convert_snapshot_to_product_data(snapshot)
+
+        self._cache_expiry[scope] = time.time()
 
         return {
             "scope": scope,
@@ -399,19 +531,24 @@ class DataMapper:
     def _product_cache_key(self, scope: str, sku: str) -> str:
         return f"{scope}::{sku}"
 
+    def _normalize_text(self, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        return unicodedata.normalize("NFKC", str(value)).strip()
+
     def _convert_snapshot_to_product_data(self, snapshot: Any) -> Dict[str, Any]:
         if snapshot is None:
             return {}
         return {
             "product_id": getattr(snapshot, "product_id", None),
-            "product_title": getattr(snapshot, "product_title", None),
-            "product_type": getattr(snapshot, "product_type", None),
-            "vendor": getattr(snapshot, "vendor", None),
+            "product_title": self._normalize_text(getattr(snapshot, "product_title", None)),
+            "product_type": self._normalize_text(getattr(snapshot, "product_type", None)),
+            "vendor": self._normalize_text(getattr(snapshot, "vendor", None)),
             "tags": getattr(snapshot, "tags", None),
             "product_status": getattr(snapshot, "product_status", None),
             "created_at": getattr(snapshot, "product_created_at", None),
             "published_at": getattr(snapshot, "product_published_at", None),
-            "variant_title": getattr(snapshot, "variant_title", None),
+            "variant_title": self._normalize_text(getattr(snapshot, "variant_title", None)),
             "price": getattr(snapshot, "price", None),
             "compare_at_price": getattr(snapshot, "compare_at_price", None),
         }
@@ -565,14 +702,14 @@ class DataMapper:
             
             return {
                 "product_id": product_data.product_id,
-                "product_title": product_data.product_title,
-                "product_type": product_data.product_type,
-                "vendor": product_data.vendor,
+                "product_title": self._normalize_text(product_data.product_title),
+                "product_type": self._normalize_text(product_data.product_type),
+                "vendor": self._normalize_text(product_data.vendor),
                 "tags": product_data.tags,
                 "product_status": product_data.product_status,
                 "created_at": product_data.product_created_at,
                 "published_at": product_data.product_published_at,
-                "variant_title": product_data.variant_title,
+                "variant_title": self._normalize_text(product_data.variant_title),
                 "price": product_data.price,
                 "compare_at_price": product_data.compare_at_price
             }

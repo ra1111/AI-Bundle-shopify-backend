@@ -15,12 +15,20 @@ import json
 import hashlib
 import logging
 from typing import Any, Dict, List, Tuple, Optional
+import contextlib
 
 import numpy as np
 import inspect
 from services.storage import storage  # must expose async get(key)->str|None and set(key, value, ttl=None)
 from services.ml.llm_utils import get_async_client, load_settings
 from services.feature_flags import feature_flags
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind
+except ImportError:  # pragma: no cover - optional dependency
+    trace = None
+    SpanKind = None
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +62,10 @@ class LLMEmbeddingEngine:
     RETRY_MAX = int(os.getenv("EMBED_RETRY_MAX", "3"))
     RETRY_BACKOFF_BASE_S = float(os.getenv("EMBED_RETRY_BACKOFF_BASE_S", "0.5"))
 
+    PREFILTER_PRICE_DELTA = float(os.getenv("SIM_PREFILTER_PRICE_DELTA", "0.25"))
+    PREFILTER_REQUIRE_VENDOR = os.getenv("SIM_PREFILTER_VENDOR_MATCH", "true").lower() == "true"
+    PREFILTER_REQUIRE_CATEGORY = os.getenv("SIM_PREFILTER_CATEGORY_MATCH", "false").lower() == "true"
+
     def __init__(self) -> None:
         self._settings = load_settings()
         self.client = get_async_client()
@@ -67,6 +79,7 @@ class LLMEmbeddingEngine:
         self._write_method = None
         self.retry_max = self._settings.retry_max or self.RETRY_MAX
         self.retry_backoff_base_s = self._settings.retry_backoff_base_s or self.RETRY_BACKOFF_BASE_S
+        self._tracer = trace.get_tracer(__name__) if trace else None
 
         read_candidates = ("get", "get_text", "read", "read_text", "load")
         write_candidates = ("set", "put", "write", "write_text", "save")
@@ -92,6 +105,17 @@ class LLMEmbeddingEngine:
 
         if not self._persist_ok:
             logger.info("EMBED_CACHE: persistent cache disabled (no compatible storage methods found)")
+
+    @contextlib.contextmanager
+    def _start_span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        if not self._tracer or not SpanKind:
+            yield None
+            return
+        with self._tracer.start_as_current_span(name, kind=SpanKind.INTERNAL) as span:
+            if attributes:
+                for key, value in attributes.items():
+                    span.set_attribute(key, value)
+            yield span
 
     def _resolve_similarity_thresholds(self, catalog_size: int) -> Tuple[float, float, float]:
         """
@@ -412,48 +436,54 @@ class LLMEmbeddingEngine:
         min_similarity: float = 0.5,
         csv_upload_id: Optional[str] = None,
     ) -> List[Tuple[str, float]]:
-        if target_sku not in embeddings:
-            logger.warning("SIM: target SKU %s missing embedding", target_sku)
-            return []
+        span_attrs = {
+            "target_sku": target_sku,
+            "catalog_size": len(catalog),
+            "threshold": min_similarity,
+        }
+        with self._start_span("llm_embeddings.similarity_search", span_attrs):
+            if target_sku not in embeddings:
+                logger.warning("SIM: target SKU %s missing embedding", target_sku)
+                return []
 
-        t = embeddings[target_sku]
-        sims: List[Tuple[str, float]] = []
-        highest_miss: Optional[float] = None
-        scope = csv_upload_id or "unknown_upload"
-        for p in catalog:
-            sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
-            if not sku or sku == target_sku:
-                continue
-            v = embeddings.get(sku)
-            if v is None:
-                continue
-            s = self._cosine(t, v)
-            if s >= min_similarity:
-                sims.append((sku, float(s)))
-            else:
-                if highest_miss is None or s > highest_miss:
-                    highest_miss = float(s)
+            t = embeddings[target_sku]
+            sims: List[Tuple[str, float]] = []
+            highest_miss: Optional[float] = None
+            scope = csv_upload_id or "unknown_upload"
+            for p in catalog:
+                sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
+                if not sku or sku == target_sku:
+                    continue
+                v = embeddings.get(sku)
+                if v is None:
+                    continue
+                s = self._cosine(t, v)
+                if s >= min_similarity:
+                    sims.append((sku, float(s)))
+                else:
+                    if highest_miss is None or s > highest_miss:
+                        highest_miss = float(s)
 
-        sims.sort(key=lambda x: x[1], reverse=True)
-        if highest_miss is not None and logger.isEnabledFor(logging.DEBUG):
-            delta = max(min_similarity - highest_miss, 0.0)
-            logger.debug(
-                "[%s] SIM miss | target=%s threshold=%.3f below=%.3f delta=%.3f",
-                scope,
-                target_sku,
-                min_similarity,
-                highest_miss,
-                delta,
-            )
-        if not sims:
-            logger.info(
-                "[%s] SIM search produced no matches | target=%s threshold=%.3f catalog_checked=%d",
-                scope,
-                target_sku,
-                min_similarity,
-                len(catalog),
-            )
-        return sims[:top_k]
+            sims.sort(key=lambda x: x[1], reverse=True)
+            if highest_miss is not None and logger.isEnabledFor(logging.DEBUG):
+                delta = max(min_similarity - highest_miss, 0.0)
+                logger.debug(
+                    "[%s] SIM miss | target=%s threshold=%.3f below=%.3f delta=%.3f",
+                    scope,
+                    target_sku,
+                    min_similarity,
+                    highest_miss,
+                    delta,
+                )
+            if not sims:
+                logger.info(
+                    "[%s] SIM search produced no matches | target=%s threshold=%.3f catalog_checked=%d",
+                    scope,
+                    target_sku,
+                    min_similarity,
+                    len(catalog),
+                )
+            return sims[:top_k]
 
     def compute_bundle_similarity(self, products: List[str], embeddings: Dict[str, np.ndarray]) -> float:
         if len(products) < 2:
@@ -481,59 +511,98 @@ class LLMEmbeddingEngine:
         if not catalog or not embeddings:
             return []
         bt = (bundle_type or "").upper()
-        fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
-        if bt == "FBT":
-            return await self._gen_fbt(
-                catalog,
-                embeddings,
-                num_candidates,
-                csv_upload_id=csv_upload_id,
-                orders_count=orders_count,
-                fbt_min=fbt_min,
-                too_similar=too_similar,
-            )
-        if bt == "VOLUME_DISCOUNT":
-            return await self._gen_volume(
-                catalog,
-                embeddings,
-                num_candidates,
-                csv_upload_id=csv_upload_id,
-                orders_count=orders_count,
-                volume_min=volume_min,
-            )
-        if bt == "MIX_MATCH":
-            return await self._gen_mixmatch(
-                catalog,
-                embeddings,
-                num_candidates,
-                csv_upload_id=csv_upload_id,
-                orders_count=orders_count,
-                volume_min=volume_min,
-            )
-        if bt == "BXGY":
-            return await self._gen_bxgy(
-                catalog,
-                embeddings,
-                num_candidates,
-                csv_upload_id=csv_upload_id,
-                orders_count=orders_count,
-                fbt_min=fbt_min,
-                too_similar=too_similar,
-            )
-        if bt == "FIXED":
-            return await self._gen_fixed(
-                catalog,
-                embeddings,
-                objective,
-                num_candidates,
-                csv_upload_id=csv_upload_id,
-                orders_count=orders_count,
-                fbt_min=fbt_min,
-                too_similar=too_similar,
-            )
-        return []
+        span_attrs = {
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": bt,
+            "objective": objective,
+            "catalog_size": len(catalog),
+        }
+        with self._start_span("llm_embeddings.generate_candidates", span_attrs):
+            fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
+            if bt == "FBT":
+                return await self._gen_fbt(
+                    catalog,
+                    embeddings,
+                    num_candidates,
+                    csv_upload_id=csv_upload_id,
+                    orders_count=orders_count,
+                    fbt_min=fbt_min,
+                    too_similar=too_similar,
+                )
+            if bt == "VOLUME_DISCOUNT":
+                return await self._gen_volume(
+                    catalog,
+                    embeddings,
+                    num_candidates,
+                    csv_upload_id=csv_upload_id,
+                    orders_count=orders_count,
+                    volume_min=volume_min,
+                )
+            if bt == "MIX_MATCH":
+                return await self._gen_mixmatch(
+                    catalog,
+                    embeddings,
+                    num_candidates,
+                    csv_upload_id=csv_upload_id,
+                    orders_count=orders_count,
+                    volume_min=volume_min,
+                )
+            if bt == "BXGY":
+                return await self._gen_bxgy(
+                    catalog,
+                    embeddings,
+                    num_candidates,
+                    csv_upload_id=csv_upload_id,
+                    orders_count=orders_count,
+                    fbt_min=fbt_min,
+                    too_similar=too_similar,
+                )
+            if bt == "FIXED":
+                return await self._gen_fixed(
+                    catalog,
+                    embeddings,
+                    objective,
+                    num_candidates,
+                    csv_upload_id=csv_upload_id,
+                    orders_count=orders_count,
+                    fbt_min=fbt_min,
+                    too_similar=too_similar,
+                )
+            return []
 
     # ---- internal generators ----
+    @staticmethod
+    def _safe_float(value: Any) -> Optional[float]:
+        if value in (None, "", "null", "NULL"):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _passes_prefilter(self, anchor: Optional[Dict[str, Any]], candidate: Optional[Dict[str, Any]]) -> bool:
+        if not anchor or not candidate:
+            return True
+        price_a = self._safe_float(anchor.get("price"))
+        price_b = self._safe_float(candidate.get("price"))
+        if price_a is not None and price_b is not None:
+            if price_a == 0:
+                return False
+            delta = abs(price_a - price_b) / max(price_a, 1.0)
+            if delta > self.PREFILTER_PRICE_DELTA:
+                return False
+        if self.PREFILTER_REQUIRE_VENDOR:
+            vendor_a = anchor.get("vendor")
+            vendor_b = candidate.get("vendor")
+            if vendor_a and vendor_b and vendor_a != vendor_b:
+                return False
+        if self.PREFILTER_REQUIRE_CATEGORY:
+            category_a = anchor.get("product_type") or anchor.get("category")
+            category_b = candidate.get("product_type") or candidate.get("category")
+            if category_a and category_b and category_a != category_b:
+                return False
+        return True
+
     async def _gen_fbt(
         self,
         catalog: List[Dict[str, Any]],
@@ -547,6 +616,7 @@ class LLMEmbeddingEngine:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(50, len(catalog))]
         scope = csv_upload_id or "unknown_upload"
+        catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
         anchors_total = len(head)
         anchors_missing_sku = 0
         anchors_missing_embedding = 0
@@ -598,6 +668,10 @@ class LLMEmbeddingEngine:
                         )
                     neighbors_too_similar += 1
                     continue  # skip near-duplicates
+                anchor_meta = catalog_lookup.get(sku)
+                candidate_meta = catalog_lookup.get(s_sku)
+                if not self._passes_prefilter(anchor_meta, candidate_meta):
+                    continue
                 out.append({"products": [sku, s_sku], "llm_similarity": sim, "source": "llm_fbt"})
                 neighbors_added += 1
                 if len(out) >= n:
@@ -638,6 +712,7 @@ class LLMEmbeddingEngine:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(30, len(catalog))]
         scope = csv_upload_id or "unknown_upload"
+        catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
         anchors_total = len(head)
         anchors_missing = 0
         neighbors_total = 0
@@ -653,29 +728,38 @@ class LLMEmbeddingEngine:
                 orders_count,
                 self.RELAX_FILTER_ORDERS,
             )
-        for p in head:
-            sku = p.get("sku")
-            if not sku or sku not in embeddings:
-                anchors_missing += 1
-                continue
-            neigh = await self.find_similar_products(
-                target_sku=sku,
-                catalog=catalog,
-                embeddings=embeddings,
-                top_k=5,
-                min_similarity=0.0 if relax_filters else volume_floor,
-                csv_upload_id=csv_upload_id,
-            )
-            if len(neigh) >= 2:
-                skus = [s for s, _ in neigh[:3]]
-                neighbors_total += len(neigh[:3])
-                avg_sim = float(np.mean([x for _, x in neigh[:3]]))
-                out.append({"products": [sku] + skus, "llm_similarity": avg_sim, "source": "llm_volume"})
-                neighbors_added += 1
-                if len(out) >= n:
-                    logger.info(
-                        "[%s] LLM volume generation summary | anchors=%d missing=%d neighbor_sets=%d",
-                        scope,
+            for p in head:
+                sku = p.get("sku")
+                if not sku or sku not in embeddings:
+                    anchors_missing += 1
+                    continue
+                neigh = await self.find_similar_products(
+                    target_sku=sku,
+                    catalog=catalog,
+                    embeddings=embeddings,
+                    top_k=5,
+                    min_similarity=0.0 if relax_filters else volume_floor,
+                    csv_upload_id=csv_upload_id,
+                )
+                if len(neigh) >= 2:
+                    skus = [s for s, _ in neigh[:3]]
+                    neighbors_total += len(neigh[:3])
+                    anchor_meta = catalog_lookup.get(sku)
+                    filtered_skus = []
+                    sims_subset = []
+                    for candidate_sku, sim in neigh[:3]:
+                        if self._passes_prefilter(anchor_meta, catalog_lookup.get(candidate_sku)):
+                            filtered_skus.append(candidate_sku)
+                            sims_subset.append(sim)
+                    if not filtered_skus:
+                        continue
+                    avg_sim = float(np.mean(sims_subset))
+                    out.append({"products": [sku] + filtered_skus, "llm_similarity": avg_sim, "source": "llm_volume"})
+                    neighbors_added += 1
+                    if len(out) >= n:
+                        logger.info(
+                            "[%s] LLM volume generation summary | anchors=%d missing=%d neighbor_sets=%d",
+                            scope,
                         anchors_total,
                         anchors_missing,
                         neighbors_added,

@@ -12,6 +12,7 @@ import random
 import time
 from collections import defaultdict
 import os
+import contextlib
 
 from services.storage import storage
 from services.ai_copy_generator import AICopyGenerator
@@ -31,6 +32,13 @@ from services.ml.fallback_ladder import FallbackLadder
 from services.obs.metrics import metrics_collector
 from services.feature_flags import feature_flags
 from services.progress_tracker import update_generation_progress
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import SpanKind
+except ImportError:  # pragma: no cover - optional dependency
+    trace = None
+    SpanKind = None
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +62,22 @@ class BundleGenerator:
         self.optimization_engine = EnterpriseOptimizationEngine()
         self.constraint_manager = EnterpriseConstraintManager()
         self.performance_monitor = EnterprisePerformanceMonitor()
-        
+
         # Initialize small shop fallback system
         self.fallback_ladder = FallbackLadder(storage)
+
+        self._tracer = trace.get_tracer(__name__) if trace else None
+
+    @contextlib.contextmanager
+    def _start_span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        if not self._tracer or not SpanKind:
+            yield None
+            return
+        with self._tracer.start_as_current_span(name, kind=SpanKind.INTERNAL) as span:
+            if attributes:
+                for key, value in attributes.items():
+                    span.set_attribute(key, value)
+            yield span
         
         # Bundle configuration
         self.bundle_types = ['FBT', 'VOLUME_DISCOUNT', 'MIX_MATCH', 'BXGY', 'FIXED']
@@ -1433,49 +1454,54 @@ class BundleGenerator:
                 for i in range(0, len(bundles_for_copy), batch_size):
                     batch_start = time.time()
                     batch = bundles_for_copy[i:i+batch_size]
-
-                    # Generate AI copy for batch in parallel
-                    try:
-                        copy_tasks = []
-                        copy_inputs = []
-                        for rec in batch:
-                            bundle_type = rec.get("bundle_type") or rec.get("type") or "MIX_MATCH"
-                            products = _normalize_products(rec.get("products"))
-                            objective = rec.get("objective", "")
-                            copy_tasks.append(
-                                self.ai_generator.generate_bundle_copy(
-                                    products,
-                                    bundle_type,
-                                    objective,
+                    span_attrs = {
+                        "csv_upload_id": csv_upload_id,
+                        "batch_index": i // batch_size,
+                        "batch_size": len(batch),
+                    }
+                    with self._start_span("bundle_generator.ai_copy_batch", span_attrs):
+                        # Generate AI copy for batch in parallel
+                        try:
+                            copy_tasks = []
+                            copy_inputs = []
+                            for rec in batch:
+                                bundle_type = rec.get("bundle_type") or rec.get("type") or "MIX_MATCH"
+                                products = _normalize_products(rec.get("products"))
+                                objective = rec.get("objective", "")
+                                copy_tasks.append(
+                                    self.ai_generator.generate_bundle_copy(
+                                        products,
+                                        bundle_type,
+                                        objective,
+                                    )
                                 )
-                            )
-                            copy_inputs.append((rec, products, bundle_type))
-                        copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
-                    except Exception as exc:
-                        logger.exception("Error scheduling AI copy generation batch")
-                        copy_inputs = [
-                            (
-                                rec,
-                                _normalize_products(rec.get("products")),
-                                rec.get("bundle_type") or rec.get("type") or "MIX_MATCH",
-                            )
-                            for rec in batch
-                        ]
-                        copy_results = [exc] * len(copy_inputs)
+                                copy_inputs.append((rec, products, bundle_type))
+                            copy_results = await asyncio.gather(*copy_tasks, return_exceptions=True)
+                        except Exception as exc:
+                            logger.exception("Error scheduling AI copy generation batch")
+                            copy_inputs = [
+                                (
+                                    rec,
+                                    _normalize_products(rec.get("products")),
+                                    rec.get("bundle_type") or rec.get("type") or "MIX_MATCH",
+                                )
+                                for rec in batch
+                            ]
+                            copy_results = [exc] * len(copy_inputs)
 
-                    # Assign results back to recommendations
-                    for (rec, products, bundle_type), result in zip(copy_inputs, copy_results):
-                        if isinstance(result, Exception):
-                            logger.warning(f"Error generating AI copy for bundle type {bundle_type}: {result}")
-                            rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
-                        elif not result:
-                            logger.warning(f"Empty AI copy response for bundle type {bundle_type}; using fallback copy")
-                            rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
-                        else:
-                            rec["ai_copy"] = result
+                        # Assign results back to recommendations
+                        for (rec, products, bundle_type), result in zip(copy_inputs, copy_results):
+                            if isinstance(result, Exception):
+                                logger.warning(f"Error generating AI copy for bundle type {bundle_type}: {result}")
+                                rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
+                            elif not result:
+                                logger.warning(f"Empty AI copy response for bundle type {bundle_type}; using fallback copy")
+                                rec["ai_copy"] = self.ai_generator.generate_fallback_copy(products, bundle_type)
+                            else:
+                                rec["ai_copy"] = result
 
-                    batch_duration = int((time.time() - batch_start) * 1000)
-                    logger.info(f"[{csv_upload_id}] AI Copy batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size} completed in {batch_duration}ms")
+                        batch_duration = int((time.time() - batch_start) * 1000)
+                        logger.info(f"[{csv_upload_id}] AI Copy batch {i//batch_size + 1}/{(len(bundles_for_copy) + batch_size - 1)//batch_size} completed in {batch_duration}ms")
 
                 ai_copy_duration = int((time.time() - ai_copy_start) * 1000)
                 logger.info(f"[{csv_upload_id}] Phase 8: AI Copy Generation - COMPLETED in {ai_copy_duration}ms")
@@ -1503,7 +1529,11 @@ class BundleGenerator:
             if final_recommendations and csv_upload_id:
                 storage_start = time.time()
                 logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - STARTED | bundles={len(final_recommendations)}")
-                await self.store_recommendations(final_recommendations, csv_upload_id)
+                with self._start_span(
+                    "bundle_generator.persist_recommendations",
+                    {"csv_upload_id": csv_upload_id, "bundle_count": len(final_recommendations)},
+                ):
+                    await self.store_recommendations(final_recommendations, csv_upload_id)
                 storage_duration = int((time.time() - storage_start) * 1000)
                 logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - COMPLETED in {storage_duration}ms")
                 metrics["phase_timings"]["phase_9_storage"] = storage_duration
