@@ -259,12 +259,36 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 generator = BundleGenerator()
 
                 is_first_install = False
+                preflight_info = None
+
                 if QUICK_START_ENABLED and not resume_only:
                     try:
-                        is_first_install = await storage.is_first_time_install(shop_id)
-                        logger.info(f"Shop {shop_id} first-time install check: {is_first_install}")
+                        # OPTIMIZATION: Use consolidated pre-flight query (single DB round-trip)
+                        preflight_info = await storage.get_quick_start_preflight_info(csv_upload_id, shop_id)
+                        is_first_install = preflight_info["is_first_time_install"]
+
+                        logger.info(
+                            f"[{csv_upload_id}] Pre-flight check complete:\n"
+                            f"  First-time install: {is_first_install}\n"
+                            f"  Existing quick-start bundles: {preflight_info['quick_start_bundle_count']}\n"
+                            f"  Upload status: {preflight_info['csv_upload_status']}"
+                        )
+
+                        # Skip quick-start if bundles already exist
+                        if preflight_info["has_existing_quick_start"]:
+                            logger.info(
+                                f"[{csv_upload_id}] Skipping quick-start: "
+                                f"{preflight_info['quick_start_bundle_count']} quick-start bundles already exist"
+                            )
+                            is_first_install = False
                     except Exception as e:
-                        logger.warning(f"Failed to check first-time install status: {e}")
+                        logger.warning(f"Failed to check pre-flight status: {e}")
+                        # Fall back to individual check
+                        try:
+                            is_first_install = await storage.is_first_time_install(shop_id)
+                            logger.info(f"Shop {shop_id} first-time install check (fallback): {is_first_install}")
+                        except Exception as fallback_e:
+                            logger.warning(f"Fallback first-time install check also failed: {fallback_e}")
 
                 # FAST PATH: Quick-start mode for first-time installations
                 if is_first_install and QUICK_START_ENABLED:
