@@ -1263,7 +1263,281 @@ class BundleGenerator:
                 serialized[key] = str(value) if value is not None else None
         
         return serialized
-    
+
+    async def generate_quick_start_bundles(
+        self,
+        csv_upload_id: str,
+        max_products: int = 50,
+        max_bundles: int = 10,
+        timeout_seconds: int = 120
+    ) -> Dict[str, Any]:
+        """Generate quick preview bundles for first-time installations.
+
+        This is an optimized fast-path that:
+        - Limits to top 50 products by sales volume
+        - Uses only 1-2 high-priority objectives
+        - Has aggressive 2-minute timeout
+        - Generates 10 bundles for immediate preview
+        - Skips expensive ML phases
+
+        Args:
+            csv_upload_id: Upload ID to process
+            max_products: Maximum products to consider (default: 50)
+            max_bundles: Maximum bundles to generate (default: 10)
+            timeout_seconds: Hard timeout in seconds (default: 120)
+
+        Returns:
+            Dict with recommendations, metrics, and quick_start flag
+        """
+        if not csv_upload_id:
+            raise ValueError("csv_upload_id is required")
+
+        logger.info(
+            f"[{csv_upload_id}] ========== QUICK-START BUNDLE GENERATION ==========\n"
+            f"  Max products: {max_products}\n"
+            f"  Max bundles: {max_bundles}\n"
+            f"  Timeout: {timeout_seconds}s"
+        )
+
+        pipeline_start = time.time()
+
+        # Set aggressive deadline
+        self._current_deadline = Deadline(timeout_seconds)
+
+        await update_generation_progress(
+            csv_upload_id,
+            step="enrichment",
+            progress=10,
+            status="in_progress",
+            message="Quick-start: Loading top products…",
+        )
+
+        try:
+            # PHASE 1: Load and enrich order data (simplified)
+            phase1_start = time.time()
+            order_lines = await storage.get_order_lines(csv_upload_id)
+
+            # Limit to top products by sales volume
+            from collections import Counter
+            sku_sales = Counter()
+            for line in order_lines:
+                sku = getattr(line, 'sku', None)
+                quantity = getattr(line, 'quantity', 0) or 0
+                if sku:
+                    sku_sales[sku] += quantity
+
+            # Get top N products
+            top_skus = [sku for sku, _ in sku_sales.most_common(max_products)]
+            logger.info(f"[{csv_upload_id}] Quick-start: Selected top {len(top_skus)} products")
+
+            # Filter order lines to only include top products
+            filtered_lines = [
+                line for line in order_lines
+                if getattr(line, 'sku', None) in top_skus
+            ]
+
+            phase1_duration = (time.time() - phase1_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="scoring",
+                progress=40,
+                status="in_progress",
+                message=f"Quick-start: Analyzing {len(top_skus)} products…",
+            )
+
+            # PHASE 2: Simple objective scoring (only high-priority objectives)
+            phase2_start = time.time()
+
+            # Use only 2 high-priority objectives for speed
+            quick_objectives = ['increase_aov', 'clear_slow_movers']
+
+            catalog = await storage.get_catalog_snapshots_map(csv_upload_id)
+
+            # Simple scoring based on inventory flags
+            product_scores = {}
+            for sku in top_skus:
+                snapshot = catalog.get(sku)
+                if not snapshot:
+                    continue
+
+                score = 0.5  # Base score
+
+                # Boost slow movers
+                if getattr(snapshot, 'is_slow_mover', False):
+                    score += 0.3
+
+                # Boost high-margin products
+                if getattr(snapshot, 'is_high_margin', False):
+                    score += 0.2
+
+                product_scores[sku] = score
+
+            phase2_duration = (time.time() - phase2_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="ml_generation",
+                progress=70,
+                status="in_progress",
+                message="Quick-start: Generating bundles…",
+            )
+
+            # PHASE 3: Simple bundle generation (no complex ML)
+            phase3_start = time.time()
+
+            # Use association rules from co-purchase patterns
+            from collections import defaultdict
+            sku_pairs = defaultdict(int)
+
+            # Build simple co-occurrence matrix from orders
+            order_groups = defaultdict(list)
+            for line in filtered_lines:
+                order_id = getattr(line, 'order_id', None)
+                sku = getattr(line, 'sku', None)
+                if order_id and sku:
+                    order_groups[order_id].append(sku)
+
+            # Count co-occurrences
+            for order_id, skus in order_groups.items():
+                unique_skus = list(set(skus))
+                for i, sku1 in enumerate(unique_skus):
+                    for sku2 in unique_skus[i+1:]:
+                        pair = tuple(sorted([sku1, sku2]))
+                        sku_pairs[pair] += 1
+
+            # Sort by frequency
+            sorted_pairs = sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)
+
+            # Generate bundles from top pairs
+            recommendations = []
+            for (sku1, sku2), count in sorted_pairs[:max_bundles]:
+                if self._current_deadline and self._current_deadline.expired:
+                    logger.warning(f"[{csv_upload_id}] Quick-start deadline exceeded during bundle creation")
+                    break
+
+                # Get product details
+                product1 = catalog.get(sku1)
+                product2 = catalog.get(sku2)
+
+                if not product1 or not product2:
+                    continue
+
+                # Simple pricing: 10% discount on bundle
+                price1 = getattr(product1, 'price', Decimal('0')) or Decimal('0')
+                price2 = getattr(product2, 'price', Decimal('0')) or Decimal('0')
+
+                total_price = price1 + price2
+                bundle_price = total_price * Decimal('0.9')  # 10% discount
+
+                # Create recommendation
+                rec = {
+                    "id": str(uuid.uuid4()),
+                    "csv_upload_id": csv_upload_id,
+                    "bundle_name": f"Bundle: {getattr(product1, 'product_title', 'Product')} + {getattr(product2, 'product_title', 'Product')}",
+                    "bundle_type": "FBT",  # Frequently Bought Together
+                    "product_skus": [sku1, sku2],
+                    "product_ids": [
+                        getattr(product1, 'product_id', ''),
+                        getattr(product2, 'product_id', '')
+                    ],
+                    "variant_ids": [
+                        getattr(product1, 'variant_id', ''),
+                        getattr(product2, 'variant_id', '')
+                    ],
+                    "bundle_price": float(bundle_price),
+                    "original_price": float(total_price),
+                    "discount_type": "PERCENTAGE",
+                    "discount_value": 10.0,
+                    "confidence": min(0.95, 0.5 + (count / 100)),  # Higher count = higher confidence
+                    "ranking_score": product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5),
+                    "rank_position": len(recommendations) + 1,
+                    "objective": "increase_aov",
+                    "reasoning": f"Often purchased together ({count} times)",
+                    "discount_reference": f"__quick_start_{csv_upload_id}__",
+                    "created_at": datetime.utcnow(),
+                    "updated_at": datetime.utcnow(),
+                }
+
+                recommendations.append(rec)
+
+            phase3_duration = (time.time() - phase3_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=90,
+                status="in_progress",
+                message="Quick-start: Saving bundles…",
+            )
+
+            # PHASE 4: Save recommendations
+            phase4_start = time.time()
+
+            if recommendations:
+                await storage.create_bundle_recommendations(recommendations)
+                logger.info(f"[{csv_upload_id}] Quick-start: Saved {len(recommendations)} preview bundles")
+
+            phase4_duration = (time.time() - phase4_start) * 1000
+
+            total_duration = (time.time() - pipeline_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=100,
+                status="completed",
+                message=f"Quick-start complete: {len(recommendations)} bundles in {total_duration/1000:.1f}s",
+            )
+
+            # Build metrics
+            metrics = {
+                "quick_start_mode": True,
+                "max_products_limit": max_products,
+                "max_bundles_limit": max_bundles,
+                "timeout_seconds": timeout_seconds,
+                "total_recommendations": len(recommendations),
+                "processing_time_ms": total_duration,
+                "phase_timings": {
+                    "phase1_data_loading_ms": phase1_duration,
+                    "phase2_scoring_ms": phase2_duration,
+                    "phase3_generation_ms": phase3_duration,
+                    "phase4_persistence_ms": phase4_duration,
+                },
+                "products_analyzed": len(top_skus),
+                "orders_analyzed": len(order_groups),
+            }
+
+            logger.info(
+                f"[{csv_upload_id}] ========== QUICK-START COMPLETE ==========\n"
+                f"  Bundles: {len(recommendations)}\n"
+                f"  Duration: {total_duration/1000:.2f}s\n"
+                f"  Products: {len(top_skus)}"
+            )
+
+            return {
+                "recommendations": recommendations,
+                "metrics": metrics,
+                "v2_pipeline": False,  # Mark as quick-start, not full v2
+                "quick_start": True,
+                "csv_upload_id": csv_upload_id,
+            }
+
+        except Exception as e:
+            logger.error(f"[{csv_upload_id}] Quick-start generation failed: {e}", exc_info=True)
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="finalization",
+                progress=100,
+                status="failed",
+                message=f"Quick-start failed: {str(e)}",
+            )
+
+            raise
+        finally:
+            self._current_deadline = None
+
     async def generate_bundle_recommendations(self, csv_upload_id: str) -> Dict[str, Any]:
         """Generate bundle recommendations using comprehensive v2 pipeline"""
         if not csv_upload_id:

@@ -797,6 +797,24 @@ class StorageService:
             await session.refresh(status)
             return status
 
+    async def is_first_time_install(self, shop_id: str) -> bool:
+        """Check if this is a first-time installation for a shop.
+
+        Returns True if:
+        - No sync status exists for the shop
+        - Sync status exists but initial_sync_completed is False
+
+        Returns False if initial_sync_completed is True (regular user)
+        """
+        normalized_shop_id = resolve_shop_id(shop_id)
+        async with self.get_session() as session:
+            status = await session.get(ShopSyncStatus, normalized_shop_id)
+            if not status:
+                # No status record = first time
+                return True
+            # Check if initial sync has been completed
+            return not status.initial_sync_completed
+
     async def backfill_bundle_recommendation_shop_ids(self) -> int:
         """Populate missing bundle_recommendations.shop_id values from their CSV uploads."""
         async with self.get_session() as session:
