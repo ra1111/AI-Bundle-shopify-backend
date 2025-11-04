@@ -3752,6 +3752,10 @@ class BundleGenerator:
                 if status and status not in {"active", "available"}:
                     inactive.append(sku)
 
+            # Check environment variable to control inventory validation strictness
+            # INVENTORY_VALIDATION_MODE: "strict" (drop bundles), "warn" (log only), "off" (skip)
+            validation_mode = os.getenv("INVENTORY_VALIDATION_MODE", "warn").lower()
+
             reasons: List[str] = []
             if missing:
                 reasons.append("missing_catalog")
@@ -3761,17 +3765,33 @@ class BundleGenerator:
                 reasons.append("inactive_product")
 
             if reasons and rec_id:
-                dropped.append(
-                    {
-                        "id": rec_id,
-                        "reasons": reasons,
-                        "missing": missing,
-                        "out_of_stock": out_of_stock,
-                        "inactive": inactive,
-                    }
-                )
-                for reason in reasons:
-                    reason_counts[reason] += 1
+                # Log inventory issues as warnings instead of dropping bundles
+                if validation_mode == "strict":
+                    # Original behavior: drop bundles with inventory issues
+                    dropped.append(
+                        {
+                            "id": rec_id,
+                            "reasons": reasons,
+                            "missing": missing,
+                            "out_of_stock": out_of_stock,
+                            "inactive": inactive,
+                        }
+                    )
+                    for reason in reasons:
+                        reason_counts[reason] += 1
+                else:
+                    # Warn mode: log issues but don't drop bundles
+                    logger.warning(
+                        "[%s] Inventory issues for bundle %s (NOT dropping, mode=%s): %s | missing=%s out_of_stock=%s inactive=%s",
+                        csv_upload_id,
+                        rec_id,
+                        validation_mode,
+                        reasons,
+                        missing,
+                        out_of_stock,
+                        inactive,
+                    )
+                    reason_counts["ok_with_warnings"] += 1
             else:
                 reason_counts["ok"] += 1
 
