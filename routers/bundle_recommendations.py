@@ -23,7 +23,18 @@ from services.pipeline_scheduler import pipeline_scheduler
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-BUNDLE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("BUNDLE_GENERATION_TIMEOUT_SECONDS", "320"))
+
+# Timeouts / watchdog — profiling-friendly defaults with env overrides
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# Default: no hard cutoff; use soft watchdog to defer long runs
+BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED = _env_bool("BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED", False)
+BUNDLE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("BUNDLE_GENERATION_TIMEOUT_SECONDS", "360"))
+BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS = int(os.getenv("BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS", "600"))
 
 class GenerateBundlesRequest(BaseModel):
     csvUploadId: Optional[str] = None
@@ -237,41 +248,92 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
             logger.info(f"Status updated: {status_update['previous_status']} -> {status_update['new_status']}")
             
             try:
-                # Generate bundle recommendations with AGGRESSIVE timeout protection
+                # Generate bundle recommendations with configurable timeout strategy:
+                # - Soft watchdog (default) for profiling/large shops: no hard fail, defer to async after SOFT seconds
+                # - Hard timeout (opt-in via env) as circuit-breaker using asyncio.wait_for
                 from services.bundle_generator import BundleGenerator
                 generator = BundleGenerator()
-                
-                # HARD TIMEOUT: Force termination after configured ceiling to protect request lifecycle
+
+                # Soft watchdog task setup (only used when hard timeout is disabled)
+                async def _soft_watchdog(csv_upload_id: str, started_at: float):
+                    check_interval = 10
+                    while True:
+                        await asyncio.sleep(check_interval)
+                        elapsed = time.time() - started_at
+                        if elapsed > BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS:
+                            # Flip to async deferral but DO NOT fail the run
+                            logger.warning(
+                                "Soft watchdog deferring bundle generation after %ds | upload_id=%s",
+                                int(elapsed),
+                                csv_upload_id,
+                            )
+                            try:
+                                await update_generation_progress(
+                                    csv_upload_id,
+                                    step="optimization",
+                                    progress=78,
+                                    status="in_progress",
+                                    message=f"Continuing asynchronously after {int(elapsed)} seconds.",
+                                    metadata={"soft_watchdog_seconds": BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS},
+                                )
+                                await concurrency_controller.atomic_status_update_with_precondition(
+                                    csv_upload_id,
+                                    "bundle_generation_async",
+                                    expected_current_status="generating_bundles",
+                                    additional_fields={
+                                        "bundle_generation_metrics": {
+                                            "async_deferred": True,
+                                            "deferred_at": datetime.utcnow().isoformat(),
+                                            "soft_watchdog_triggered": True,
+                                            "elapsed_seconds": int(elapsed),
+                                        }
+                                    },
+                                )
+                                # Schedule resume and exit watchdog
+                                pipeline_scheduler.schedule(_resume_bundle_generation(csv_upload_id))
+                            except Exception as watchdog_exc:  # pragma: no cover - defensive logging
+                                logger.warning("Soft watchdog encountered an error: %s", watchdog_exc)
+                            return
+
+                logger.info(
+                    "Bundle generation %s: invoking generator with %s",
+                    scope,
+                    f"hard timeout {BUNDLE_GENERATION_TIMEOUT_SECONDS}s" if BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED else "soft watchdog mode",
+                )
+
+                watchdog_task = None
                 try:
-                    logger.info(
-                        f"Bundle generation {scope}: invoking generator with "
-                        f"{BUNDLE_GENERATION_TIMEOUT_SECONDS}s timeout"
-                    )
-                    generation_result = await asyncio.wait_for(
-                        generator.generate_bundle_recommendations(csv_upload_id),
-                        timeout=float(BUNDLE_GENERATION_TIMEOUT_SECONDS),
-                    )
-                    logger.info(f"Bundle generation {scope}: generator completed without timeout")
+                    if BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED:
+                        generation_result = await asyncio.wait_for(
+                            generator.generate_bundle_recommendations(csv_upload_id),
+                            timeout=float(BUNDLE_GENERATION_TIMEOUT_SECONDS),
+                        )
+                        logger.info("Bundle generation %s: generator completed without hard-timeout", scope)
+                    else:
+                        # Launch soft watchdog and run without hard timeout to measure true runtime
+                        watchdog_task = asyncio.create_task(_soft_watchdog(csv_upload_id, start_time))
+                        generation_result = await generator.generate_bundle_recommendations(csv_upload_id)
+                        logger.info("Bundle generation %s: generator completed under soft-watchdog mode", scope)
                 except asyncio.TimeoutError:
                     logger.error(
-                        f"TIMEOUT: Bundle generation exceeded {BUNDLE_GENERATION_TIMEOUT_SECONDS} seconds for "
-                        f"{csv_upload_id}, force terminating"
+                        "TIMEOUT: Bundle generation exceeded %s seconds for %s, force terminating",
+                        BUNDLE_GENERATION_TIMEOUT_SECONDS,
+                        csv_upload_id,
                     )
-                    timeout_message = "Bundle generation timed out after 6 minutes."
+                    timeout_message = f"Bundle generation timed out after {BUNDLE_GENERATION_TIMEOUT_SECONDS} seconds."
                     metrics_payload = {
                         "timeout_error": True,
                         "total_recommendations": 0,
                         "processing_time_ms": BUNDLE_GENERATION_TIMEOUT_SECONDS * 1000,
                         "timeout_reason": f"{BUNDLE_GENERATION_TIMEOUT_SECONDS}_second_hard_limit_exceeded",
                     }
-                    # Return a timeout result instead of letting it hang
                     generation_result = {
                         "recommendations": [],
                         "metrics": metrics_payload,
                         "v2_pipeline": True,
-                        "csv_upload_id": csv_upload_id
+                        "csv_upload_id": csv_upload_id,
                     }
-                    
+
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
@@ -279,15 +341,11 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         status="failed",
                         message=timeout_message,
                     )
-                    
-                    # Try to get any partial results that might have been persisted
+
                     try:
                         partial_recommendations = await storage.get_partial_bundle_recommendations(csv_upload_id)
                         if partial_recommendations:
-                            logger.info(
-                                "Found %d partial results after timeout",
-                                len(partial_recommendations),
-                            )
+                            logger.info("Found %d partial results after timeout", len(partial_recommendations))
                             metrics_payload["partial_recommendations_found"] = len(partial_recommendations)
                     except Exception as exc:
                         logger.warning("Could not retrieve partial results after timeout: %s", exc)
@@ -302,6 +360,12 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         },
                     )
                     return
+                finally:
+                    if watchdog_task:
+                        try:
+                            watchdog_task.cancel()
+                        except Exception:
+                            pass
                 
                 if isinstance(generation_result, dict) and generation_result.get("async_deferred"):
                     metrics = generation_result.get("metrics", {})
@@ -504,14 +568,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
         await concurrency_controller.atomic_status_update_with_precondition(
             csv_upload_id, 
             "bundle_generation_failed",
-            additional_fields={"error_message": f"Process timeout after 6 minutes: {str(e)}"}
+            additional_fields={"error_message": f"Process timeout after {BUNDLE_GENERATION_TIMEOUT_SECONDS} seconds: {str(e)}"}
         )
         await update_generation_progress(
             csv_upload_id,
             step="finalization",
             progress=100,
             status="failed",
-            message=f"Process timeout after 6 minutes: {e}",
+            message=f"Process timeout after {BUNDLE_GENERATION_TIMEOUT_SECONDS} seconds: {e}",
         )
         return
         
