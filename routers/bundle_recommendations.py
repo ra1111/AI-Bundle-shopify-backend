@@ -34,7 +34,7 @@ def _env_bool(name: str, default: bool) -> bool:
 # Default: no hard cutoff; use soft watchdog to defer long runs
 BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED = _env_bool("BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED", False)
 BUNDLE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("BUNDLE_GENERATION_TIMEOUT_SECONDS", "360"))
-BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS = int(os.getenv("BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS", "600"))
+BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS = int(os.getenv("BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS", "1200"))
 
 class GenerateBundlesRequest(BaseModel):
     csvUploadId: Optional[str] = None
