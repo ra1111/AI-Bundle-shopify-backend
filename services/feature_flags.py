@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 class FeatureFlag:
     """Feature flag configuration"""
     key: str
-    value: bool
+    value: Any  # Can be bool, int, float, str, list, dict
     description: str
     shop_id: Optional[str] = None
     updated_at: Optional[datetime] = None
@@ -55,7 +55,9 @@ class FeatureFlagsManager:
             # Data mapping controls
             "data_mapping.auto_reenrich_on_csv": True,
             "data_mapping.reset_cache_on_new_data": True,
+            "data_mapping.cache_ttl_seconds": 1800,
             "data_mapping.unresolved_cache_ttl_seconds": 600,
+            "data_mapping.target_chunk_p95_ms": 800,
             "data_mapping.enable_run_scope_fallback": True,
             "data_mapping.prefetch_enabled": True,
             "data_mapping.concurrent_mapping": True,
@@ -73,6 +75,21 @@ class FeatureFlagsManager:
             "bundling.fallback_force_top_pairs": True,
             "bundling.fallback_force_pair_limit": 12,
             "bundling.llm_adaptive_similarity": True,
+
+            # Staged publishing configuration
+            "bundling.staged_publish_enabled": True,
+            "bundling.staged_thresholds": [3, 5, 10, 20, 40],
+            "bundling.staged_hard_cap": 40,
+            "bundling.staged_prefer_high_score": True,
+            "bundling.staged_cycle_interval_seconds": 0,
+            "bundling.staged.soft_guard_seconds": 45,
+            "bundling.staged.wave_batch_size": 10,
+            "bundling.staged.backpressure_queue_threshold": 0,
+            "bundling.staged.backpressure_cooldown_waves": 1,
+
+            # Finalization concurrency configuration
+            "bundling.finalize.concurrent_tracks.copy": 3,
+            "bundling.finalize.concurrent_tracks.pricing": 2,
 
             # Analytics and insights
             "analytics.insights_engine": True,
@@ -137,22 +154,25 @@ class FeatureFlagsManager:
             # Fall back to default flags
             self._flag_cache = self.default_flags.copy()
     
-    def get_flag(self, flag_key: str, shop_id: Optional[str] = None, default: bool = False) -> bool:
-        """Get feature flag value with shop-specific overrides"""
+    def get_flag(self, flag_key: str, shop_id: Optional[str] = None, default: Any = False) -> Any:
+        """Get feature flag value with shop-specific overrides
+
+        Supports both boolean flags and configuration values (numbers, strings, lists, dicts)
+        """
         try:
-            # Check for emergency kill switches first
-            if self._is_killed_by_emergency_switch(flag_key):
+            # Check for emergency kill switches first (only for boolean flags)
+            if isinstance(default, bool) and self._is_killed_by_emergency_switch(flag_key):
                 return False
-            
+
             # Check shop-specific override
             if shop_id and shop_id in self._shop_overrides:
                 shop_flags = self._shop_overrides[shop_id]
                 if flag_key in shop_flags:
                     return shop_flags[flag_key]
-            
+
             # Check global flag
             return self._flag_cache.get(flag_key, default)
-            
+
         except Exception as e:
             logger.warning(f"Error getting flag {flag_key}: {e}")
             return default
@@ -178,15 +198,15 @@ class FeatureFlagsManager:
             logger.error(f"Error getting all flags: {e}")
             return self.default_flags.copy()
     
-    async def set_flag(self, flag_key: str, value: bool, shop_id: Optional[str] = None, 
+    async def set_flag(self, flag_key: str, value: Any, shop_id: Optional[str] = None,
                       updated_by: str = "system") -> bool:
-        """Set feature flag value"""
+        """Set feature flag or configuration value"""
         try:
             # Validate flag key
             if not self._is_valid_flag_key(flag_key):
                 logger.warning(f"Invalid flag key: {flag_key}")
                 return False
-            
+
             # Update cache
             if shop_id:
                 if shop_id not in self._shop_overrides:
@@ -194,16 +214,16 @@ class FeatureFlagsManager:
                 self._shop_overrides[shop_id][flag_key] = value
             else:
                 self._flag_cache[flag_key] = value
-            
+
             # Persist to storage
             await self._persist_flag(flag_key, value, shop_id, updated_by)
-            
+
             # Record change
             self._record_flag_change(flag_key, value, shop_id, updated_by)
-            
+
             logger.info(f"Set flag {flag_key}={value} for shop={shop_id} by {updated_by}")
             return True
-            
+
         except Exception as e:
             logger.error(f"Error setting flag {flag_key}: {e}")
             return False
@@ -331,13 +351,13 @@ class FeatureFlagsManager:
         except Exception as e:
             logger.warning(f"Could not load flags from storage: {e}")
     
-    async def _persist_flag(self, flag_key: str, value: bool, shop_id: Optional[str], updated_by: str):
+    async def _persist_flag(self, flag_key: str, value: Any, shop_id: Optional[str], updated_by: str):
         """Persist feature flag to storage"""
         try:
             # This would persist to database in a real implementation
             # await storage.upsert_feature_flag(flag_key, value, shop_id, updated_by)
             pass
-            
+
         except Exception as e:
             logger.warning(f"Could not persist flag to storage: {e}")
     
@@ -393,7 +413,7 @@ class FeatureFlagsManager:
         # Allow alphanumeric, dots, and underscores
         return all(c.isalnum() or c in '._' for c in flag_key)
     
-    def _record_flag_change(self, flag_key: str, value: bool, shop_id: Optional[str], updated_by: str):
+    def _record_flag_change(self, flag_key: str, value: Any, shop_id: Optional[str], updated_by: str):
         """Record flag change in history"""
         change_record = {
             "timestamp": datetime.now().isoformat(),
@@ -402,9 +422,9 @@ class FeatureFlagsManager:
             "shop_id": shop_id,
             "updated_by": updated_by
         }
-        
+
         self.change_history.append(change_record)
-        
+
         # Keep only last 100 changes
         if len(self.change_history) > 100:
             self.change_history = self.change_history[-100:]
