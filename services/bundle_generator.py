@@ -1317,24 +1317,93 @@ class BundleGenerator:
             phase1_start = time.time()
             order_lines = await storage.get_order_lines(csv_upload_id)
 
+            logger.info(
+                f"[{csv_upload_id}] Quick-start Phase 1: Loaded {len(order_lines)} order lines"
+            )
+
+            # Early exit check: insufficient data
+            if len(order_lines) < 10:
+                logger.warning(
+                    f"[{csv_upload_id}] Quick-start: Insufficient data - only {len(order_lines)} order lines. "
+                    f"Need at least 10 for meaningful bundles."
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=100,
+                    status="completed",
+                    message=f"Quick-start complete: 0 bundles (insufficient data: {len(order_lines)} orders)",
+                )
+                return {
+                    "recommendations": [],
+                    "metrics": {
+                        "quick_start_mode": True,
+                        "total_recommendations": 0,
+                        "exit_reason": "insufficient_order_lines",
+                        "order_lines_count": len(order_lines),
+                    },
+                    "quick_start": True,
+                    "csv_upload_id": csv_upload_id,
+                }
+
             # Limit to top products by sales volume
             from collections import Counter
             sku_sales = Counter()
+            unique_skus = set()
             for line in order_lines:
                 sku = getattr(line, 'sku', None)
                 quantity = getattr(line, 'quantity', 0) or 0
                 if sku:
+                    unique_skus.add(sku)
                     sku_sales[sku] += quantity
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Found {len(unique_skus)} unique SKUs, "
+                f"total quantity sold: {sum(sku_sales.values())}"
+            )
+
+            # Early exit check: insufficient product variety
+            if len(unique_skus) < 2:
+                logger.warning(
+                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_skus)} unique SKUs. "
+                    f"Need at least 2 for bundles."
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=100,
+                    status="completed",
+                    message=f"Quick-start complete: 0 bundles (insufficient variety: {len(unique_skus)} products)",
+                )
+                return {
+                    "recommendations": [],
+                    "metrics": {
+                        "quick_start_mode": True,
+                        "total_recommendations": 0,
+                        "exit_reason": "insufficient_product_variety",
+                        "unique_skus": len(unique_skus),
+                    },
+                    "quick_start": True,
+                    "csv_upload_id": csv_upload_id,
+                }
 
             # Get top N products
             top_skus = [sku for sku, _ in sku_sales.most_common(max_products)]
-            logger.info(f"[{csv_upload_id}] Quick-start: Selected top {len(top_skus)} products")
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Selected top {len(top_skus)} products from {len(unique_skus)} total"
+            )
 
             # Filter order lines to only include top products
+            top_skus_set = set(top_skus)
             filtered_lines = [
                 line for line in order_lines
-                if getattr(line, 'sku', None) in top_skus
+                if getattr(line, 'sku', None) in top_skus_set
             ]
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Filtered {len(order_lines)} → {len(filtered_lines)} order lines "
+                f"(kept {len(filtered_lines)/len(order_lines)*100:.1f}%)"
+            )
 
             phase1_duration = (time.time() - phase1_start) * 1000
 
@@ -1398,20 +1467,86 @@ class BundleGenerator:
                 if order_id and sku:
                     order_groups[order_id].append(sku)
 
+            logger.info(
+                f"[{csv_upload_id}] Quick-start Phase 3: Built order groups from {len(order_groups)} unique orders"
+            )
+
+            # Early exit check: insufficient orders
+            if len(order_groups) < 5:
+                logger.warning(
+                    f"[{csv_upload_id}] Quick-start: Insufficient orders - only {len(order_groups)} unique orders. "
+                    f"Need at least 5 for meaningful co-purchase patterns."
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=100,
+                    status="completed",
+                    message=f"Quick-start complete: 0 bundles (insufficient orders: {len(order_groups)})",
+                )
+                return {
+                    "recommendations": [],
+                    "metrics": {
+                        "quick_start_mode": True,
+                        "total_recommendations": 0,
+                        "exit_reason": "insufficient_unique_orders",
+                        "unique_orders": len(order_groups),
+                        "unique_skus": len(unique_skus),
+                    },
+                    "quick_start": True,
+                    "csv_upload_id": csv_upload_id,
+                }
+
             # Count co-occurrences
             for order_id, skus in order_groups.items():
-                unique_skus = list(set(skus))
-                for i, sku1 in enumerate(unique_skus):
-                    for sku2 in unique_skus[i+1:]:
+                unique_skus_in_order = list(set(skus))
+                for i, sku1 in enumerate(unique_skus_in_order):
+                    for sku2 in unique_skus_in_order[i+1:]:
                         pair = tuple(sorted([sku1, sku2]))
                         sku_pairs[pair] += 1
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Found {len(sku_pairs)} unique co-purchase pairs"
+            )
+
+            # Early exit check: no co-purchase pairs
+            if len(sku_pairs) == 0:
+                logger.warning(
+                    f"[{csv_upload_id}] Quick-start: No co-purchase pairs found. "
+                    f"All orders contain single items only."
+                )
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=100,
+                    status="completed",
+                    message="Quick-start complete: 0 bundles (no multi-item orders)",
+                )
+                return {
+                    "recommendations": [],
+                    "metrics": {
+                        "quick_start_mode": True,
+                        "total_recommendations": 0,
+                        "exit_reason": "no_copurchase_pairs",
+                        "unique_orders": len(order_groups),
+                        "copurchase_pairs": 0,
+                    },
+                    "quick_start": True,
+                    "csv_upload_id": csv_upload_id,
+                }
 
             # Sort by frequency
             sorted_pairs = sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)
 
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Top pair frequency: {sorted_pairs[0][1] if sorted_pairs else 0}, "
+                f"evaluating top {min(len(sorted_pairs), max_bundles)} candidates"
+            )
+
             # Generate bundles from top pairs
             recommendations = []
-            for (sku1, sku2), count in sorted_pairs[:max_bundles]:
+            catalog_misses = 0
+            for (sku1, sku2), count in sorted_pairs[:max_bundles * 3]:  # Try 3x to account for catalog misses
                 if self._current_deadline and self._current_deadline.expired:
                     logger.warning(f"[{csv_upload_id}] Quick-start deadline exceeded during bundle creation")
                     break
@@ -1421,7 +1556,12 @@ class BundleGenerator:
                 product2 = catalog.get(sku2)
 
                 if not product1 or not product2:
+                    catalog_misses += 1
                     continue
+
+                # Stop if we have enough bundles
+                if len(recommendations) >= max_bundles:
+                    break
 
                 # Simple pricing: 10% discount on bundle
                 price1 = getattr(product1, 'price', Decimal('0')) or Decimal('0')
@@ -1460,6 +1600,12 @@ class BundleGenerator:
                 }
 
                 recommendations.append(rec)
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start Phase 3 complete: "
+                f"Generated {len(recommendations)} bundles from {len(sorted_pairs)} pair candidates "
+                f"(catalog misses: {catalog_misses})"
+            )
 
             phase3_duration = (time.time() - phase3_start) * 1000
 
@@ -1503,6 +1649,17 @@ class BundleGenerator:
                     "phase2_scoring_ms": phase2_duration,
                     "phase3_generation_ms": phase3_duration,
                     "phase4_persistence_ms": phase4_duration,
+                },
+                # Detailed filtering funnel metrics
+                "funnel": {
+                    "order_lines_loaded": len(order_lines),
+                    "unique_skus_found": len(unique_skus),
+                    "top_skus_selected": len(top_skus),
+                    "order_lines_after_filter": len(filtered_lines),
+                    "unique_orders": len(order_groups),
+                    "copurchase_pairs_found": len(sku_pairs),
+                    "catalog_misses": catalog_misses,
+                    "final_bundles": len(recommendations),
                 },
                 "products_analyzed": len(top_skus),
                 "orders_analyzed": len(order_groups),

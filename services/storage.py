@@ -8,6 +8,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from typing import List, Optional, Dict, Any, Tuple
 from types import SimpleNamespace
 import logging
+import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from sqlalchemy.exc import ProgrammingError
@@ -27,6 +28,11 @@ class StorageService:
     # ---------- NEW: helpers & defaults ----------
 
     ORDER_LINE_TEXT_DEFAULT = "unspecified"
+
+    # Pre-flight check cache: {csv_upload_id: (result, timestamp)}
+    # Caches results for 60 seconds to handle rapid retries
+    _preflight_cache: Dict[str, Tuple[Dict[str, Any], float]] = {}
+    _PREFLIGHT_CACHE_TTL = 60  # seconds
 
     def _table_column_names(self, table):
         return {c.name for c in table.columns}
@@ -814,6 +820,89 @@ class StorageService:
                 return True
             # Check if initial sync has been completed
             return not status.initial_sync_completed
+
+    async def get_quick_start_preflight_info(self, csv_upload_id: str, shop_id: str) -> Dict[str, Any]:
+        """Consolidated pre-flight check for quick-start bundle generation.
+
+        Performs a single optimized query to gather all information needed for quick-start decision:
+        - is_first_time_install: Whether this is a first-time installation
+        - has_existing_quick_start: Whether quick-start bundles already exist for this upload
+        - csv_upload_status: Current status of the CSV upload
+
+        This reduces database round-trips from 3+ queries to 1 query.
+        Results are cached for 60 seconds to handle rapid retries.
+
+        Returns:
+            Dict with keys:
+            - is_first_time_install (bool)
+            - has_existing_quick_start (bool)
+            - quick_start_bundle_count (int)
+            - csv_upload_status (str or None)
+        """
+        # Check cache first
+        now = time.time()
+        if csv_upload_id in self._preflight_cache:
+            cached_result, cached_time = self._preflight_cache[csv_upload_id]
+            if now - cached_time < self._PREFLIGHT_CACHE_TTL:
+                logger.debug(
+                    f"[{csv_upload_id}] Pre-flight check cache HIT "
+                    f"(age: {now - cached_time:.1f}s)"
+                )
+                return cached_result
+            else:
+                # Cache expired, remove it
+                del self._preflight_cache[csv_upload_id]
+
+        normalized_shop_id = resolve_shop_id(shop_id)
+
+        async with self.get_session() as session:
+            # Single query to get all pre-flight info using a SQL query with JOINs
+            query = text("""
+                SELECT
+                    COALESCE(sss.initial_sync_completed, FALSE) as sync_completed,
+                    cu.status as upload_status,
+                    COUNT(br.id) FILTER (WHERE br.discount_reference LIKE :quick_start_pattern) as quick_start_count
+                FROM csv_uploads cu
+                LEFT JOIN shop_sync_status sss ON sss.shop_id = cu.shop_id
+                LEFT JOIN bundle_recommendations br ON br.csv_upload_id = cu.id
+                WHERE cu.id = :csv_upload_id
+                GROUP BY sss.initial_sync_completed, cu.status
+            """)
+
+            result = await session.execute(
+                query,
+                {
+                    "csv_upload_id": csv_upload_id,
+                    "quick_start_pattern": "__quick_start_%"
+                }
+            )
+            row = result.fetchone()
+
+            if not row:
+                # CSV upload not found - assume first install, no existing bundles
+                return {
+                    "is_first_time_install": True,
+                    "has_existing_quick_start": False,
+                    "quick_start_bundle_count": 0,
+                    "csv_upload_status": None,
+                }
+
+            sync_completed = row[0] if row[0] is not None else False
+            upload_status = row[1]
+            quick_start_count = row[2] if row[2] is not None else 0
+
+            result = {
+                "is_first_time_install": not sync_completed,
+                "has_existing_quick_start": quick_start_count > 0,
+                "quick_start_bundle_count": int(quick_start_count),
+                "csv_upload_status": upload_status,
+            }
+
+            # Store in cache
+            self._preflight_cache[csv_upload_id] = (result, time.time())
+            logger.debug(f"[{csv_upload_id}] Pre-flight check cache MISS, result cached")
+
+            return result
 
     async def backfill_bundle_recommendation_shop_ids(self) -> int:
         """Populate missing bundle_recommendations.shop_id values from their CSV uploads."""
