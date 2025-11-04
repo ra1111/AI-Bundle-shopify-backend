@@ -48,11 +48,13 @@ class EnterpriseOptimizationEngine:
     """Advanced multi-objective optimization engine for enterprise bundle recommendations"""
     
     def __init__(self):
-        self.population_size = 100
-        self.max_generations = 50
-        self.mutation_rate = 0.1
+        # Performance optimized: Reduced from 5,000 to 500 evaluations (10x faster)
+        # 100 × 50 generations = 5,000 evaluations → 50 × 10 = 500 evaluations
+        self.population_size = 50  # Reduced from 100
+        self.max_generations = 10  # Reduced from 50
+        self.mutation_rate = 0.15  # Increased from 0.1 to maintain diversity
         self.crossover_rate = 0.8
-        self.elite_size = 10
+        self.elite_size = 5  # Proportional reduction from 10
         
         # Performance optimization
         self.cache_enabled = True
@@ -75,6 +77,7 @@ class EnterpriseOptimizationEngine:
         # Caching for performance
         self._objective_cache = {}
         self._constraint_cache = {}
+        self._catalog_cache = {}  # NEW: Cache catalog data to avoid repeated DB queries
         
     async def optimize_bundle_portfolio(self, 
                                       candidates: List[Dict[str, Any]], 
@@ -102,10 +105,15 @@ class EnterpriseOptimizationEngine:
             # Validate inputs
             if not candidates:
                 return {"pareto_solutions": [], "metrics": {"error": "No candidates provided"}}
-            
+
             if not objectives:
                 objectives = [OptimizationObjective.MAXIMIZE_REVENUE, OptimizationObjective.MAXIMIZE_MARGIN]
-            
+
+            # OPTIMIZATION: Pre-load catalog ONCE for all evaluations (avoids repeated DB queries)
+            logger.info(f"Pre-caching catalog data for optimization (csv_upload_id={csv_upload_id})")
+            self._catalog_cache[csv_upload_id] = await storage.get_catalog_snapshots_map(csv_upload_id)
+            logger.info(f"Pre-cached {len(self._catalog_cache[csv_upload_id])} catalog items for optimization")
+
             # Initialize optimization population
             population = await self._initialize_population(candidates, csv_upload_id)
             
@@ -434,9 +442,13 @@ class EnterpriseOptimizationEngine:
         try:
             products = candidate.get("products", [])
             confidence = float(candidate.get("confidence", 0))
-            
-            # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+
+            # OPTIMIZATION: Use pre-cached catalog instead of querying DB
+            catalog_map = self._catalog_cache.get(csv_upload_id)
+            if not catalog_map:
+                # Fallback (should not happen if pre-caching worked)
+                logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
+                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
             
             # Get product pricing data
             total_value = Decimal('0')
@@ -460,13 +472,16 @@ class EnterpriseOptimizationEngine:
         """Compute profit margin score for bundle"""
         try:
             products = candidate.get("products", [])
-            
+
             # Get product cost/margin data from objective flags
             total_margin = 0.0
             item_count = 0
-            
-            # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+
+            # OPTIMIZATION: Use pre-cached catalog instead of querying DB
+            catalog_map = self._catalog_cache.get(csv_upload_id)
+            if not catalog_map:
+                logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
+                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
             catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
             
             for item in catalog_items:
@@ -487,10 +502,13 @@ class EnterpriseOptimizationEngine:
         """Compute inventory risk score (lower risk = higher score)"""
         try:
             products = candidate.get("products", [])
-            
+
             total_risk = 0.0
-            # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            # OPTIMIZATION: Use pre-cached catalog instead of querying DB
+            catalog_map = self._catalog_cache.get(csv_upload_id)
+            if not catalog_map:
+                logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
+                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
             catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
             
             for item in catalog_items:
@@ -535,13 +553,16 @@ class EnterpriseOptimizationEngine:
         try:
             products = candidate.get("products", [])
             lift = float(candidate.get("lift", 1))
-            
+
             # Higher lift indicates better cross-selling potential
             cross_sell_base = min(1.0, (lift - 1) / 2)
-            
+
             # Bonus for multi-category bundles
-            # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            # OPTIMIZATION: Use pre-cached catalog instead of querying DB
+            catalog_map = self._catalog_cache.get(csv_upload_id)
+            if not catalog_map:
+                logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
+                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
             catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
             categories = set()
             for item in catalog_items:
@@ -560,10 +581,13 @@ class EnterpriseOptimizationEngine:
         """Compute cannibalization risk score (lower cannibalization = higher score)"""
         try:
             products = candidate.get("products", [])
-            
+
             # Check for products in same category (potential cannibalization)
-            # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            # OPTIMIZATION: Use pre-cached catalog instead of querying DB
+            catalog_map = self._catalog_cache.get(csv_upload_id)
+            if not catalog_map:
+                logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
+                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
             catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
             categories = []
             for item in catalog_items:

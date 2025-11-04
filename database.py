@@ -45,22 +45,31 @@ if DATABASE_URL:
         # We only use JSONB in our models anyway
         pass
 
+    # OPTIMIZATION: Tuned connection pool for high-concurrency ML operations
+    # Supports parallel candidate generation, embedding batches, and optimization engine
     engine = create_async_engine(
         DATABASE_URL,
         echo=os.getenv("NODE_ENV") == "development",
         pool_size=50,  # Increased to support 40+ parallel Phase 3 tasks
-        max_overflow=10,  # Total max: 60 connections
-        pool_pre_ping=True,
-        pool_recycle=1800,
-        pool_timeout=15,
+        max_overflow=20,  # Increased from 10 to 20 (Total max: 70 connections)
+        pool_pre_ping=True,  # Verify connections before use
+        pool_recycle=1800,  # Recycle connections after 30 minutes
+        pool_timeout=20,  # Increased from 15 to 20 seconds for busy periods
         # CockroachDB compatibility settings
         connect_args={
             "ssl": "require",  # CockroachDB requires SSL
             "server_settings": {
                 "application_name": "ai_bundle_creator",
             },
+            # OPTIMIZATION: asyncpg connection tuning
+            "command_timeout": 60,  # Command timeout in seconds
+            "timeout": 30,  # Connection timeout in seconds
         },
         use_insertmanyvalues=True,  # CockroachDB supports this
+        # OPTIMIZATION: Enhanced query execution settings
+        execution_options={
+            "isolation_level": "READ COMMITTED",  # Optimal for high-concurrency reads
+        },
     )
 
     # Monkey-patch the asyncpg dialect for CockroachDB compatibility

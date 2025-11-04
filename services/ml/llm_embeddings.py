@@ -14,6 +14,7 @@ import os
 import json
 import hashlib
 import logging
+import asyncio
 from typing import Any, Dict, List, Tuple, Optional, Set
 import contextlib
 
@@ -361,27 +362,55 @@ class LLMEmbeddingEngine:
             seen.add(ck)
             unique_items.append((ck, text))
 
-        logger.info("LLM_EMBEDDINGS: to_generate_unique=%d (from %d pending) batches≈%d",
-                    len(unique_items), len(pending), (len(unique_items)-1)//self.batch_size + 1)
+        num_batches = (len(unique_items) - 1) // self.batch_size + 1
+        logger.info("LLM_EMBEDDINGS: to_generate_unique=%d (from %d pending) batches=%d",
+                    len(unique_items), len(pending), num_batches)
 
-        # embed in batches
+        # OPTIMIZATION: Process batches in parallel with rate limiting
+        # Prevents overwhelming OpenAI API while maximizing throughput
+        MAX_CONCURRENT_BATCHES = int(os.getenv("EMBED_CONCURRENT_BATCHES", "3"))
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+
+        async def process_batch_limited(batch_index: int, batch: List[Tuple[str, str]]) -> Tuple[List[str], List[np.ndarray]]:
+            """Process one batch with concurrency control"""
+            async with semaphore:
+                batch_keys = [ck for ck, _ in batch]
+                batch_texts = [tx for _, tx in batch]
+
+                logger.debug(f"LLM_EMBEDDINGS: Processing batch {batch_index + 1}/{num_batches} ({len(batch_texts)} texts)")
+
+                # Call API with retries
+                vecs = await self._embed_texts(batch_texts)
+
+                if not vecs or len(vecs) != len(batch_texts):
+                    logger.error(
+                        "LLM_EMBEDDINGS: Batch %d mismatch/failure, got=%d expected=%d",
+                        batch_index,
+                        len(vecs) if vecs else 0,
+                        len(batch_texts)
+                    )
+                    # Fill with zeros on failure
+                    vecs = [np.zeros(self.embedding_dim, dtype=np.float32) for _ in batch_texts]
+
+                return batch_keys, vecs
+
+        # Split into batches
+        batches = [unique_items[i:i + self.batch_size] for i in range(0, len(unique_items), self.batch_size)]
+
+        # Process all batches concurrently (limited by semaphore)
+        logger.info(f"LLM_EMBEDDINGS: Starting parallel batch processing (max_concurrent={MAX_CONCURRENT_BATCHES})")
+        batch_results = await asyncio.gather(*[
+            process_batch_limited(i, batch) for i, batch in enumerate(batches)
+        ], return_exceptions=True)
+
+        # Merge results and cache
         generated: Dict[str, np.ndarray] = {}
-        for i in range(0, len(unique_items), self.batch_size):
-            batch = unique_items[i:i + self.batch_size]
-            batch_keys = [ck for ck, _ in batch]
-            batch_texts = [tx for _, tx in batch]
-
-            # call API with retries
-            vecs = await self._embed_texts(batch_texts)
-            if not vecs or len(vecs) != len(batch_texts):
-                # length mismatch or failure; fill zeros
-                logger.error("LLM_EMBEDDINGS: batch mismatch/failure, got=%s expected=%s",
-                             len(vecs) if vecs else 0, len(batch_texts))
-                for ck in batch_keys:
-                    generated[ck] = np.zeros(self.embedding_dim, dtype=np.float32)
+        for result in batch_results:
+            if isinstance(result, Exception):
+                logger.error(f"LLM_EMBEDDINGS: Batch processing failed: {result}")
                 continue
 
-            # write to cache maps
+            batch_keys, vecs = result
             for ck, v in zip(batch_keys, vecs):
                 if v is None or not isinstance(v, np.ndarray):
                     v = np.zeros(self.embedding_dim, dtype=np.float32)
