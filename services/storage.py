@@ -3,7 +3,7 @@ Storage Service Layer
 Provides database operations matching the TypeScript storage interface
 """
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, delete, func, desc, and_, or_, text
+from sqlalchemy import select, delete, func, desc, and_, or_, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from typing import List, Optional, Dict, Any, Tuple
 from types import SimpleNamespace
@@ -296,6 +296,34 @@ class StorageService:
             query = select(CsvUpload).order_by(desc(CsvUpload.created_at)).limit(limit)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def safe_mark_upload_completed(self, upload_id: str) -> bool:
+        """Atomically transition an upload to 'bundle_generation_completed' if not already terminal."""
+        if not upload_id:
+            return False
+
+        terminal_statuses = (
+            "bundle_generation_failed",
+            "bundle_generation_timed_out",
+            "bundle_generation_cancelled",
+        )
+
+        async with self.get_session() as session:
+            stmt = (
+                update(CsvUpload)
+                .where(
+                    CsvUpload.id == upload_id,
+                    CsvUpload.status.notin_(terminal_statuses),
+                )
+                .values(status="bundle_generation_completed", updated_at=func.now())
+            )
+            result = await session.execute(stmt)
+            if result.rowcount:
+                await session.commit()
+                return True
+
+            await session.rollback()
+            return False
     
     # Order operations
     async def create_orders(self, orders_data: List[Dict[str, Any]]) -> List[Order]:

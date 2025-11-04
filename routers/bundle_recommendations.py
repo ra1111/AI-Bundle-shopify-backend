@@ -415,18 +415,54 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 else:
                     logger.info(f"Bundle generation completed {scope} in {generation_time:.2f}s")
                 
-                # Atomically update status to completed with precondition
-                logger.info(f"Bundle generation {scope}: attempting status transition to bundle_generation_completed")
-                completion_update = await concurrency_controller.atomic_status_update_with_precondition(
-                    csv_upload_id, 
-                    "bundle_generation_completed",
-                    expected_current_status="generating_bundles"
-                )
-                
-                if completion_update["success"]:
-                    logger.info(f"Bundle generation completed successfully for shop {shop_id}")
+                current_status = None
+                try:
+                    upload_row = await storage.get_csv_upload(csv_upload_id)
+                    current_status = getattr(upload_row, "status", None)
+                except Exception as exc:
+                    logger.warning(
+                        "Bundle generation %s: unable to fetch upload state prior to completion update: %s",
+                        scope,
+                        exc,
+                    )
+
+                terminal_statuses = {
+                    "bundle_generation_failed",
+                    "bundle_generation_timed_out",
+                    "bundle_generation_cancelled",
+                }
+
+                if current_status in terminal_statuses:
+                    logger.info(
+                        "Bundle generation %s: skipping completion overwrite because status is already %s",
+                        scope,
+                        current_status,
+                    )
                 else:
-                    logger.warning(f"Failed to mark generation as completed: {completion_update['error']}")
+                    logger.info(
+                        f"Bundle generation {scope}: attempting status transition to bundle_generation_completed"
+                    )
+                    completion_update = await concurrency_controller.atomic_status_update_with_precondition(
+                        csv_upload_id,
+                        "bundle_generation_completed",
+                        expected_current_status="generating_bundles",
+                    )
+
+                    if completion_update["success"]:
+                        logger.info(f"Bundle generation completed successfully for shop {shop_id}")
+                    else:
+                        safe_transition = await storage.safe_mark_upload_completed(csv_upload_id)
+                        if safe_transition:
+                            logger.info(
+                                "Bundle generation %s: CAS fallback succeeded via safe_mark_upload_completed",
+                                scope,
+                            )
+                        else:
+                            logger.warning(
+                                "Bundle generation %s: failed to mark as completed (%s) and safe fallback rejected",
+                                scope,
+                                completion_update["error"],
+                            )
                 
             except Exception as e:
                 # Bundle generation failed - update status atomically

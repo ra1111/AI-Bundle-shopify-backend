@@ -37,6 +37,7 @@ from services.progress_tracker import (
     update_generation_progress,
     get_generation_checkpoint,
 )
+from services.deadlines import Deadline
 
 try:
     from opentelemetry import trace
@@ -87,7 +88,14 @@ class BundleGenerator:
 
     def _time_budget_exceeded(self, end_time: Optional[datetime]) -> bool:
         """Check whether the global time budget has been exhausted."""
+        if self._current_deadline and self._current_deadline.expired:
+            return True
         return bool(end_time and datetime.now() >= end_time)
+
+    def _deadline_remaining(self) -> Optional[float]:
+        if not self._current_deadline:
+            return None
+        return self._current_deadline.remaining()
 
     def _build_dataset_profile(
         self,
@@ -464,9 +472,15 @@ class BundleGenerator:
         return payload
 
     def _warn_if_time_low(self, end_time: Optional[datetime], csv_upload_id: str, phase_label: str) -> None:
-        if not end_time or self.soft_timeout_warning_seconds <= 0:
+        if self.soft_timeout_warning_seconds <= 0:
             return
-        remaining = (end_time - datetime.now()).total_seconds()
+
+        remaining: Optional[float] = None
+        if self._current_deadline and not self._current_deadline.expired:
+            remaining = self._current_deadline.remaining()
+        elif end_time:
+            remaining = (end_time - datetime.now()).total_seconds()
+
         if remaining is None:
             return
         if remaining <= self.soft_timeout_warning_seconds:
@@ -767,6 +781,14 @@ class BundleGenerator:
         # Loop prevention and performance safeguards
         self.max_total_attempts = 500  # Hard cap on total attempts across all objectives/types
         self.max_time_budget_seconds = 300  # 5 minutes maximum processing time
+        self.soft_timeout_seconds = max(
+            1,
+            min(
+                self.max_time_budget_seconds,
+                int(os.getenv("SOFT_TIMEOUT_SECONDS", str(self.max_time_budget_seconds - 30))),
+            ),
+        )
+        self._current_deadline: Optional[Deadline] = None
         self.max_attempts_per_objective_type = 50  # Max attempts per objective/bundle_type combo
         self.seen_sku_combinations = set()  # Track already processed SKU combinations
         self.generation_stats = {
@@ -839,6 +861,11 @@ class BundleGenerator:
             feature_flags.get_flag("bundling.staged.soft_guard_seconds", 45),
             default=45,
             minimum=0,
+        )
+        self.staged_wave_batch_size = self._coerce_int(
+            feature_flags.get_flag("bundling.staged.wave_batch_size", 10),
+            default=10,
+            minimum=1,
         )
         self.staged_backpressure_queue_threshold = self._coerce_int(
             feature_flags.get_flag("bundling.staged.backpressure_queue_threshold", 0),
@@ -1317,6 +1344,17 @@ class BundleGenerator:
 
         # Set hard timeout
         end_time = start_time + timedelta(seconds=self.max_time_budget_seconds)
+
+        if self.soft_timeout_seconds:
+            self._current_deadline = Deadline(self.soft_timeout_seconds)
+            logger.info(
+                "[%s] Soft deadline set to %.1fs (remaining=%.1fs)",
+                csv_upload_id,
+                self.soft_timeout_seconds,
+                self._deadline_remaining() or 0.0,
+            )
+        else:
+            self._current_deadline = None
 
         try:
             # Phase 1: Data Mapping and Enrichment
@@ -2745,15 +2783,14 @@ class BundleGenerator:
 
             # Store recommendations in database
             if final_recommendations and csv_upload_id:
-                storage_start = time.time()
-                logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - STARTED | bundles={len(final_recommendations)}")
-                with self._start_span(
-                    "bundle_generator.persist_recommendations",
-                    {"csv_upload_id": csv_upload_id, "bundle_count": len(final_recommendations)},
-                ):
-                    await self.store_recommendations(final_recommendations, csv_upload_id)
-                storage_duration = int((time.time() - storage_start) * 1000)
-                logger.info(f"[{csv_upload_id}] Phase 9: Database Storage - COMPLETED in {storage_duration}ms")
+                logger.info(
+                    f"[{csv_upload_id}] Phase 9: Database Storage - STARTED | bundles={len(final_recommendations)}"
+                )
+                publish_result = await self._publish_wave(final_recommendations, csv_upload_id)
+                storage_duration = publish_result["duration_ms"]
+                logger.info(
+                    f"[{csv_upload_id}] Phase 9: Database Storage - COMPLETED in {storage_duration}ms"
+                )
                 metrics["phase_timings"]["phase_9_storage"] = storage_duration
             elif final_bundle_count == 0:
                 metrics["phase_timings"]["phase_9_storage"] = 0
@@ -2781,6 +2818,44 @@ class BundleGenerator:
             )
             return recommendations  # Return original recommendations if finalization fails
 
+    async def _publish_wave(
+        self,
+        wave: List[Dict[str, Any]],
+        csv_upload_id: str,
+        stage_index: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Persist a single wave and return IDs with timing."""
+        if not wave:
+            return {"ids": [], "duration_ms": 0}
+
+        deduped_wave: List[Dict[str, Any]] = []
+        seen_ids = set()
+        for record in wave:
+            rec_id = record.get("id")
+            if rec_id and rec_id in seen_ids:
+                continue
+            if rec_id:
+                seen_ids.add(rec_id)
+            deduped_wave.append(record)
+
+        if not deduped_wave:
+            return {"ids": [], "duration_ms": 0}
+
+        storage_start = time.time()
+        with self._start_span(
+            "bundle_generator.publish_wave",
+            {
+                "csv_upload_id": csv_upload_id,
+                "stage": stage_index + 1 if stage_index is not None else None,
+                "stage_size": len(deduped_wave),
+            },
+        ):
+            await self.store_recommendations(deduped_wave, csv_upload_id)
+
+        duration_ms = int((time.time() - storage_start) * 1000)
+        published_ids = [rec.get("id") for rec in deduped_wave if rec.get("id")]
+        return {"ids": published_ids, "duration_ms": duration_ms}
+
     async def _publish_in_stages(
         self,
         recommendations: List[Dict[str, Any]],
@@ -2793,12 +2868,20 @@ class BundleGenerator:
         """Publish bundles in micro-batches so merchants see results sooner."""
         run_identifier = run_id or f"bundle:{csv_upload_id}"
         logger.info(
-            "[finalize.enter] run=%s staged=%s wave_targets=%s hard_cap=%s",
+            "[finalize.enter] run=%s staged=%s wave_targets=%s hard_cap=%s remaining=%.2fs",
             run_identifier,
             True,
             self.staged_thresholds,
             self.staged_hard_cap,
+            self._deadline_remaining() or -1.0,
         )
+
+        if self._time_budget_exceeded(end_time):
+            logger.warning(
+                "[%s] TIMEOUT GUARD: skipping staged publish because deadline already exceeded",
+                csv_upload_id,
+            )
+            return recommendations
 
         staged_state, metrics_state = await self._load_staged_wave_state(csv_upload_id)
         metrics.setdefault("phase_timings", {})
@@ -2895,6 +2978,26 @@ class BundleGenerator:
         else:
             dynamic_targets[-1] = staged_total_target
 
+        max_wave = max(1, self.staged_wave_batch_size)
+        expanded_targets: List[int] = []
+        cursor = max(0, published)
+        for target in dynamic_targets:
+            target = min(staged_total_target, target)
+            while target - cursor > max_wave:
+                cursor += max_wave
+                expanded_targets.append(cursor)
+            if target > cursor or not expanded_targets:
+                cursor = target
+                expanded_targets.append(target)
+        # Deduplicate while preserving order
+        seen_targets = set()
+        ordered_expanded: List[int] = []
+        for value in expanded_targets:
+            if value not in seen_targets:
+                ordered_expanded.append(value)
+                seen_targets.add(value)
+        dynamic_targets = ordered_expanded or dynamic_targets
+
         total_stages = len(dynamic_targets)
         total_candidates = staged_total_target
 
@@ -2916,12 +3019,13 @@ class BundleGenerator:
         staged_state.setdefault("resume", {})
 
         logger.info(
-            "[%s] Starting staged publish | run=%s stages=%d target=%d thresholds=%s",
+            "[%s] Starting staged publish | run=%s stages=%d target=%d thresholds=%s remaining=%.2fs",
             csv_upload_id,
             run_identifier,
             total_stages,
             staged_total_target,
             dynamic_targets,
+            self._deadline_remaining() or -1.0,
         )
 
         for index, stage_target in enumerate(dynamic_targets):
@@ -2947,13 +3051,7 @@ class BundleGenerator:
                 )
                 continue
 
-            time_remaining = None
-            if end_time:
-                time_remaining = (end_time - datetime.now()).total_seconds()
-            if (
-                time_remaining is not None
-                and time_remaining <= self.staged_soft_guard_seconds
-            ):
+            async def defer_and_return(reason: str, time_left: Optional[float]) -> List[Dict[str, Any]]:
                 staged_state["cursor"] = {
                     "stage_idx": index,
                     "published": published,
@@ -2962,16 +3060,20 @@ class BundleGenerator:
                 staged_state["resume"] = {
                     "stage_idx": index,
                     "published": published,
-                    "reason": "watchdog_imminent",
+                    "reason": reason,
                     "timestamp": datetime.utcnow().isoformat(),
                 }
                 await self._persist_staged_wave_state(
                     csv_upload_id, staged_state, metrics_state
                 )
+                effective_remaining = (
+                    time_left if time_left is not None else self._deadline_remaining()
+                )
                 logger.info(
-                    "[finalize.defer] run=%s reason=watchdog_imminent time_left_s=%.2f resume_cursor=%s",
+                    "[finalize.defer] run=%s reason=%s time_left_s=%s resume_cursor=%s",
                     run_identifier,
-                    max(time_remaining, 0.0),
+                    reason,
+                    None if effective_remaining is None else f"{max(effective_remaining, 0.0):.2f}",
                     staged_state["cursor"],
                 )
                 progress_payload = self._build_staged_progress_payload(
@@ -2990,7 +3092,19 @@ class BundleGenerator:
                 )
                 return staged_results
 
-            stage_slice = ordered_effective[published:stage_target]
+            if self._time_budget_exceeded(end_time):
+                return await defer_and_return("time_budget_exceeded", None)
+
+            time_remaining = None
+            if end_time:
+                time_remaining = (end_time - datetime.now()).total_seconds()
+            if (
+                time_remaining is not None
+                and time_remaining <= self.staged_soft_guard_seconds
+            ):
+                return await defer_and_return("watchdog_imminent", time_remaining)
+
+            stage_slice = ordered_effective[published:min(stage_target, published + self.staged_wave_batch_size)]
             if not stage_slice:
                 logger.debug(
                     "[%s] Stage %d yielded empty slice after filtering; aborting staged publish loop.",
@@ -3000,6 +3114,14 @@ class BundleGenerator:
                 break
 
             stage_start = time.time()
+            logger.info(
+                "[WAVE_START] upload=%s stage=%d target=%d published=%d remaining=%.2fs",
+                csv_upload_id,
+                index + 1,
+                stage_target,
+                published,
+                self._deadline_remaining() or -1.0,
+            )
             await self._emit_heartbeat(
                 csv_upload_id,
                 step="staged_publish",
@@ -3047,28 +3169,24 @@ class BundleGenerator:
             published += kept_count
             drops_total += dropped_count
             staged_results.extend(processed_slice)
-            last_bundle_id = (
-                processed_slice[-1].get("id") if processed_slice else last_bundle_id
-            )
 
             copy_ms = track_summary.get("copy_ms", 0)
             pricing_ms = track_summary.get("pricing_ms", 0)
             inventory_ms = track_summary.get("inventory_ms", 0)
             compliance_ms = track_summary.get("compliance_ms", 0)
             storage_ms = 0
+            publish_result = {"ids": [], "duration_ms": 0}
 
             if processed_slice:
-                storage_start = time.time()
-                with self._start_span(
-                    "bundle_generator.stage_persist",
-                    {
-                        "csv_upload_id": csv_upload_id,
-                        "stage": index + 1,
-                        "stage_size": len(processed_slice),
-                    },
-                ):
-                    await self.store_recommendations(processed_slice, csv_upload_id)
-                storage_ms = int((time.time() - storage_start) * 1000)
+                publish_result = await self._publish_wave(
+                    processed_slice,
+                    csv_upload_id,
+                    stage_index=index,
+                )
+                storage_ms = publish_result["duration_ms"]
+                published_ids = publish_result["ids"]
+                if published_ids:
+                    last_bundle_id = published_ids[-1]
 
             stage_duration = int((time.time() - stage_start) * 1000)
             accumulated_copy_ms += copy_ms
@@ -3076,6 +3194,9 @@ class BundleGenerator:
             accumulated_inventory_ms += inventory_ms
             accumulated_compliance_ms += compliance_ms
             accumulated_storage_ms += storage_ms
+
+            if self._time_budget_exceeded(end_time):
+                return await defer_and_return("time_budget_exceeded_post_stage", None)
 
             wave_entry = {
                 "index": index,
@@ -3116,13 +3237,15 @@ class BundleGenerator:
                 else "{}"
             )
             logger.info(
-                "[finalize.wave.done] run=%s stage_idx=%d target=%d took_ms=%d kept=%d drops=%d %s",
-                run_identifier,
-                index,
+                "[WAVE_DONE] upload=%s stage=%d target=%d kept=%d drops=%d duration_ms=%d total_published=%d remaining_time=%.2fs %s",
+                csv_upload_id,
+                index + 1,
                 stage_target,
-                stage_duration,
                 kept_count,
                 dropped_count,
+                stage_duration,
+                published,
+                self._deadline_remaining() or -1.0,
                 drop_summary_str,
             )
 
