@@ -1,0 +1,46 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+*.log
+
+# --- Virtual environments ---
+venv/
+.venv/
+env/
+ENV/
+build/
+dist/
+
+# --- OS / IDE ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# --- Environment / secrets ---
+.env
+*.env
+.env.*
+!example.env
+
+# --- Cache ---
+.cache/
+*.tmp
+*.bak
+
+# --- Docker / cloud ---
+*.pid
+*.db
+*.sqlite
+*.tar
+*.gz
+
+# --- Node (if frontend present) ---
+node_modules/
+npm-debug.log
+yarn-error.log

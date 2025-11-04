@@ -51,8 +51,8 @@ if DATABASE_URL:
         pool_size=50,  # Increased to support 40+ parallel Phase 3 tasks
         max_overflow=10,  # Total max: 60 connections
         pool_pre_ping=True,
-        pool_recycle=3600,
-        pool_timeout=30,
+        pool_recycle=1800,
+        pool_timeout=15,
         # CockroachDB compatibility settings
         connect_args={
             "ssl": "require",  # CockroachDB requires SSL
@@ -123,8 +123,8 @@ else:
             pool_size=10,
             max_overflow=20,
             pool_pre_ping=True,
-            pool_recycle=3600,
-            pool_timeout=30,
+            pool_recycle=1800,
+            pool_timeout=15,
         )
     else:
         DATABASE_URL = "sqlite+aiosqlite:///:memory:"
@@ -431,6 +431,7 @@ class Bundle(Base):
     products: Mapped[dict] = mapped_column(JSONB, nullable=False)
     pricing: Mapped[dict] = mapped_column(JSONB, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    shop_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -497,7 +498,10 @@ Index('uq_catalog_snapshots_upload_variant',
       CatalogSnapshot.csv_upload_id, CatalogSnapshot.variant_id,
       unique=True)
 Index('ix_bundle_recommendations_shop', BundleRecommendation.shop_id)
-
+Index('ix_bundles_created_at', Bundle.created_at)
+Index('ix_bundles_type', Bundle.bundle_type)
+Index('ix_bundle_recommendations_upload', BundleRecommendation.csv_upload_id)
+Index('ix_association_rules_upload', AssociationRule.csv_upload_id)
 # -------------------------------------------------------------------
 # DI + init helpers
 # -------------------------------------------------------------------
