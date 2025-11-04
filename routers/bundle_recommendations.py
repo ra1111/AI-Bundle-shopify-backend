@@ -36,6 +36,12 @@ BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED = _env_bool("BUNDLE_GENERATION_HARD_TIMEO
 BUNDLE_GENERATION_TIMEOUT_SECONDS = int(os.getenv("BUNDLE_GENERATION_TIMEOUT_SECONDS", "360"))
 BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS = int(os.getenv("BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS", "1200"))
 
+# Quick-start mode for first-time installations
+QUICK_START_ENABLED = _env_bool("QUICK_START_ENABLED", True)  # Enable by default
+QUICK_START_TIMEOUT_SECONDS = int(os.getenv("QUICK_START_TIMEOUT_SECONDS", "120"))  # 2 minutes
+QUICK_START_MAX_PRODUCTS = int(os.getenv("QUICK_START_MAX_PRODUCTS", "50"))  # Top 50 products
+QUICK_START_MAX_BUNDLES = int(os.getenv("QUICK_START_MAX_BUNDLES", "10"))  # Limit to 10 bundles for speed
+
 class GenerateBundlesRequest(BaseModel):
     csvUploadId: Optional[str] = None
 
@@ -246,13 +252,92 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 return
             
             logger.info(f"Status updated: {status_update['previous_status']} -> {status_update['new_status']}")
-            
+
             try:
-                # Generate bundle recommendations with configurable timeout strategy:
-                # - Soft watchdog (default) for profiling/large shops: no hard fail, defer to async after SOFT seconds
-                # - Hard timeout (opt-in via env) as circuit-breaker using asyncio.wait_for
+                # Check if this is a first-time installation and quick-start is enabled
                 from services.bundle_generator import BundleGenerator
                 generator = BundleGenerator()
+
+                is_first_install = False
+                if QUICK_START_ENABLED and not resume_only:
+                    try:
+                        is_first_install = await storage.is_first_time_install(shop_id)
+                        logger.info(f"Shop {shop_id} first-time install check: {is_first_install}")
+                    except Exception as e:
+                        logger.warning(f"Failed to check first-time install status: {e}")
+
+                # FAST PATH: Quick-start mode for first-time installations
+                if is_first_install and QUICK_START_ENABLED:
+                    logger.info(
+                        f"[{csv_upload_id}] 🚀 QUICK-START MODE ACTIVATED for first-time install\n"
+                        f"  Shop: {shop_id}\n"
+                        f"  Max products: {QUICK_START_MAX_PRODUCTS}\n"
+                        f"  Max bundles: {QUICK_START_MAX_BUNDLES}\n"
+                        f"  Timeout: {QUICK_START_TIMEOUT_SECONDS}s\n"
+                        f"  Full generation will be queued for background processing"
+                    )
+
+                    try:
+                        # Run quick-start generation (fast preview)
+                        generation_result = await asyncio.wait_for(
+                            generator.generate_quick_start_bundles(
+                                csv_upload_id,
+                                max_products=QUICK_START_MAX_PRODUCTS,
+                                max_bundles=QUICK_START_MAX_BUNDLES,
+                                timeout_seconds=QUICK_START_TIMEOUT_SECONDS
+                            ),
+                            timeout=float(QUICK_START_TIMEOUT_SECONDS + 30)  # Extra 30s buffer
+                        )
+
+                        logger.info(
+                            f"[{csv_upload_id}] ✅ Quick-start completed successfully\n"
+                            f"  Bundles: {generation_result.get('metrics', {}).get('total_recommendations', 0)}\n"
+                            f"  Duration: {generation_result.get('metrics', {}).get('processing_time_ms', 0) / 1000:.2f}s"
+                        )
+
+                        # Update upload status to completed for quick-start
+                        quick_complete = await storage.safe_mark_upload_completed(csv_upload_id)
+                        if quick_complete:
+                            logger.info(f"[{csv_upload_id}] Marked quick-start upload as completed")
+
+                        # Notify user that preview bundles are ready
+                        try:
+                            await notify_partial_ready(csv_upload_id, generation_result.get('metrics', {}))
+                        except Exception as notify_exc:
+                            logger.warning(f"Failed to send quick-start notification: {notify_exc}")
+
+                        # Queue full generation in background for comprehensive results
+                        logger.info(
+                            f"[{csv_upload_id}] 📋 Scheduling full bundle generation in background\n"
+                            f"  This will run with normal timeout ({BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS}s watchdog)"
+                        )
+
+                        # Schedule full generation asynchronously
+                        # Note: This will run later with full pipeline
+                        pipeline_scheduler.schedule(_run_full_generation_after_quickstart(csv_upload_id, shop_id))
+
+                        # Return early - quick-start is complete
+                        return
+
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[{csv_upload_id}] ⚠️ Quick-start timed out after {QUICK_START_TIMEOUT_SECONDS}s\n"
+                            f"  Falling back to full generation pipeline"
+                        )
+                        # Fall through to normal generation
+                    except Exception as quick_exc:
+                        logger.error(
+                            f"[{csv_upload_id}] ❌ Quick-start failed: {quick_exc}\n"
+                            f"  Falling back to full generation pipeline",
+                            exc_info=True
+                        )
+                        # Fall through to normal generation
+
+                # NORMAL PATH: Full generation for regular users or if quick-start failed
+                logger.info(
+                    f"Bundle generation {scope}: using {'FULL PIPELINE' if is_first_install else 'NORMAL MODE'} "
+                    f"(first_install={is_first_install}, quick_start_enabled={QUICK_START_ENABLED})"
+                )
 
                 # Soft watchdog task setup (only used when hard timeout is disabled)
                 async def _soft_watchdog(csv_upload_id: str, started_at: float):
@@ -636,5 +721,83 @@ def _resume_bundle_generation(csv_upload_id: str):
     async def _runner():
         await asyncio.sleep(0.1)
         await generate_bundles_background(csv_upload_id, resume_only=True)
+
+    return _runner
+
+
+def _run_full_generation_after_quickstart(csv_upload_id: str, shop_id: str):
+    """Schedule full bundle generation after quick-start preview is complete.
+
+    This runs the comprehensive v2 pipeline in the background while the merchant
+    sees the quick-start preview bundles immediately. When complete, the full
+    bundles replace the preview bundles and the shop sync status is marked complete.
+    """
+    async def _runner():
+        # Wait a bit before starting full generation to avoid overload
+        await asyncio.sleep(5)
+
+        logger.info(
+            f"[{csv_upload_id}] 🔄 Starting full bundle generation after quick-start\n"
+            f"  Shop: {shop_id}\n"
+            f"  Mode: Comprehensive v2 pipeline\n"
+            f"  Timeout: {BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS}s soft watchdog"
+        )
+
+        try:
+            # Clear quick-start bundles before full generation
+            quick_start_bundles = []
+            try:
+                from sqlalchemy import select, and_
+                async with storage.get_session() as session:
+                    query = select(BundleRecommendation).where(
+                        and_(
+                            BundleRecommendation.csv_upload_id == csv_upload_id,
+                            BundleRecommendation.discount_reference.like("__quick_start_%")
+                        )
+                    )
+                    result = await session.execute(query)
+                    quick_start_bundles = list(result.scalars().all())
+
+                if quick_start_bundles:
+                    logger.info(
+                        f"[{csv_upload_id}] Found {len(quick_start_bundles)} quick-start bundles to replace"
+                    )
+            except Exception as e:
+                logger.warning(f"[{csv_upload_id}] Could not query quick-start bundles: {e}")
+
+            # Run full generation (this will replace quick-start bundles)
+            from services.bundle_generator import BundleGenerator
+            generator = BundleGenerator()
+
+            # Use the normal generate_bundle_recommendations method
+            generation_result = await generator.generate_bundle_recommendations(csv_upload_id)
+
+            total_recs = generation_result.get('metrics', {}).get('total_recommendations', 0)
+
+            logger.info(
+                f"[{csv_upload_id}] ✅ Full generation complete after quick-start\n"
+                f"  Total bundles: {total_recs}\n"
+                f"  Processing time: {generation_result.get('metrics', {}).get('processing_time_ms', 0) / 1000:.2f}s"
+            )
+
+            # Mark shop sync as completed now that full generation is done
+            try:
+                await storage.mark_shop_sync_completed(shop_id)
+                logger.info(f"[{csv_upload_id}] Marked shop {shop_id} initial sync as completed")
+            except Exception as e:
+                logger.warning(f"[{csv_upload_id}] Failed to mark sync completed: {e}")
+
+            # Notify user that full bundles are ready
+            try:
+                await notify_bundle_ready(csv_upload_id, generation_result.get('metrics', {}))
+            except Exception as notify_exc:
+                logger.warning(f"[{csv_upload_id}] Failed to send full-generation notification: {notify_exc}")
+
+        except Exception as e:
+            logger.error(
+                f"[{csv_upload_id}] ❌ Full generation after quick-start failed: {e}",
+                exc_info=True
+            )
+            # Don't fail hard - merchant already has preview bundles
 
     return _runner
