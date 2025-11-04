@@ -80,6 +80,7 @@ class LLMEmbeddingEngine:
         self.retry_max = self._settings.retry_max or self.RETRY_MAX
         self.retry_backoff_base_s = self._settings.retry_backoff_base_s or self.RETRY_BACKOFF_BASE_S
         self._tracer = trace.get_tracer(__name__) if trace else None
+        self._persist_warning_logged = False
 
         read_candidates = ("get", "get_text", "read", "read_text", "load")
         write_candidates = ("set", "put", "write", "write_text", "save")
@@ -117,6 +118,26 @@ class LLMEmbeddingEngine:
                     span.set_attribute(key, value)
             yield span
 
+    def _disable_persistence(self, reason: str) -> None:
+        if self._persist_ok:
+            self._persist_ok = False
+            if not self._persist_warning_logged:
+                logger.warning("EMBED_CACHE: persistent cache disabled (%s)", reason)
+                self._persist_warning_logged = True
+
+    def _handle_storage_error(self, exc: Exception, action: str, key: str) -> None:
+        msg = f"{exc.__class__.__name__}: {exc}"
+        logger.warning("EMBED_CACHE: %s failed for key=%s: %s", action, key, msg)
+        text = str(exc).lower()
+        disable_signals = (
+            "undefinedtableerror",
+            "does not exist",
+            "connection refused",
+            "no such table",
+        )
+        if any(sig in text for sig in disable_signals):
+            self._disable_persistence(msg)
+
     def _resolve_similarity_thresholds(self, catalog_size: int) -> Tuple[float, float, float]:
         """
         Determine similarity thresholds, optionally adapting based on catalog size.
@@ -152,11 +173,15 @@ class LLMEmbeddingEngine:
     async def _storage_get(self, key: str) -> Optional[str]:
         if not self._persist_ok or self._read_method is None:
             return None
-        result = self._read_method(key)
-        result = await result if inspect.isawaitable(result) else result
-        if isinstance(result, (bytes, bytearray)):
-            result = result.decode("utf-8", errors="ignore")
-        return result
+        try:
+            result = self._read_method(key)
+            result = await result if inspect.isawaitable(result) else result
+            if isinstance(result, (bytes, bytearray)):
+                result = result.decode("utf-8", errors="ignore")
+            return result
+        except Exception as exc:
+            self._handle_storage_error(exc, "read", key)
+            return None
 
     async def _storage_set(self, key: str, value: str, ttl: Optional[int] = None) -> None:
         if not self._persist_ok or self._write_method is None:
@@ -169,8 +194,8 @@ class LLMEmbeddingEngine:
                 result = self._write_method(key, value)
             if inspect.isawaitable(result):
                 await result
-        except Exception as e:
-            logger.warning("EMBED_CACHE: write failed for key=%s: %s", key, e)
+        except Exception as exc:
+            self._handle_storage_error(exc, "write", key)
 
     # --------- text synthesis & cache keys ---------
     @staticmethod

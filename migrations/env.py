@@ -3,8 +3,11 @@ import os
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy import text
 
 from dotenv import load_dotenv
+
+import re
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -21,6 +24,28 @@ database_url = os.getenv("DATABASE_URL")
 if database_url:
     sync_database_url = database_url.replace("postgresql+asyncpg://", "postgresql://")
     config.set_main_option("sqlalchemy.url", sync_database_url)
+
+try:
+    from sqlalchemy.dialects.postgresql.base import PGDialect
+
+    _original_get_server_version_info = PGDialect._get_server_version_info
+
+    def _cockroach_safe_server_version(self, connection):
+        version_str = connection.scalar(text("SELECT version()"))
+        if isinstance(version_str, bytes):
+            version_str = version_str.decode("utf-8", errors="ignore")
+
+        if version_str and "CockroachDB" in version_str:
+            match = re.search(r"v(\d+)\.(\d+)\.(\d+)", version_str)
+            if match:
+                return (13, 0)
+
+        return _original_get_server_version_info(self, connection)
+
+    PGDialect._get_server_version_info = _cockroach_safe_server_version
+except Exception:
+    # Best-effort patch; fall back to SQLAlchemy defaults if anything fails
+    pass
 
 # add your model's MetaData object here
 # for 'autogenerate' support

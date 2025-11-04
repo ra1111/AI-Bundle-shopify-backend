@@ -257,15 +257,17 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         f"TIMEOUT: Bundle generation exceeded {BUNDLE_GENERATION_TIMEOUT_SECONDS} seconds for "
                         f"{csv_upload_id}, force terminating"
                     )
+                    timeout_message = "Bundle generation timed out after 6 minutes."
+                    metrics_payload = {
+                        "timeout_error": True,
+                        "total_recommendations": 0,
+                        "processing_time_ms": BUNDLE_GENERATION_TIMEOUT_SECONDS * 1000,
+                        "timeout_reason": f"{BUNDLE_GENERATION_TIMEOUT_SECONDS}_second_hard_limit_exceeded",
+                    }
                     # Return a timeout result instead of letting it hang
                     generation_result = {
                         "recommendations": [],
-                        "metrics": {
-                            "timeout_error": True,
-                            "total_recommendations": 0,
-                            "processing_time_ms": BUNDLE_GENERATION_TIMEOUT_SECONDS * 1000,
-                            "timeout_reason": f"{BUNDLE_GENERATION_TIMEOUT_SECONDS}_second_hard_limit_exceeded"
-                        },
+                        "metrics": metrics_payload,
                         "v2_pipeline": True,
                         "csv_upload_id": csv_upload_id
                     }
@@ -275,26 +277,31 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         step="finalization",
                         progress=100,
                         status="failed",
-                        message="Bundle generation timed out after 6 minutes.",
+                        message=timeout_message,
                     )
                     
                     # Try to get any partial results that might have been persisted
                     try:
-                        from database import get_db
-                        from sqlalchemy import select
-                        from database import BundleRecommendation
-                        async with get_db() as db:
-                            query = select(BundleRecommendation).where(
-                                BundleRecommendation.csv_upload_id == csv_upload_id,
-                                BundleRecommendation.shop_id == shop_id
+                        partial_recommendations = await storage.get_partial_bundle_recommendations(csv_upload_id)
+                        if partial_recommendations:
+                            logger.info(
+                                "Found %d partial results after timeout",
+                                len(partial_recommendations),
                             )
-                            result = await db.execute(query)
-                            partial_recommendations = result.scalars().all()
-                            if partial_recommendations:
-                                logger.info(f"Found {len(partial_recommendations)} partial results after timeout")
-                                generation_result["metrics"]["partial_recommendations_found"] = len(partial_recommendations)
-                    except Exception as e:
-                        logger.warning(f"Could not retrieve partial results after timeout: {e}")
+                            metrics_payload["partial_recommendations_found"] = len(partial_recommendations)
+                    except Exception as exc:
+                        logger.warning("Could not retrieve partial results after timeout: %s", exc)
+
+                    await concurrency_controller.atomic_status_update_with_precondition(
+                        csv_upload_id,
+                        "bundle_generation_failed",
+                        expected_current_status="generating_bundles",
+                        additional_fields={
+                            "error_message": timeout_message,
+                            "bundle_generation_metrics": metrics_payload,
+                        },
+                    )
+                    return
                 
                 if isinstance(generation_result, dict) and generation_result.get("async_deferred"):
                     metrics = generation_result.get("metrics", {})

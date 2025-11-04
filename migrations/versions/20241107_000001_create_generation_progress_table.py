@@ -18,39 +18,42 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
-        "generation_progress",
-        sa.Column("upload_id", sa.String(), primary_key=True),
-        sa.Column("shop_domain", sa.Text(), nullable=False),
-        sa.Column("step", sa.Text(), nullable=False),
-        sa.Column(
-            "progress",
-            sa.Integer(),
-            nullable=False,
-            server_default=sa.text("0"),
-        ),
-        sa.Column("status", sa.Text(), nullable=False),
-        sa.Column("message", sa.Text(), nullable=True),
-        sa.Column(
-            "metadata",
-            postgresql.JSONB(astext_type=sa.Text()),
-            nullable=True,
-        ),
-        sa.Column(
-            "updated_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
-        sa.CheckConstraint(
-            "progress BETWEEN 0 AND 100",
-            name="ck_generation_progress_range",
-        ),
-        sa.CheckConstraint(
-            "status IN ('in_progress','completed','failed')",
-            name="ck_generation_progress_status",
-        ),
-    )
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    if not inspector.has_table("generation_progress"):
+        op.create_table(
+            "generation_progress",
+            sa.Column("upload_id", sa.String(), primary_key=True),
+            sa.Column("shop_domain", sa.Text(), nullable=False),
+            sa.Column("step", sa.Text(), nullable=False),
+            sa.Column(
+                "progress",
+                sa.Integer(),
+                nullable=False,
+                server_default=sa.text("0"),
+            ),
+            sa.Column("status", sa.Text(), nullable=False),
+            sa.Column("message", sa.Text(), nullable=True),
+            sa.Column(
+                "metadata",
+                postgresql.JSONB(astext_type=sa.Text()),
+                nullable=True,
+            ),
+            sa.Column(
+                "updated_at",
+                sa.DateTime(timezone=True),
+                server_default=sa.text("now()"),
+                nullable=False,
+            ),
+            sa.CheckConstraint(
+                "progress BETWEEN 0 AND 100",
+                name="ck_generation_progress_range",
+            ),
+            sa.CheckConstraint(
+                "status IN ('in_progress','completed','failed')",
+                name="ck_generation_progress_status",
+            ),
+        )
 
 
 def downgrade() -> None:
