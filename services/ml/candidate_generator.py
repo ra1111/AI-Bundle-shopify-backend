@@ -34,6 +34,7 @@ class CandidateGenerationContext:
     sku_frequency: Dict[str, int]
     llm_candidate_target: int
     llm_only: bool = False
+    covis_vectors: Optional[Dict[str, Any]] = None  # MODERN: Co-visitation graph (pseudo-Item2Vec)
 
 class CandidateGenerator:
     """Advanced candidate generation using ML techniques"""
@@ -139,6 +140,37 @@ class CandidateGenerator:
             catalog_subset = catalog_subset or []
             embedding_targets = embedding_targets or set()
 
+        # MODERN ML: Build co-visitation graph (pseudo-Item2Vec)
+        # This provides semantic similarity without ML training (~1-5ms)
+        covis_vectors = None
+        try:
+            from services.ml.pseudo_item2vec import build_covis_vectors
+
+            # Get order lines for co-visitation analysis
+            order_lines = await storage.get_order_lines(csv_upload_id)
+
+            if order_lines and embedding_targets:
+                covis_start = time.time()
+                covis_vectors = build_covis_vectors(
+                    order_lines=order_lines,
+                    top_skus=embedding_targets,  # Limit to same SKUs as embeddings
+                    min_co_visits=1,
+                    max_neighbors=50,
+                )
+                covis_duration = (time.time() - covis_start) * 1000
+                logger.info(
+                    "[%s] Built co-visitation graph | vectors=%d duration_ms=%.1f",
+                    csv_upload_id,
+                    len(covis_vectors),
+                    covis_duration,
+                )
+            else:
+                logger.info(f"[{csv_upload_id}] Skipping co-visitation graph (no order lines or embedding targets)")
+
+        except Exception as e:
+            logger.warning(f"Failed to build co-visitation graph: {e}. Continuing without covis features.")
+            covis_vectors = None
+
         context = CandidateGenerationContext(
             run_id=run_id,
             valid_skus=valid_skus,
@@ -151,6 +183,7 @@ class CandidateGenerator:
             embedding_targets=embedding_targets,
             sku_frequency=dict(sku_frequency),
             llm_candidate_target=20,
+            covis_vectors=covis_vectors,  # MODERN: Add co-visitation vectors
         )
         logger.info(
             "[%s] Candidate context prepared | txns=%d sequences=%d embeddings=%d catalog_subset=%d targets=%d",
@@ -716,6 +749,25 @@ class CandidateGenerator:
 
             if invalid_filtered > 0:
                 logger.warning(f"Candidates: filtered_invalid={invalid_filtered} remaining={len(all_candidates)} valid_skus={len(valid_skus)} varid_map={len(varid_to_sku)}")
+
+            # 5.5. MODERN ML: Enrich candidates with co-visitation similarity
+            # This adds Item2Vec-style features without training overhead
+            if all_candidates and context and hasattr(context, 'covis_vectors') and context.covis_vectors:
+                logger.info(f"[{csv_upload_id}] Enriching {len(all_candidates)} candidates with co-visitation features")
+                from services.ml.pseudo_item2vec import enhance_candidate_with_covisitation
+
+                enriched_count = 0
+                for candidate in all_candidates:
+                    try:
+                        enhance_candidate_with_covisitation(candidate, context.covis_vectors)
+                        enriched_count += 1
+                    except Exception as e:
+                        logger.debug(f"Failed to enrich candidate with covis features: {e}")
+                        # Continue without covis features for this candidate
+
+                logger.info(f"[{csv_upload_id}] Co-visitation enrichment complete: {enriched_count}/{len(all_candidates)} candidates enriched")
+            elif all_candidates:
+                logger.info(f"[{csv_upload_id}] Skipping co-visitation enrichment (no vectors in context)")
 
             # 6. HYBRID SCORING: Combine LLM semantic + transactional signals
             transaction_count = len(context.transactions) if context and context.transactions else 0

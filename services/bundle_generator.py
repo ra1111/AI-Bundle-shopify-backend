@@ -771,7 +771,7 @@ class BundleGenerator:
         self.enable_enterprise_optimization = True
         self.enable_constraint_management = True
         self.enable_performance_monitoring = True
-        self.enable_pareto_optimization = True
+        self.enable_pareto_optimization = feature_flags.get_flag("advanced.pareto_optimization", False)  # MODERN: Disabled by default for speed
         
         # Advanced feature flags (PR-5, PR-6, PR-8)
         self.enable_normalized_ranking = True
@@ -1446,6 +1446,34 @@ class BundleGenerator:
             await update_generation_progress(
                 csv_upload_id,
                 step="ml_generation",
+                progress=60,
+                status="in_progress",
+                message="Quick-start: Building co-visitation graph…",
+            )
+
+            # PHASE 2.5: Build co-visitation graph (MODERN ML)
+            # This gives us Item2Vec-style similarity without training
+            phase2_5_start = time.time()
+
+            from services.ml.pseudo_item2vec import build_covis_vectors
+
+            top_sku_set = set(top_skus)
+            covis_vectors = build_covis_vectors(
+                order_lines=filtered_lines,
+                top_skus=top_sku_set,
+                min_co_visits=1,
+                max_neighbors=50,
+            )
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Built co-visitation graph for {len(covis_vectors)} products"
+            )
+
+            phase2_5_duration = (time.time() - phase2_5_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="ml_generation",
                 progress=70,
                 status="in_progress",
                 message="Quick-start: Generating bundles…",
@@ -1467,9 +1495,9 @@ class BundleGenerator:
                 f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
             )
 
-            # Build each bundle type
+            # Build each bundle type (MODERN: pass covis_vectors for similarity scoring)
             fbt_bundles = _build_quick_start_fbt_bundles(
-                csv_upload_id, filtered_lines, catalog, product_scores, max_fbt_bundles
+                csv_upload_id, filtered_lines, catalog, product_scores, max_fbt_bundles, covis_vectors
             )
 
             bogo_bundles = []
@@ -1541,6 +1569,7 @@ class BundleGenerator:
                 "phase_timings": {
                     "phase1_data_loading_ms": phase1_duration,
                     "phase2_scoring_ms": phase2_duration,
+                    "phase2_5_covis_graph_ms": phase2_5_duration,
                     "phase3_generation_ms": phase3_duration,
                     "phase4_persistence_ms": phase4_duration,
                 },
@@ -4532,12 +4561,20 @@ def _build_quick_start_fbt_bundles(
     catalog: Dict[str, Any],
     product_scores: Dict[str, float],
     max_fbt_bundles: int,
+    covis_vectors: Dict[str, Any] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build simple FBT bundles from co-occurrence counts.
-    Uses: 2-product bundles, fixed 10% discount.
+    Build modern FBT bundles using co-visitation similarity (MODERN ML).
+
+    Uses:
+    - Co-visitation graph for semantic similarity (pseudo-Item2Vec)
+    - Bandit pricing for dynamic discount selection
+    - Blended scoring: co-occurrence + similarity + product quality
+
+    This gives "AI-powered" recommendations without ML training overhead.
     """
     from collections import defaultdict
+    from services.ml.pseudo_item2vec import cosine_similarity
 
     order_groups: Dict[str, List[str]] = defaultdict(list)
 
@@ -4559,11 +4596,34 @@ def _build_quick_start_fbt_bundles(
     if not sku_pairs:
         return []
 
-    sorted_pairs = sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)
+    # MODERN: Score pairs using co-visitation similarity + co-occurrence
+    scored_pairs = []
+    for (sku1, sku2), count in sku_pairs.items():
+        # Get co-visitation similarity (0-1 range)
+        covis_sim = 0.0
+        if covis_vectors and sku1 in covis_vectors and sku2 in covis_vectors:
+            v1 = covis_vectors[sku1]
+            v2 = covis_vectors[sku2]
+            covis_sim = cosine_similarity(v1, v2)
+
+        # Blended score: 60% similarity + 40% co-occurrence frequency
+        # High similarity = products naturally go together
+        # High co-occurrence = proven purchase pattern
+        co_occurrence_score = min(1.0, count / 10.0)  # Normalize to [0, 1]
+        blended_score = 0.6 * covis_sim + 0.4 * co_occurrence_score
+
+        # Require minimum quality: either good similarity OR multiple co-purchases
+        if covis_sim < 0.1 and count < 2:
+            continue  # Skip weak pairs
+
+        scored_pairs.append(((sku1, sku2), count, covis_sim, blended_score))
+
+    # Sort by blended score (descending)
+    scored_pairs.sort(key=lambda x: x[3], reverse=True)
 
     recommendations: List[Dict[str, Any]] = []
-    for (sku1, sku2), count in sorted_pairs:
-        if len(recommendations) >= max_fbt_bundles:
+    for (sku1, sku2), count, covis_sim, blended_score in scored_pairs:
+        if len(recommendations) >= max_fbt_bundles * 3:  # Generate more candidates for filtering
             break
 
         p1 = catalog.get(sku1)
@@ -4577,10 +4637,34 @@ def _build_quick_start_fbt_bundles(
             continue
 
         total_price = price1 + price2
-        bundle_price = total_price * 0.9  # 10% off
+        avg_price = total_price / 2.0
 
-        conf = min(0.95, 0.5 + (count / 100.0))
-        score = product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5)
+        # MODERN: Use bandit pricing instead of fixed 10%
+        # This provides "dynamic AI pricing" without training
+        from services.pricing import BayesianPricingEngine
+        pricing_engine = BayesianPricingEngine()
+
+        bandit_result = pricing_engine.multi_armed_bandit_pricing(
+            bundle_products=[sku1, sku2],
+            product_prices={sku1: Decimal(str(price1)), sku2: Decimal(str(price2))},
+            features={
+                "covis_similarity": covis_sim,
+                "avg_price": avg_price,
+                "bundle_type": "FBT",
+                "objective": "increase_aov"
+            },
+            objective="increase_aov"
+        )
+
+        bundle_price = float(bandit_result["bundle_price"])
+        discount_pct = bandit_result["discount_pct"]
+
+        # Confidence based on similarity + co-occurrence
+        conf = min(0.95, 0.3 + (0.4 * covis_sim) + (0.3 * min(1.0, count / 50.0)))
+
+        # Ranking score: blend product quality + similarity
+        product_quality_score = product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5)
+        ranking_score = 0.7 * product_quality_score + 0.3 * covis_sim
 
         recommendations.append({
             "id": str(uuid.uuid4()),
@@ -4607,15 +4691,25 @@ def _build_quick_start_fbt_bundles(
                 "original_total": total_price,
                 "bundle_price": bundle_price,
                 "discount_amount": total_price - bundle_price,
-                "discount_pct": "10.0%",
+                "discount_pct": f"{discount_pct}%",
             },
             "confidence": Decimal(str(conf)),
-            "predicted_lift": Decimal("1.0"),
-            "ranking_score": Decimal(str(score)),
+            "predicted_lift": Decimal(str(1.0 + (covis_sim * 0.5))),  # Higher lift for high similarity
+            "ranking_score": Decimal(str(ranking_score)),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
+            # MODERN: Add co-visitation features for explainability
+            "features": {
+                "covis_similarity": covis_sim,
+                "co_occurrence_count": count,
+                "blended_score": blended_score,
+            }
         })
+
+        # Stop once we have enough high-quality bundles
+        if len(recommendations) >= max_fbt_bundles:
+            break
 
     return recommendations
 

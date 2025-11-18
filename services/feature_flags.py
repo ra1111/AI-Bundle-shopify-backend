@@ -45,7 +45,7 @@ class FeatureFlagsManager:
             "phase.explainability": True,
 
             # Advanced features (PR implementations)
-            "advanced.pareto_optimization": True,
+            "advanced.pareto_optimization": False,  # MODERN: Disabled by default for speed (NSGA-II is slow)
             "advanced.constraint_management": True,
             "advanced.performance_monitoring": True,
             "advanced.normalized_ranking": True,
