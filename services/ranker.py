@@ -17,44 +17,46 @@ class WeightedLinearRanker:
     
     def __init__(self):
         # Default weight configuration (can be tuned per objective)
-        # MODERN LTR: Includes co-visitation similarity (pseudo-Item2Vec signal)
+        # MODERN LTR: Pure data-driven ranking without heuristics
+        # Removed objective_fit (heuristic-based) in favor of behavioral/statistical signals
         self.default_weights = {
-            "confidence": Decimal('0.30'),          # Statistical confidence
+            "confidence": Decimal('0.40'),          # Statistical confidence (strongest signal)
             "lift": Decimal('0.20'),                # Association lift
-            "objective_fit": Decimal('0.20'),       # Business objective alignment
-            "covis_similarity": Decimal('0.15'),    # Co-visitation graph similarity (NEW)
-            "inventory_term": Decimal('0.10'),      # Stock availability
-            "price_sanity": Decimal('0.05'),        # Price reasonableness
+            "covis_similarity": Decimal('0.20'),    # Co-visitation graph similarity (behavioral)
+            "inventory_term": Decimal('0.10'),      # Stock availability (deterministic)
+            "price_sanity": Decimal('0.10'),        # Price reasonableness
+            "objective_fit": Decimal('0.00'),       # REMOVED: Heuristic-based, redundant with other signals
             "novelty_penalty": Decimal('0.10')      # Subtracted from total
         }
         
         # Objective-specific weight overrides
+        # All objectives now use pure data-driven signals (no heuristic objective_fit)
         self.objective_weights = {
             "clear_slow_movers": {
-                "confidence": Decimal('0.20'),
-                "lift": Decimal('0.15'),
-                "objective_fit": Decimal('0.35'),      # Higher weight for objective fit
-                "covis_similarity": Decimal('0.10'),   # Co-visitation similarity
-                "inventory_term": Decimal('0.15'),
-                "price_sanity": Decimal('0.05'),
+                "confidence": Decimal('0.30'),         # Statistical confidence
+                "lift": Decimal('0.20'),               # Association strength
+                "covis_similarity": Decimal('0.15'),   # Behavioral similarity
+                "inventory_term": Decimal('0.25'),     # Critical for slow movers (high stock signal)
+                "price_sanity": Decimal('0.10'),       # Price reasonableness
+                "objective_fit": Decimal('0.00'),      # REMOVED: Use inventory_term instead
                 "novelty_penalty": Decimal('0.05')
             },
             "margin_guard": {
-                "confidence": Decimal('0.25'),
-                "lift": Decimal('0.20'),
-                "objective_fit": Decimal('0.15'),
-                "covis_similarity": Decimal('0.10'),   # Co-visitation similarity
-                "inventory_term": Decimal('0.05'),
-                "price_sanity": Decimal('0.25'),       # Higher weight for price sanity
+                "confidence": Decimal('0.35'),         # Statistical confidence
+                "lift": Decimal('0.20'),               # Association strength
+                "covis_similarity": Decimal('0.15'),   # Behavioral similarity
+                "inventory_term": Decimal('0.05'),     # Less critical for margin
+                "price_sanity": Decimal('0.25'),       # Critical for margin protection
+                "objective_fit": Decimal('0.00'),      # REMOVED: Use price_sanity instead
                 "novelty_penalty": Decimal('0.10')
             },
             "increase_aov": {
-                "confidence": Decimal('0.35'),         # Focus on statistical confidence
-                "lift": Decimal('0.25'),
-                "objective_fit": Decimal('0.15'),
-                "covis_similarity": Decimal('0.15'),   # Co-visitation similarity (FBT benefits most)
-                "inventory_term": Decimal('0.05'),
-                "price_sanity": Decimal('0.05'),
+                "confidence": Decimal('0.40'),         # Strongest statistical signal
+                "lift": Decimal('0.25'),               # Association strength
+                "covis_similarity": Decimal('0.20'),   # Behavioral similarity (FBT benefits most)
+                "inventory_term": Decimal('0.05'),     # Basic availability check
+                "price_sanity": Decimal('0.10'),       # Price reasonableness
+                "objective_fit": Decimal('0.00'),      # REMOVED: Use covis + lift instead
                 "novelty_penalty": Decimal('0.05')
             }
         }
@@ -484,14 +486,16 @@ class WeightedLinearRanker:
         This matches the architecture of Pinterest/Amazon/YouTube ranking systems
         but without needing GPU training, retraining pipelines, or ML infrastructure.
 
+        Pure data-driven ranking using behavioral and statistical signals only.
+        No heuristic-based objective_fit (removed for clean, deterministic ranking).
+
         Features expected:
             - confidence: Statistical confidence from association rules
             - lift: Association rule lift
-            - objective_fit: Business objective alignment score
             - covis_similarity: Co-visitation graph similarity (pseudo-Item2Vec)
             - inventory_signal: Stock availability
-            - embedding_similarity: LLM embedding similarity (optional)
             - price_sanity: Price reasonableness
+            - embedding_similarity: LLM embedding similarity (optional)
 
         Args:
             features: Dict of normalized features [0, 1]
@@ -504,22 +508,20 @@ class WeightedLinearRanker:
             >>> score = ranker.compute_ltr_score({
             ...     "confidence": 0.85,
             ...     "lift": 0.72,
-            ...     "objective_fit": 0.90,
             ...     "covis_similarity": 0.65,
             ...     "inventory_signal": 0.80,
             ...     "price_sanity": 0.95
             ... })
-            >>> # 0.82 = high-quality bundle
+            >>> # 0.78 = high-quality bundle (pure data-driven)
         """
         # Get objective-specific weights
         weights = self.get_weights_for_objective(objective)
 
-        # Compute weighted sum
+        # Compute weighted sum (pure data-driven signals only)
         score = (
             float(weights["confidence"]) * features.get("confidence", 0.0)
             + float(weights["lift"]) * features.get("lift", 0.0)
-            + float(weights["objective_fit"]) * features.get("objective_fit", 0.0)
-            + float(weights.get("covis_similarity", Decimal('0.15'))) * features.get("covis_similarity", 0.0)
+            + float(weights.get("covis_similarity", Decimal('0.20'))) * features.get("covis_similarity", 0.0)
             + float(weights["inventory_term"]) * features.get("inventory_signal", 0.0)
             + float(weights["price_sanity"]) * features.get("price_sanity", 0.0)
         )
