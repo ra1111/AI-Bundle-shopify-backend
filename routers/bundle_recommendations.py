@@ -473,8 +473,11 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                     if watchdog_task:
                         try:
                             watchdog_task.cancel()
-                        except Exception:
+                        except asyncio.CancelledError:
+                            # Task was already cancelled, this is fine
                             pass
+                        except Exception as e:
+                            logger.debug(f"Error cancelling watchdog task: {e}")
                 
                 if isinstance(generation_result, dict) and generation_result.get("async_deferred"):
                     metrics = generation_result.get("metrics", {})

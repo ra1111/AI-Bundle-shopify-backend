@@ -42,7 +42,23 @@ class HybridScorer:
     """
 
     def __init__(self):
-        pass
+        """Initialize the hybrid scorer with default configuration"""
+        self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+
+        # Weight tiers based on transaction volume
+        self.weight_tiers = {
+            "small": ScoringWeights(alpha=0.6, beta=0.2, gamma=0.2),   # < 300 txns: Trust LLM
+            "medium": ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2),  # 300-1200 txns: Balanced
+            "large": ScoringWeights(alpha=0.2, beta=0.6, gamma=0.2),   # > 1200 txns: Trust data
+        }
+
+        # Thresholds for tier classification
+        self.tier_thresholds = {
+            "small_max": 300,
+            "medium_max": 1200,
+        }
+
+        self.logger.debug("HybridScorer initialized with weight tiers: %s", self.weight_tiers)
 
     def get_weights_for_dataset(self, transaction_count: int) -> ScoringWeights:
         """
@@ -55,18 +71,22 @@ class HybridScorer:
             ScoringWeights with optimal α, β, γ values
         """
         try:
-            if transaction_count < 300:
-                # Small store: Trust LLM semantic understanding
-                weights = ScoringWeights(alpha=0.6, beta=0.2, gamma=0.2)
+            # Validate transaction_count
+            if not isinstance(transaction_count, (int, float)) or transaction_count < 0:
+                logger.warning(
+                    f"HYBRID_SCORER: Invalid transaction_count={transaction_count}, using 0"
+                )
+                transaction_count = 0
+
+            # Determine tier based on thresholds
+            if transaction_count < self.tier_thresholds["small_max"]:
                 tier = "small"
-            elif transaction_count < 1200:
-                # Medium store: Balanced approach
-                weights = ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2)
+            elif transaction_count < self.tier_thresholds["medium_max"]:
                 tier = "medium"
             else:
-                # Large store: Trust transactional data
-                weights = ScoringWeights(alpha=0.2, beta=0.6, gamma=0.2)
                 tier = "large"
+
+            weights = self.weight_tiers[tier]
 
             logger.info(
                 f"HYBRID_SCORER: Dynamic weights selected | "
@@ -82,7 +102,8 @@ class HybridScorer:
                 f"Falling back to balanced weights (α=0.4, β=0.4, γ=0.2)",
                 exc_info=True
             )
-            return ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2)
+            # Fallback to medium tier weights
+            return self.weight_tiers.get("medium", ScoringWeights(alpha=0.4, beta=0.4, gamma=0.2))
 
     def score_bundle(
         self,

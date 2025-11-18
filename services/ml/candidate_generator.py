@@ -302,13 +302,13 @@ class CandidateGenerator:
             if price is not None:
                 try:
                     product["price"] = float(price)
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as e:
+                    logger.debug(f"Failed to convert price to float for SKU {sku_str}: {price} - {e}")
             if compare_at is not None:
                 try:
                     product["compare_at_price"] = float(compare_at)
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as e:
+                    logger.debug(f"Failed to convert compare_at_price to float for SKU {sku_str}: {compare_at} - {e}")
             products.append(product)
         logger.debug(
             "Materialized catalog entries | input=%d usable=%d",
@@ -1006,8 +1006,11 @@ class CandidateGenerator:
             if all_valid and len(normalized) >= 2:
                 try:
                     candidate["products"] = normalized
-                except Exception:
-                    pass
+                except (TypeError, AttributeError) as e:
+                    # Candidate dict might be immutable or frozen
+                    logger.debug(f"Could not update candidate products (using original): {e}")
+                except Exception as e:
+                    logger.warning(f"Unexpected error updating candidate products: {e}")
                 filtered_candidates.append(candidate)
             else:
                 sources = candidate.get("generation_sources") or []
@@ -1032,8 +1035,11 @@ class CandidateGenerator:
                             fallback_products.append(mapped if mapped else original_str or original)
                     try:
                         candidate["products"] = fallback_products
-                    except Exception:
-                        pass
+                    except (TypeError, AttributeError) as e:
+                        # Candidate dict might be immutable or frozen
+                        logger.debug(f"Could not update candidate with fallback products (using original): {e}")
+                    except Exception as e:
+                        logger.warning(f"Unexpected error updating candidate with fallback products: {e}")
                     logger.info(
                         "[%s] Retained candidate for small catalog | source=%s reason=%s offending=%s products=%s",
                         scope,
