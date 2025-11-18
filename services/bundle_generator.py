@@ -771,7 +771,7 @@ class BundleGenerator:
         self.enable_enterprise_optimization = True
         self.enable_constraint_management = True
         self.enable_performance_monitoring = True
-        self.enable_pareto_optimization = True
+        self.enable_pareto_optimization = feature_flags.get_flag("advanced.pareto_optimization", False)  # MODERN: Disabled by default for speed
         
         # Advanced feature flags (PR-5, PR-6, PR-8)
         self.enable_normalized_ranking = True
