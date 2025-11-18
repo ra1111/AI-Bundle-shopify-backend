@@ -145,11 +145,11 @@ class WeightedLinearRanker:
             enriched["confidence_raw"] = Decimal(str(candidate.get("confidence", 0)))
             enriched["lift_raw"] = Decimal(str(candidate.get("lift", 1)))
             enriched["support_raw"] = Decimal(str(candidate.get("support", 0)))
-            
-            # 2. Objective fit score
-            enriched["objective_fit_raw"] = await self.compute_objective_fit(
-                candidate.get("products", []), objective, csv_upload_id, catalog_map
-            )
+
+            # 2. Objective fit score (DEPRECATED - no-op, weight is 0.0)
+            # No longer computed to save ~50-100ms per candidate
+            # Previously: enriched["objective_fit_raw"] = await self.compute_objective_fit(...)
+            enriched["objective_fit_raw"] = Decimal('0')
             
             # 3. Inventory term
             enriched["inventory_term_raw"] = await self.compute_inventory_term(
@@ -175,7 +175,17 @@ class WeightedLinearRanker:
             return candidate
     
     async def compute_objective_fit(self, product_skus: List[str], objective: str, csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
-        """Compute objective fit score for bundle products"""
+        """
+        DEPRECATED: Objective fit is no longer used (weight = 0.0).
+
+        Returns 0 immediately to avoid expensive catalog lookups and heuristic scoring.
+        Kept for backwards compatibility in case external code still calls this method.
+        """
+        # No-op: objective_fit removed from ranking in favor of pure data-driven signals
+        return Decimal('0')
+
+        # Old implementation below (kept for reference, never executed)
+        # -----------------------------------------------------------
         try:
             if not product_skus:
                 return Decimal('0')
