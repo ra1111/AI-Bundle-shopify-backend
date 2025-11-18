@@ -17,38 +17,43 @@ class WeightedLinearRanker:
     
     def __init__(self):
         # Default weight configuration (can be tuned per objective)
+        # MODERN LTR: Includes co-visitation similarity (pseudo-Item2Vec signal)
         self.default_weights = {
-            "confidence": Decimal('0.35'),
-            "lift": Decimal('0.25'),
-            "objective_fit": Decimal('0.20'),
-            "inventory_term": Decimal('0.10'),
-            "price_sanity": Decimal('0.10'),
-            "novelty_penalty": Decimal('0.10')  # Subtracted from total
+            "confidence": Decimal('0.30'),          # Statistical confidence
+            "lift": Decimal('0.20'),                # Association lift
+            "objective_fit": Decimal('0.20'),       # Business objective alignment
+            "covis_similarity": Decimal('0.15'),    # Co-visitation graph similarity (NEW)
+            "inventory_term": Decimal('0.10'),      # Stock availability
+            "price_sanity": Decimal('0.05'),        # Price reasonableness
+            "novelty_penalty": Decimal('0.10')      # Subtracted from total
         }
         
         # Objective-specific weight overrides
         self.objective_weights = {
             "clear_slow_movers": {
-                "confidence": Decimal('0.25'),
-                "lift": Decimal('0.20'),
-                "objective_fit": Decimal('0.35'),  # Higher weight for objective fit
+                "confidence": Decimal('0.20'),
+                "lift": Decimal('0.15'),
+                "objective_fit": Decimal('0.35'),      # Higher weight for objective fit
+                "covis_similarity": Decimal('0.10'),   # Co-visitation similarity
                 "inventory_term": Decimal('0.15'),
                 "price_sanity": Decimal('0.05'),
                 "novelty_penalty": Decimal('0.05')
             },
             "margin_guard": {
-                "confidence": Decimal('0.30'),
-                "lift": Decimal('0.25'),
+                "confidence": Decimal('0.25'),
+                "lift": Decimal('0.20'),
                 "objective_fit": Decimal('0.15'),
+                "covis_similarity": Decimal('0.10'),   # Co-visitation similarity
                 "inventory_term": Decimal('0.05'),
-                "price_sanity": Decimal('0.25'),  # Higher weight for price sanity
+                "price_sanity": Decimal('0.25'),       # Higher weight for price sanity
                 "novelty_penalty": Decimal('0.10')
             },
             "increase_aov": {
-                "confidence": Decimal('0.40'),  # Focus on statistical confidence
-                "lift": Decimal('0.30'),
+                "confidence": Decimal('0.35'),         # Focus on statistical confidence
+                "lift": Decimal('0.25'),
                 "objective_fit": Decimal('0.15'),
-                "inventory_term": Decimal('0.10'),
+                "covis_similarity": Decimal('0.15'),   # Co-visitation similarity (FBT benefits most)
+                "inventory_term": Decimal('0.05'),
                 "price_sanity": Decimal('0.05'),
                 "novelty_penalty": Decimal('0.05')
             }
@@ -443,32 +448,94 @@ class WeightedLinearRanker:
             return candidates
     
     def compute_weighted_score(self, candidate: Dict[str, Any], weights: Dict[str, Decimal]) -> Decimal:
-        """Compute final weighted score"""
+        """
+        Compute final weighted score using Learning-to-Rank (LtR) formula.
+
+        This is a lightweight LtR approach inspired by Pinterest/Amazon ranking systems.
+        Uses weighted linear combination of normalized features without ML training.
+        """
         try:
             score = Decimal('0')
-            
-            # Add weighted components
+
+            # Add weighted components (MODERN LTR)
             score += weights["confidence"] * candidate.get("confidence_norm", Decimal('0'))
             score += weights["lift"] * candidate.get("lift_norm", Decimal('0'))
             score += weights["objective_fit"] * candidate.get("objective_fit_norm", Decimal('0'))
             score += weights["inventory_term"] * candidate.get("inventory_term_norm", Decimal('0'))
             score += weights["price_sanity"] * candidate.get("price_sanity_norm", Decimal('0'))
-            
+
+            # NEW: Co-visitation similarity (pseudo-Item2Vec signal)
+            score += weights.get("covis_similarity", Decimal('0')) * candidate.get("covis_similarity_norm", Decimal('0'))
+
             # Subtract novelty penalty
             score -= weights["novelty_penalty"] * candidate.get("novelty_penalty_raw", Decimal('0'))
-            
+
             # Ensure score is in [0, 1] range
             return max(Decimal('0'), min(Decimal('1'), score))
-            
+
         except Exception as e:
             logger.warning(f"Error computing weighted score: {e}")
             return Decimal('0.5')
+
+    def compute_ltr_score(self, features: Dict[str, float], objective: str = "increase_aov") -> float:
+        """
+        Modern Learning-to-Rank scoring formula (no ML training required).
+
+        This matches the architecture of Pinterest/Amazon/YouTube ranking systems
+        but without needing GPU training, retraining pipelines, or ML infrastructure.
+
+        Features expected:
+            - confidence: Statistical confidence from association rules
+            - lift: Association rule lift
+            - objective_fit: Business objective alignment score
+            - covis_similarity: Co-visitation graph similarity (pseudo-Item2Vec)
+            - inventory_signal: Stock availability
+            - embedding_similarity: LLM embedding similarity (optional)
+            - price_sanity: Price reasonableness
+
+        Args:
+            features: Dict of normalized features [0, 1]
+            objective: Business objective for weight selection
+
+        Returns:
+            Score in [0, 1] range
+
+        Example:
+            >>> score = ranker.compute_ltr_score({
+            ...     "confidence": 0.85,
+            ...     "lift": 0.72,
+            ...     "objective_fit": 0.90,
+            ...     "covis_similarity": 0.65,
+            ...     "inventory_signal": 0.80,
+            ...     "price_sanity": 0.95
+            ... })
+            >>> # 0.82 = high-quality bundle
+        """
+        # Get objective-specific weights
+        weights = self.get_weights_for_objective(objective)
+
+        # Compute weighted sum
+        score = (
+            float(weights["confidence"]) * features.get("confidence", 0.0)
+            + float(weights["lift"]) * features.get("lift", 0.0)
+            + float(weights["objective_fit"]) * features.get("objective_fit", 0.0)
+            + float(weights.get("covis_similarity", Decimal('0.15'))) * features.get("covis_similarity", 0.0)
+            + float(weights["inventory_term"]) * features.get("inventory_signal", 0.0)
+            + float(weights["price_sanity"]) * features.get("price_sanity", 0.0)
+        )
+
+        # Optional: embedding similarity if available
+        if "embedding_similarity" in features:
+            score += 0.10 * features["embedding_similarity"]
+
+        # Clamp to [0, 1]
+        return max(0.0, min(1.0, score))
     
     def get_score_components(self, candidate: Dict[str, Any], weights: Dict[str, Decimal]) -> Dict[str, float]:
         """Get detailed score component breakdown for explainability"""
         try:
             components = {}
-            
+
             # Individual weighted contributions
             components["confidence_contribution"] = float(
                 weights["confidence"] * candidate.get("confidence_norm", Decimal('0'))
@@ -479,6 +546,9 @@ class WeightedLinearRanker:
             components["objective_fit_contribution"] = float(
                 weights["objective_fit"] * candidate.get("objective_fit_norm", Decimal('0'))
             )
+            components["covis_similarity_contribution"] = float(
+                weights.get("covis_similarity", Decimal('0')) * candidate.get("covis_similarity_norm", Decimal('0'))
+            )
             components["inventory_contribution"] = float(
                 weights["inventory_term"] * candidate.get("inventory_term_norm", Decimal('0'))
             )
@@ -488,18 +558,19 @@ class WeightedLinearRanker:
             components["novelty_penalty"] = float(
                 weights["novelty_penalty"] * candidate.get("novelty_penalty_raw", Decimal('0'))
             )
-            
+
             # Raw values for reference
             components["raw_values"] = {
                 "confidence": float(candidate.get("confidence_raw", Decimal('0'))),
                 "lift": float(candidate.get("lift_raw", Decimal('0'))),
                 "objective_fit": float(candidate.get("objective_fit_raw", Decimal('0'))),
+                "covis_similarity": float(candidate.get("covis_similarity_raw", Decimal('0'))),
                 "inventory_term": float(candidate.get("inventory_term_raw", Decimal('0'))),
                 "price_sanity": float(candidate.get("price_sanity_raw", Decimal('0')))
             }
-            
+
             return components
-            
+
         except Exception as e:
             logger.warning(f"Error getting score components: {e}")
             return {}
