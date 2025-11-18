@@ -324,10 +324,15 @@ class BundleGenerator:
         if isinstance(waves, list):
             try:
                 waves = sorted(waves, key=lambda item: item.get("index", 0))
-            except Exception:
-                pass
+            except (TypeError, AttributeError) as e:
+                # Wave items might not be dicts or might not have 'get' method
+                logger.warning(f"Could not sort waves by index: {e}. Using unsorted list.")
+            except Exception as e:
+                logger.error(f"Unexpected error sorting waves: {e}")
         else:
             waves = []
+            if waves != []:  # Only log if waves was not already empty
+                logger.debug(f"Waves is not a list (type: {type(waves)}), using empty list")
         merged_state["waves"] = waves
 
         # Normalise totals / cursor

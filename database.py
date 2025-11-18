@@ -43,7 +43,13 @@ if DATABASE_URL:
         """Custom connection setup that avoids JSON codec issues with CockroachDB"""
         # Don't set up JSON codecs - CockroachDB doesn't have the 'json' type
         # We only use JSONB in our models anyway
-        pass
+        try:
+            # Set connection-specific parameters if needed
+            # For now, this is intentionally minimal to avoid CockroachDB compatibility issues
+            logger.debug("AsyncPG connection setup complete (minimal config for CockroachDB)")
+        except Exception as e:
+            logger.warning(f"Error in asyncpg connection setup: {e}")
+            # Continue without custom setup - connection will still work
 
     # OPTIMIZATION: Tuned connection pool for high-concurrency ML operations
     # Supports parallel candidate generation, embedding batches, and optimization engine
@@ -91,10 +97,14 @@ if DATABASE_URL:
                 schema='pg_catalog',
                 format='text',
             )
-        except Exception:
+            logger.debug("JSONB codec setup successful for CockroachDB connection")
+        except ImportError as e:
+            logger.warning(f"asyncpg not available for JSONB codec setup: {e}")
+            # SQLAlchemy will handle JSON encoding/decoding in Python
+        except Exception as e:
             # If even JSONB fails, just skip codec setup entirely
             # SQLAlchemy will handle JSON encoding/decoding in Python
-            pass
+            logger.debug(f"JSONB codec setup skipped (fallback to Python JSON handling): {e}")
 
     PGDialect_asyncpg.setup_asyncpg_json_codec = patched_setup_asyncpg_json_codec
 
@@ -147,16 +157,29 @@ else:
 AsyncSessionLocal = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 def _redact_db_url(url: str) -> str:
+    """Redact password from database URL for logging purposes"""
     try:
+        if not url or not isinstance(url, str):
+            return "******"
+
         if "@" in url and "://" in url:
             head, tail = url.split("://", 1)
             creds, hostpart = tail.split("@", 1)
             if ":" in creds:
                 user, _pwd = creds.split(":", 1)
                 return f"{head}://{user}:******@{hostpart}"
-    except Exception:
-        pass
-    return "******"
+            # If no password in creds, just redact the whole thing
+            return f"{head}://******@{hostpart}"
+
+        # If URL doesn't match expected format, redact everything
+        return "******"
+
+    except ValueError as e:
+        logger.debug(f"URL parsing error during redaction: {e}")
+        return "******"
+    except Exception as e:
+        logger.warning(f"Unexpected error redacting database URL: {e}")
+        return "******"
 
 logger = logging.getLogger(__name__)
 logger.info(f"Creating SQL engine for { _redact_db_url(DATABASE_URL) }")
