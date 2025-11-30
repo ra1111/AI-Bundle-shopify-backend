@@ -379,14 +379,25 @@ class CSVProcessor:
 
         # Log SKU distribution in order lines
         sku_counts = {}
+        variant_id_counts = {}
         for line in order_lines:
             sku = line.get('sku')
+            variant_id = line.get('variant_id')
             sku_counts[sku] = sku_counts.get(sku, 0) + 1
+            if variant_id:
+                variant_id_counts[variant_id] = variant_id_counts.get(variant_id, 0) + 1
 
         logger.info(f"[{upload_id}] 📊 ORDER LINES SKU DISTRIBUTION:")
         logger.info(f"[{upload_id}]   Total unique SKUs: {len(sku_counts)}")
+        logger.info(f"[{upload_id}]   Total unique variant_ids: {len(variant_id_counts)}")
+        logger.info(f"[{upload_id}]   Top SKUs by frequency:")
         for sku, count in sorted(sku_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
-            logger.info(f"[{upload_id}]     {sku}: {count} line items")
+            logger.info(f"[{upload_id}]     SKU='{sku}': {count} line items")
+
+        # Log SKUs with None/empty values
+        none_sku_count = sku_counts.get(None, 0)
+        if none_sku_count > 0:
+            logger.warning(f"[{upload_id}] ⚠️  {none_sku_count} order lines have NULL/empty SKUs!")
 
         # Log order structure
         order_sku_pairs = {}
@@ -567,18 +578,23 @@ class CSVProcessor:
 
         # Log catalog SKU distribution
         catalog_skus = [snap['sku'] for snap in snaps if snap.get('sku')]
+        catalog_skus_with_none = [snap.get('sku') for snap in snaps]
+        none_sku_count = sum(1 for s in catalog_skus_with_none if not s)
+
         logger.info(f"[{upload_id}] 📋 CATALOG CSV PROCESSING - COMPLETED")
         logger.info(f"[{upload_id}]   Total catalog entries: {len(snaps)}")
+        logger.info(f"[{upload_id}]   Entries with valid SKUs: {len(catalog_skus)}")
+        logger.info(f"[{upload_id}]   Entries with NULL/empty SKUs: {none_sku_count}")
         logger.info(f"[{upload_id}]   Unique SKUs in catalog: {len(set(catalog_skus))}")
         logger.info(f"[{upload_id}]   Skipped (archived/draft): {pre_filtered}")
-        logger.info(f"[{upload_id}]   Sample SKUs: {list(set(catalog_skus))[:10]}")
+        logger.info(f"[{upload_id}]   All catalog SKUs: {sorted(list(set(catalog_skus)))}")
 
-        # Log prices
-        prices = [(snap['sku'], float(snap['price'])) for snap in snaps if snap.get('sku') and snap.get('price')]
+        # Log prices with SKU details
+        prices = [(snap['sku'], float(snap['price']), snap.get('variant_id')) for snap in snaps if snap.get('sku') and snap.get('price')]
         if prices:
-            logger.info(f"[{upload_id}] 💰 CATALOG PRICES:")
-            for sku, price in prices[:10]:
-                logger.info(f"[{upload_id}]     {sku}: ${price}")
+            logger.info(f"[{upload_id}] 💰 CATALOG PRICES (showing all):")
+            for sku, price, variant_id in prices:
+                logger.info(f"[{upload_id}]     SKU='{sku}' | price=${price} | variant_id={variant_id}")
 
         logger.info(f"CSV: catalog prepared upload_id={upload_id} run_id={run_id} count={len(snaps)} skipped_status={pre_filtered}")
         if snaps:
@@ -717,8 +733,13 @@ class CSVProcessor:
     def extract_order_line_data(self, row: Dict[str, str], upload_id: str, order_id: str) -> Optional[Dict[str, Any]]:
         variant_id = (row.get('variantId') or row.get('variant_id') or '').strip()
         sku = (row.get('sku') or '').strip()
+
+        # EXTENSIVE SKU LOGGING
         if not (variant_id or sku):
+            logger.debug(f"[{upload_id}] 🔍 SKU EXTRACTION: Skipped row (no variant_id or sku) - order_id={order_id}")
             return None
+
+        logger.debug(f"[{upload_id}] 🔍 SKU EXTRACTION: variant_id='{variant_id}', sku='{sku}', order_id={order_id}")
 
         def as_int(v: str, default=0) -> int:
             try:

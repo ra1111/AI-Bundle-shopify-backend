@@ -1333,11 +1333,30 @@ class BundleGenerator:
 
                 # EXTENSIVE LOGGING: What did we load from database?
                 sku_list = [getattr(line, 'sku', None) for line in order_lines]
+                variant_id_list = [getattr(line, 'variant_id', None) for line in order_lines]
                 unique_skus_loaded = set(filter(None, sku_list))
+                unique_variant_ids_loaded = set(filter(None, variant_id_list))
+                none_sku_count = sum(1 for s in sku_list if not s)
+
                 logger.info(f"[{csv_upload_id}] 📊 QUICK-START PHASE 1 - SKU ANALYSIS:")
                 logger.info(f"[{csv_upload_id}]   Total order lines: {len(order_lines)}")
+                logger.info(f"[{csv_upload_id}]   Order lines with SKU: {len(order_lines) - none_sku_count}")
+                logger.info(f"[{csv_upload_id}]   Order lines with NULL/empty SKU: {none_sku_count}")
                 logger.info(f"[{csv_upload_id}]   Unique SKUs found: {len(unique_skus_loaded)}")
-                logger.info(f"[{csv_upload_id}]   SKU list: {sorted(unique_skus_loaded)}")
+                logger.info(f"[{csv_upload_id}]   Unique variant_ids found: {len(unique_variant_ids_loaded)}")
+                logger.info(f"[{csv_upload_id}]   All SKUs from DB: {sorted(unique_skus_loaded)}")
+
+                # Show SKU type breakdown
+                no_sku_prefix = [s for s in unique_skus_loaded if s and s.startswith('no-sku-')]
+                acc_prefix = [s for s in unique_skus_loaded if s and s.startswith('ACC-')]
+                other_skus = [s for s in unique_skus_loaded if s and not s.startswith('no-sku-') and not s.startswith('ACC-')]
+
+                if no_sku_prefix:
+                    logger.warning(f"[{csv_upload_id}] ⚠️  {len(no_sku_prefix)} SKUs start with 'no-sku-' prefix: {no_sku_prefix}")
+                if acc_prefix:
+                    logger.info(f"[{csv_upload_id}]   {len(acc_prefix)} SKUs start with 'ACC-' prefix: {acc_prefix}")
+                if other_skus:
+                    logger.info(f"[{csv_upload_id}]   {len(other_skus)} SKUs with other formats: {other_skus}")
 
                 # Log order structure
                 order_ids = list(set(filter(None, [getattr(line, 'order_id', None) for line in order_lines])))
@@ -1478,24 +1497,53 @@ class BundleGenerator:
                 catalog_skus = list(catalog.keys())
                 logger.info(f"[{csv_upload_id}] 📋 QUICK-START PHASE 2 - CATALOG ANALYSIS:")
                 logger.info(f"[{csv_upload_id}]   SKUs in catalog: {len(catalog_skus)}")
-                logger.info(f"[{csv_upload_id}]   Catalog SKU list: {sorted(catalog_skus)}")
+                logger.info(f"[{csv_upload_id}]   All catalog SKUs: {sorted(catalog_skus)}")
+
+                # Show SKU type breakdown in catalog
+                no_sku_catalog = [s for s in catalog_skus if s and s.startswith('no-sku-')]
+                acc_catalog = [s for s in catalog_skus if s and s.startswith('ACC-')]
+                other_catalog = [s for s in catalog_skus if s and not s.startswith('no-sku-') and not s.startswith('ACC-')]
+
+                logger.info(f"[{csv_upload_id}]   Catalog SKUs with 'no-sku-' prefix: {len(no_sku_catalog)}")
+                logger.info(f"[{csv_upload_id}]   Catalog SKUs with 'ACC-' prefix: {len(acc_catalog)}")
+                logger.info(f"[{csv_upload_id}]   Catalog SKUs with other formats: {len(other_catalog)}")
 
                 # Check for price data
                 skus_with_price = [sku for sku, snap in catalog.items() if getattr(snap, 'price', 0) and float(getattr(snap, 'price', 0)) > 0]
-                logger.info(f"[{csv_upload_id}]   SKUs with valid prices: {len(skus_with_price)}")
+                skus_without_price = [sku for sku in catalog_skus if sku not in skus_with_price]
+
+                logger.info(f"[{csv_upload_id}]   SKUs with valid prices (>$0): {len(skus_with_price)}")
+                logger.info(f"[{csv_upload_id}]   SKUs with invalid/zero prices: {len(skus_without_price)}")
+
                 if skus_with_price:
-                    for sku in skus_with_price[:5]:
+                    logger.info(f"[{csv_upload_id}] 💰 CATALOG PRICES (all entries):")
+                    for sku in sorted(skus_with_price):
                         price = float(getattr(catalog[sku], 'price', 0))
-                        logger.info(f"[{csv_upload_id}]     {sku}: ${price}")
+                        variant_id = getattr(catalog[sku], 'variant_id', 'N/A')
+                        logger.info(f"[{csv_upload_id}]     SKU='{sku}' | price=${price} | variant_id={variant_id}")
+
+                if skus_without_price:
+                    logger.warning(f"[{csv_upload_id}] ⚠️  SKUs in catalog with ZERO/NULL prices: {skus_without_price}")
 
                 # Cross-check with order SKUs
                 order_skus = set(filter(None, [getattr(line, 'sku', None) for line in order_lines]))
                 catalog_sku_set = set(catalog_skus)
                 missing_in_catalog = order_skus - catalog_sku_set
+                missing_in_orders = catalog_sku_set - order_skus
+
+                logger.info(f"[{csv_upload_id}] 🔍 SKU CROSS-CHECK (Orders vs Catalog):")
+                logger.info(f"[{csv_upload_id}]   SKUs in orders: {len(order_skus)}")
+                logger.info(f"[{csv_upload_id}]   SKUs in catalog: {len(catalog_sku_set)}")
+                logger.info(f"[{csv_upload_id}]   SKUs in BOTH: {len(order_skus & catalog_sku_set)}")
+
                 if missing_in_catalog:
-                    logger.warning(f"[{csv_upload_id}] ⚠️  SKUs in orders but NOT in catalog: {missing_in_catalog}")
+                    logger.error(f"[{csv_upload_id}] ❌ SKUs in orders but NOT in catalog ({len(missing_in_catalog)}): {sorted(missing_in_catalog)}")
+                    logger.error(f"[{csv_upload_id}]    This will cause catalog lookup failures and 0 bundles!")
                 else:
                     logger.info(f"[{csv_upload_id}] ✅ All order SKUs found in catalog!")
+
+                if missing_in_orders:
+                    logger.info(f"[{csv_upload_id}] ℹ️  SKUs in catalog but not in orders ({len(missing_in_orders)}): {sorted(missing_in_orders)}")
 
             except Exception as cat_e:
                 catalog_duration = (time.time() - catalog_start) * 1000
@@ -4765,14 +4813,18 @@ def _build_quick_start_fbt_bundles(
         p2 = catalog.get(sku2)
         if not p1 or not p2:
             catalog_miss_count += 1
-            logger.warning(f"[{csv_upload_id}]   Catalog miss: {sku1}+{sku2} (p1={p1 is not None}, p2={p2 is not None})")
+            logger.warning(f"[{csv_upload_id}]   ❌ Catalog miss: SKU1='{sku1}' SKU2='{sku2}' | p1_exists={p1 is not None}, p2_exists={p2 is not None}")
+            if not p1:
+                logger.warning(f"[{csv_upload_id}]      SKU '{sku1}' not found in catalog (tried exact match)")
+            if not p2:
+                logger.warning(f"[{csv_upload_id}]      SKU '{sku2}' not found in catalog (tried exact match)")
             continue
 
         price1 = float(getattr(p1, 'price', 0) or 0)
         price2 = float(getattr(p2, 'price', 0) or 0)
         if price1 <= 0 or price2 <= 0:
             price_fail_count += 1
-            logger.warning(f"[{csv_upload_id}]   Price invalid: {sku1}+{sku2} (p1=${price1}, p2=${price2})")
+            logger.warning(f"[{csv_upload_id}]   ❌ Price invalid: SKU1='{sku1}' SKU2='{sku2}' | price1=${price1}, price2=${price2}")
             continue
 
         total_price = price1 + price2
