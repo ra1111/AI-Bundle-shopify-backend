@@ -355,6 +355,9 @@ class CSVProcessor:
     # ---------- Orders (unchanged, but with sanitizers) ----------
 
     async def process_orders_csv(self, rows: List[Dict[str, str]], upload_id: str) -> None:
+        logger.info(f"[{upload_id}] 📦 ORDERS CSV PROCESSING - STARTED")
+        logger.info(f"[{upload_id}]   Total rows to process: {len(rows)}")
+
         orders_map: Dict[str, Dict[str, Any]] = {}
         order_lines: List[Dict[str, Any]] = []
 
@@ -374,12 +377,35 @@ class CSVProcessor:
                 logger.warning(f"Error processing order row: {e}")
                 continue
 
+        # Log SKU distribution in order lines
+        sku_counts = {}
+        for line in order_lines:
+            sku = line.get('sku')
+            sku_counts[sku] = sku_counts.get(sku, 0) + 1
+
+        logger.info(f"[{upload_id}] 📊 ORDER LINES SKU DISTRIBUTION:")
+        logger.info(f"[{upload_id}]   Total unique SKUs: {len(sku_counts)}")
+        for sku, count in sorted(sku_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
+            logger.info(f"[{upload_id}]     {sku}: {count} line items")
+
+        # Log order structure
+        order_sku_pairs = {}
+        for order_id, order_data in orders_map.items():
+            order_skus = [line['sku'] for line in order_lines if line.get('order_id') == order_id]
+            if len(order_skus) >= 2:
+                order_sku_pairs[order_id] = order_skus
+
+        logger.info(f"[{upload_id}] 📦 ORDERS WITH MULTIPLE ITEMS:")
+        logger.info(f"[{upload_id}]   Orders with 2+ items: {len(order_sku_pairs)}/{len(orders_map)}")
+        for order_id, skus in list(order_sku_pairs.items())[:5]:
+            logger.info(f"[{upload_id}]     {order_id}: {skus}")
+
         if orders_map:
             await storage.create_orders([self._filter_order_fields(o) for o in orders_map.values()])
-            logger.info(f"Created {len(orders_map)} orders")
+            logger.info(f"[{upload_id}] ✅ Created {len(orders_map)} orders in database")
         if order_lines:
             await storage.create_order_lines(order_lines)
-            logger.info(f"Created {len(order_lines)} order lines")
+            logger.info(f"[{upload_id}] ✅ Created {len(order_lines)} order lines in database")
 
     # ---------- Variants ----------
 
@@ -539,11 +565,26 @@ class CSVProcessor:
                 logger.warning(f"Error processing catalog row: {e}")
                 continue
 
+        # Log catalog SKU distribution
+        catalog_skus = [snap['sku'] for snap in snaps if snap.get('sku')]
+        logger.info(f"[{upload_id}] 📋 CATALOG CSV PROCESSING - COMPLETED")
+        logger.info(f"[{upload_id}]   Total catalog entries: {len(snaps)}")
+        logger.info(f"[{upload_id}]   Unique SKUs in catalog: {len(set(catalog_skus))}")
+        logger.info(f"[{upload_id}]   Skipped (archived/draft): {pre_filtered}")
+        logger.info(f"[{upload_id}]   Sample SKUs: {list(set(catalog_skus))[:10]}")
+
+        # Log prices
+        prices = [(snap['sku'], float(snap['price'])) for snap in snaps if snap.get('sku') and snap.get('price')]
+        if prices:
+            logger.info(f"[{upload_id}] 💰 CATALOG PRICES:")
+            for sku, price in prices[:10]:
+                logger.info(f"[{upload_id}]     {sku}: ${price}")
+
         logger.info(f"CSV: catalog prepared upload_id={upload_id} run_id={run_id} count={len(snaps)} skipped_status={pre_filtered}")
         if snaps:
             await storage.create_catalog_snapshots(snaps)
             dur_ms = int((time.time() - t0) * 1000)
-            logger.info(f"CSV: catalog created upload_id={upload_id} run_id={run_id} count={len(snaps)} durMs={dur_ms}")
+            logger.info(f"[{upload_id}] ✅ CSV: catalog created upload_id={upload_id} run_id={run_id} count={len(snaps)} durMs={dur_ms}")
             # Best-effort post-computation; non-fatal if it fails
             try:
                 await storage.recompute_catalog_objectives(upload_id)

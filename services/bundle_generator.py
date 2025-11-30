@@ -1330,6 +1330,23 @@ class BundleGenerator:
                     f"[{csv_upload_id}] ✅ Database query completed in {phase1_db_duration:.0f}ms\n"
                     f"  Order lines loaded: {len(order_lines)}"
                 )
+
+                # EXTENSIVE LOGGING: What did we load from database?
+                sku_list = [getattr(line, 'sku', None) for line in order_lines]
+                unique_skus_loaded = set(filter(None, sku_list))
+                logger.info(f"[{csv_upload_id}] 📊 QUICK-START PHASE 1 - SKU ANALYSIS:")
+                logger.info(f"[{csv_upload_id}]   Total order lines: {len(order_lines)}")
+                logger.info(f"[{csv_upload_id}]   Unique SKUs found: {len(unique_skus_loaded)}")
+                logger.info(f"[{csv_upload_id}]   SKU list: {sorted(unique_skus_loaded)}")
+
+                # Log order structure
+                order_ids = list(set(filter(None, [getattr(line, 'order_id', None) for line in order_lines])))
+                logger.info(f"[{csv_upload_id}]   Unique orders: {len(order_ids)}")
+                if len(order_ids) > 0 and len(order_ids) <= 5:
+                    for oid in order_ids[:5]:
+                        order_skus = [getattr(line, 'sku', None) for line in order_lines if getattr(line, 'order_id', None) == oid]
+                        logger.info(f"[{csv_upload_id}]     Order {oid}: {order_skus}")
+
             except Exception as db_e:
                 phase1_db_duration = (time.time() - phase1_start) * 1000
                 logger.error(
@@ -1456,6 +1473,30 @@ class BundleGenerator:
                     f"[{csv_upload_id}] ✅ Catalog loaded in {catalog_duration:.0f}ms\n"
                     f"  Catalog entries: {len(catalog)}"
                 )
+
+                # EXTENSIVE LOGGING: Catalog contents
+                catalog_skus = list(catalog.keys())
+                logger.info(f"[{csv_upload_id}] 📋 QUICK-START PHASE 2 - CATALOG ANALYSIS:")
+                logger.info(f"[{csv_upload_id}]   SKUs in catalog: {len(catalog_skus)}")
+                logger.info(f"[{csv_upload_id}]   Catalog SKU list: {sorted(catalog_skus)}")
+
+                # Check for price data
+                skus_with_price = [sku for sku, snap in catalog.items() if getattr(snap, 'price', 0) and float(getattr(snap, 'price', 0)) > 0]
+                logger.info(f"[{csv_upload_id}]   SKUs with valid prices: {len(skus_with_price)}")
+                if skus_with_price:
+                    for sku in skus_with_price[:5]:
+                        price = float(getattr(catalog[sku], 'price', 0))
+                        logger.info(f"[{csv_upload_id}]     {sku}: ${price}")
+
+                # Cross-check with order SKUs
+                order_skus = set(filter(None, [getattr(line, 'sku', None) for line in order_lines]))
+                catalog_sku_set = set(catalog_skus)
+                missing_in_catalog = order_skus - catalog_sku_set
+                if missing_in_catalog:
+                    logger.warning(f"[{csv_upload_id}] ⚠️  SKUs in orders but NOT in catalog: {missing_in_catalog}")
+                else:
+                    logger.info(f"[{csv_upload_id}] ✅ All order SKUs found in catalog!")
+
             except Exception as cat_e:
                 catalog_duration = (time.time() - catalog_start) * 1000
                 logger.error(
@@ -4648,6 +4689,10 @@ def _build_quick_start_fbt_bundles(
     from collections import defaultdict
     from services.ml.pseudo_item2vec import cosine_similarity
 
+    logger.info(f"[{csv_upload_id}] 🔗 FBT BUNDLE GENERATION - STARTED")
+    logger.info(f"[{csv_upload_id}]   Input: {len(filtered_lines)} order lines")
+    logger.info(f"[{csv_upload_id}]   Target: {max_fbt_bundles} FBT bundles")
+
     order_groups: Dict[str, List[str]] = defaultdict(list)
 
     for line in filtered_lines:
@@ -4655,6 +4700,8 @@ def _build_quick_start_fbt_bundles(
         sku = getattr(line, 'sku', None)
         if order_id and sku:
             order_groups[order_id].append(sku)
+
+    logger.info(f"[{csv_upload_id}]   Orders grouped: {len(order_groups)}")
 
     sku_pairs: Dict[tuple, int] = defaultdict(int)
 
@@ -4665,11 +4712,18 @@ def _build_quick_start_fbt_bundles(
                 pair = tuple(sorted((sku1, sku2)))
                 sku_pairs[pair] += 1
 
+    logger.info(f"[{csv_upload_id}] 📊 SKU PAIRS FOUND:")
+    logger.info(f"[{csv_upload_id}]   Total unique pairs: {len(sku_pairs)}")
+    for pair, count in sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)[:10]:
+        logger.info(f"[{csv_upload_id}]     {pair[0]} + {pair[1]}: {count} times")
+
     if not sku_pairs:
+        logger.warning(f"[{csv_upload_id}] ⚠️  No SKU pairs found! Returning 0 bundles.")
         return []
 
     # MODERN: Score pairs using co-visitation similarity + co-occurrence
     scored_pairs = []
+    filtered_out_count = 0
     for (sku1, sku2), count in sku_pairs.items():
         # Get co-visitation similarity (0-1 range)
         covis_sim = 0.0
@@ -4686,14 +4740,23 @@ def _build_quick_start_fbt_bundles(
 
         # Require minimum quality: either good similarity OR multiple co-purchases
         if covis_sim < 0.1 and count < 2:
+            filtered_out_count += 1
+            logger.debug(f"[{csv_upload_id}]   Filtered: {sku1}+{sku2} (covis={covis_sim:.2f}, count={count})")
             continue  # Skip weak pairs
 
         scored_pairs.append(((sku1, sku2), count, covis_sim, blended_score))
+
+    logger.info(f"[{csv_upload_id}] ✅ Scoring complete:")
+    logger.info(f"[{csv_upload_id}]   Pairs after filtering: {len(scored_pairs)}/{len(sku_pairs)}")
+    logger.info(f"[{csv_upload_id}]   Filtered out (weak): {filtered_out_count}")
 
     # Sort by blended score (descending)
     scored_pairs.sort(key=lambda x: x[3], reverse=True)
 
     recommendations: List[Dict[str, Any]] = []
+    catalog_miss_count = 0
+    price_fail_count = 0
+
     for (sku1, sku2), count, covis_sim, blended_score in scored_pairs:
         if len(recommendations) >= max_fbt_bundles * 3:  # Generate more candidates for filtering
             break
@@ -4701,11 +4764,15 @@ def _build_quick_start_fbt_bundles(
         p1 = catalog.get(sku1)
         p2 = catalog.get(sku2)
         if not p1 or not p2:
+            catalog_miss_count += 1
+            logger.warning(f"[{csv_upload_id}]   Catalog miss: {sku1}+{sku2} (p1={p1 is not None}, p2={p2 is not None})")
             continue
 
         price1 = float(getattr(p1, 'price', 0) or 0)
         price2 = float(getattr(p2, 'price', 0) or 0)
         if price1 <= 0 or price2 <= 0:
+            price_fail_count += 1
+            logger.warning(f"[{csv_upload_id}]   Price invalid: {sku1}+{sku2} (p1=${price1}, p2=${price2})")
             continue
 
         total_price = price1 + price2
@@ -4783,6 +4850,17 @@ def _build_quick_start_fbt_bundles(
         if len(recommendations) >= max_fbt_bundles:
             break
 
+    logger.info(f"[{csv_upload_id}] 🎉 FBT BUNDLE GENERATION - COMPLETED")
+    logger.info(f"[{csv_upload_id}]   Bundles created: {len(recommendations)}")
+    logger.info(f"[{csv_upload_id}]   Catalog misses: {catalog_miss_count}")
+    logger.info(f"[{csv_upload_id}]   Price failures: {price_fail_count}")
+    if len(recommendations) == 0:
+        logger.error(f"[{csv_upload_id}] ❌ ZERO FBT BUNDLES CREATED!")
+        logger.error(f"[{csv_upload_id}]   Possible reasons:")
+        logger.error(f"[{csv_upload_id}]     - SKU pairs filtered out: {filtered_out_count}")
+        logger.error(f"[{csv_upload_id}]     - Catalog lookup failures: {catalog_miss_count}")
+        logger.error(f"[{csv_upload_id}]     - Invalid prices: {price_fail_count}")
+
     return recommendations
 
 
@@ -4799,6 +4877,9 @@ def _build_quick_start_bogo_bundles(
     - available_total > 5
     - Buy 2, get 1 effectively 50% off (3 units for price of 2)
     """
+    logger.info(f"[{csv_upload_id}] 🎁 BOGO BUNDLE GENERATION - STARTED")
+    logger.info(f"[{csv_upload_id}]   Target: {max_bogo_bundles} BOGO bundles")
+
     candidates = []
     for sku, snap in catalog.items():
         try:
@@ -4809,7 +4890,10 @@ def _build_quick_start_bogo_bundles(
         if getattr(snap, "is_slow_mover", False) and available > 5:
             candidates.append((sku, available, snap))
 
+    logger.info(f"[{csv_upload_id}]   Slow-mover candidates found: {len(candidates)}/{len(catalog)}")
+
     if not candidates:
+        logger.warning(f"[{csv_upload_id}] ⚠️  No slow-mover products found for BOGO!")
         return []
 
     # Sort by excess inventory (desc)
@@ -4864,6 +4948,9 @@ def _build_quick_start_bogo_bundles(
             "created_at": datetime.utcnow(),
         })
 
+    logger.info(f"[{csv_upload_id}] 🎉 BOGO BUNDLE GENERATION - COMPLETED")
+    logger.info(f"[{csv_upload_id}]   Bundles created: {len(bundles)}")
+
     return bundles
 
 
@@ -4882,6 +4969,9 @@ def _build_quick_start_volume_bundles(
     - Popular SKUs (based on sku_sales)
     - Sufficient stock (available_total > 20)
     """
+    logger.info(f"[{csv_upload_id}] 📦 VOLUME BUNDLE GENERATION - STARTED")
+    logger.info(f"[{csv_upload_id}]   Target: {max_volume_bundles} VOLUME bundles")
+
     candidates = []
     for sku, units_sold in sku_sales.items():
         snap = catalog.get(sku)
@@ -4897,7 +4987,10 @@ def _build_quick_start_volume_bundles(
         if available > 20 and units_sold >= 3:
             candidates.append((sku, units_sold, available, snap))
 
+    logger.info(f"[{csv_upload_id}]   High-stock candidates found: {len(candidates)}/{len(sku_sales)}")
+
     if not candidates:
+        logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
         return []
 
     # Sort by units sold desc, then stock desc
@@ -4947,6 +5040,9 @@ def _build_quick_start_volume_bundles(
             "is_approved": True,
             "created_at": datetime.utcnow(),
         })
+
+    logger.info(f"[{csv_upload_id}] 🎉 VOLUME BUNDLE GENERATION - COMPLETED")
+    logger.info(f"[{csv_upload_id}]   Bundles created: {len(bundles)}")
 
     return bundles
 
