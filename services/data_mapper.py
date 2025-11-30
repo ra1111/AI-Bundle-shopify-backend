@@ -14,7 +14,7 @@ from collections import deque
 
 from services.feature_flags import feature_flags
 
-from services.storage import storage
+from services.storage import storage, update_csv_upload_status, summarize_upload_coverage
 
 try:
     from opentelemetry import trace
@@ -185,10 +185,14 @@ class DataMapper:
         
         metrics = {
             "total_order_lines": 0,
+            "order_line_count": 0,
             "resolved_variants": 0,
             "unresolved_skus": 0,
             "missing_inventory": 0,
-            "enriched_lines": 0
+            "enriched_lines": 0,
+            "variant_count": 0,
+            "catalog_count": 0,
+            "blocked_no_variants_or_catalog": False,
         }
 
         unresolved_samples: List[str] = []
@@ -204,6 +208,34 @@ class DataMapper:
             # Resolve run_id to correlate across files
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
             logger.info(f"[{csv_upload_id}] ✅ run_id resolved: {run_id or 'None (using upload_id)'}")
+
+            # Optional: backfill missing order_line.sku values from variants when available.
+            if feature_flags.get_flag("data_mapping.backfill_order_line_skus", True):
+                backfilled = await storage.backfill_order_line_skus_from_variants(csv_upload_id, run_id)
+                if backfilled:
+                    logger.info(
+                        "[%s] Backfilled %d order_lines.sku from variants (run=%s)",
+                        csv_upload_id,
+                        backfilled,
+                        run_id,
+                    )
+                    metrics["order_line_skus_backfilled"] = backfilled
+
+            # Snapshot coverage counts up front for easier debugging and metrics.
+            try:
+                coverage = await summarize_upload_coverage(csv_upload_id, run_id)
+                metrics["order_count"] = coverage.get("orders", 0)
+                metrics["order_line_count"] = coverage.get("order_lines", 0)
+                metrics["variant_count"] = coverage.get("variants", 0)
+                metrics["catalog_count"] = coverage.get("catalog", 0)
+            except Exception as exc:
+                logger.warning(
+                    "[%s] Coverage summary failed (run=%s): %s",
+                    csv_upload_id,
+                    run_id,
+                    exc,
+                )
+                coverage = {}
             
             # Get all order lines for this upload (or entire run if available)
             logger.info(f"[{csv_upload_id}] 📦 Step 2: Fetching order lines...")
@@ -225,6 +257,7 @@ class DataMapper:
             )
 
             metrics["total_order_lines"] = len(order_lines)
+            metrics["order_line_count"] = len(order_lines)
             
             if not order_lines:
                 logger.warning(f"[{csv_upload_id}] ⚠️ No order lines found - returning early")
@@ -249,9 +282,44 @@ class DataMapper:
             
             logger.info(
                 f"[{csv_upload_id}] ✅ Prefetch complete in {prefetch_duration * 1000:.0f}ms\n"
-                f"  Variants: {len(prefetch_data.get('variant_map', {}))}\n"
+                f"  Variants: {len(prefetch_data.get('variants_by_sku', {}))}\n"
                 f"  Catalog: {len(prefetch_data.get('catalog_map', {}))}"
             )
+
+            # Hard-stop if the upload/run has no variant or catalog rows. This indicates ingestion never ran.
+            if feature_flags.get_flag("data_mapping.block_on_missing_variant_catalog", True):
+                counts = await storage.count_variant_and_catalog_records(csv_upload_id, run_id)
+                variant_count = counts.get("variant_count", metrics.get("variant_count", 0))
+                catalog_count = counts.get("catalog_count", metrics.get("catalog_count", 0))
+                metrics["variant_count"] = variant_count
+                metrics["catalog_count"] = catalog_count
+                if variant_count == 0 or catalog_count == 0:
+                    metrics["blocked_no_variants_or_catalog"] = True
+                    error_message = (
+                        f"Phase 1 blocked: variants={variant_count}, catalog={catalog_count} "
+                        f"for upload={csv_upload_id}"
+                    )
+                    try:
+                        await update_csv_upload_status(
+                            csv_upload_id=csv_upload_id,
+                            status="blocked_missing_catalog",
+                            error_message=error_message,
+                            extra_metrics=metrics,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Failed to mark upload as blocked_missing_catalog: %s",
+                            csv_upload_id,
+                            exc,
+                        )
+                    logger.error(
+                        "[%s] 🚫 Blocking Phase 1: no variants/catalog found (variant_count=%d, catalog_count=%d, run_id=%s)",
+                        csv_upload_id,
+                        variant_count,
+                        catalog_count,
+                        run_id,
+                    )
+                    return {"metrics": metrics, "enriched_lines": []}
 
             scope = prefetch_data.get("scope", self._scope_key(csv_upload_id, run_id))
             default_batch = feature_flags.get_flag("data_mapping.prefetch_batch_size", 100) or 100

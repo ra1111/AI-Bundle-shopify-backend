@@ -295,6 +295,23 @@ class StorageService:
                 await session.commit()
                 await session.refresh(upload)
             return upload
+
+    async def update_csv_upload_status(
+        self,
+        csv_upload_id: str,
+        status: str,
+        error_message: Optional[str] = None,
+        extra_metrics: Optional[Dict[str, Any]] = None,
+    ) -> Optional[CsvUpload]:
+        """Update upload status with optional error and metrics payload."""
+        if not csv_upload_id:
+            return None
+        updates: Dict[str, Any] = {"status": status}
+        if error_message is not None:
+            updates["error_message"] = error_message
+        if extra_metrics is not None:
+            updates["bundle_generation_metrics"] = extra_metrics
+        return await self.update_csv_upload(csv_upload_id, updates)
     
     async def get_recent_uploads(self, limit: int = 10) -> List[CsvUpload]:
         """Get recent CSV uploads"""
@@ -979,6 +996,153 @@ class StorageService:
             result = await session.execute(query)
             return list(result.scalars().all())
 
+    async def count_variant_and_catalog_records(
+        self, csv_upload_id: Optional[str], run_id: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Count variants and catalog snapshots for an upload or run."""
+        if not csv_upload_id and not run_id:
+            raise ValueError("csv_upload_id or run_id is required")
+
+        async with self.get_session() as session:
+            if run_id:
+                variant_query = (
+                    select(func.count())
+                    .select_from(Variant)
+                    .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
+                    .where(CsvUpload.run_id == run_id)
+                )
+                catalog_query = (
+                    select(func.count())
+                    .select_from(CatalogSnapshot)
+                    .join(CsvUpload, CatalogSnapshot.csv_upload_id == CsvUpload.id)
+                    .where(CsvUpload.run_id == run_id)
+                )
+            else:
+                variant_query = select(func.count()).select_from(Variant).where(Variant.csv_upload_id == csv_upload_id)
+                catalog_query = (
+                    select(func.count()).select_from(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)
+                )
+
+            variant_count = (await session.execute(variant_query)).scalar_one() or 0
+            catalog_count = (await session.execute(catalog_query)).scalar_one() or 0
+            return {"variant_count": int(variant_count), "catalog_count": int(catalog_count)}
+
+    async def _count_orders_and_lines(
+        self, csv_upload_id: Optional[str], run_id: Optional[str] = None
+    ) -> Dict[str, int]:
+        """Count orders and order_lines scoped to an upload or run."""
+        if not csv_upload_id and not run_id:
+            raise ValueError("csv_upload_id or run_id is required")
+
+        async with self.get_session() as session:
+            if run_id:
+                orders_query = (
+                    select(func.count())
+                    .select_from(Order)
+                    .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
+                    .where(CsvUpload.run_id == run_id)
+                )
+                order_lines_query = (
+                    select(func.count())
+                    .select_from(OrderLine)
+                    .join(CsvUpload, OrderLine.csv_upload_id == CsvUpload.id)
+                    .where(CsvUpload.run_id == run_id)
+                )
+            else:
+                orders_query = select(func.count()).select_from(Order).where(Order.csv_upload_id == csv_upload_id)
+                order_lines_query = (
+                    select(func.count())
+                    .select_from(OrderLine)
+                    .where(OrderLine.csv_upload_id == csv_upload_id)
+                )
+
+            order_count = (await session.execute(orders_query)).scalar_one() or 0
+            order_line_count = (await session.execute(order_lines_query)).scalar_one() or 0
+            return {"order_count": int(order_count), "order_line_count": int(order_line_count)}
+
+    async def summarize_upload_coverage(
+        self, csv_upload_id: str, run_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Summarize ingestion coverage for an upload/run: orders, order_lines, variants, catalog.
+        """
+        if not csv_upload_id:
+            raise ValueError("csv_upload_id is required")
+
+        resolved_run_id = run_id or await self.get_run_id_for_upload(csv_upload_id)
+        orders = await self._count_orders_and_lines(csv_upload_id, resolved_run_id)
+        variants = await self.count_variant_and_catalog_records(csv_upload_id, resolved_run_id)
+
+        summary = {
+            "csv_upload_id": csv_upload_id,
+            "run_id": resolved_run_id,
+            "orders": orders.get("order_count", 0),
+            "order_lines": orders.get("order_line_count", 0),
+            "variants": variants.get("variant_count", 0),
+            "catalog": variants.get("catalog_count", 0),
+        }
+        logger.info(
+            "[%s] Coverage summary | run=%s orders=%d order_lines=%d variants=%d catalog=%d",
+            csv_upload_id,
+            resolved_run_id,
+            summary["orders"],
+            summary["order_lines"],
+            summary["variants"],
+            summary["catalog"],
+        )
+        return summary
+
+    async def backfill_order_line_skus_from_variants(
+        self, csv_upload_id: Optional[str] = None, run_id: Optional[str] = None
+    ) -> int:
+        """Populate missing order_lines.sku from variants when variant_id matches."""
+        if not csv_upload_id and not run_id:
+            raise ValueError("csv_upload_id or run_id is required")
+
+        async with self.get_session() as session:
+            if run_id:
+                stmt = text(
+                    """
+                    UPDATE order_lines ol
+                    SET sku = v.sku
+                    FROM variants v
+                    JOIN csv_uploads cu_v ON cu_v.id = v.csv_upload_id
+                    JOIN csv_uploads cu_ol ON cu_ol.id = ol.csv_upload_id
+                    WHERE ol.variant_id = v.variant_id
+                      AND cu_v.run_id = :run_id
+                      AND cu_ol.run_id = :run_id
+                      AND (ol.sku IS NULL OR TRIM(ol.sku) = '')
+                      AND v.sku IS NOT NULL
+                    """
+                )
+                params = {"run_id": run_id}
+            else:
+                stmt = text(
+                    """
+                    UPDATE order_lines ol
+                    SET sku = v.sku
+                    FROM variants v
+                    WHERE ol.variant_id = v.variant_id
+                      AND ol.csv_upload_id = :csv_upload_id
+                      AND v.csv_upload_id = :csv_upload_id
+                      AND (ol.sku IS NULL OR TRIM(ol.sku) = '')
+                      AND v.sku IS NOT NULL
+                    """
+                )
+                params = {"csv_upload_id": csv_upload_id}
+
+            result = await session.execute(stmt, params)
+            await session.commit()
+            updated = result.rowcount or 0
+            if updated:
+                logger.info(
+                    "Backfilled %d order_lines.sku from variants (upload=%s run=%s)",
+                    updated,
+                    csv_upload_id,
+                    run_id,
+                )
+            return int(updated)
+
     async def get_variant_maps(self, csv_upload_id: str) -> Tuple[Dict[str, Variant], Dict[str, Variant]]:
         """Return variants keyed by SKU and variant_id for a CSV upload."""
         variants = await self.get_variants(csv_upload_id)
@@ -1605,3 +1769,22 @@ class StorageService:
 # Global storage instance
 storage = StorageService()
 storage.client = storage
+
+
+# Convenience wrappers for async callers that import functions directly
+async def update_csv_upload_status(
+    csv_upload_id: str,
+    status: str,
+    error_message: Optional[str] = None,
+    extra_metrics: Optional[Dict[str, Any]] = None,
+) -> Optional[CsvUpload]:
+    return await storage.update_csv_upload_status(
+        csv_upload_id,
+        status,
+        error_message=error_message,
+        extra_metrics=extra_metrics,
+    )
+
+
+async def summarize_upload_coverage(csv_upload_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+    return await storage.summarize_upload_coverage(csv_upload_id, run_id)

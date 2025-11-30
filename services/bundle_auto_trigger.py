@@ -13,7 +13,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
 
-from services.storage import storage
+from services.storage import storage, update_csv_upload_status
 from services.progress_tracker import update_generation_progress
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,34 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
             "Auto-bundle: skipping orders upload %s (status=%s)",
             orders_upload_id,
             orders_status,
+        )
+        return
+
+    # Ensure ingestion for variants/catalog is complete before queueing Phase 1.
+    try:
+        coverage = await storage.summarize_upload_coverage(orders_upload_id, run_id)
+        variant_count = coverage.get("variants", 0)
+        catalog_count = coverage.get("catalog", 0)
+        if variant_count == 0 or catalog_count == 0:
+            logger.warning(
+                "Auto-bundle: NOT scheduling bundle generation for %s (variants=%d catalog=%d)",
+                orders_upload_id,
+                variant_count,
+                catalog_count,
+            )
+            await update_csv_upload_status(
+                csv_upload_id=orders_upload_id,
+                status="ingestion_incomplete",
+                error_message="Variants/catalog not yet ingested; bundle generation not scheduled.",
+                extra_metrics=coverage,
+            )
+            return
+    except Exception as exc:
+        logger.warning(
+            "Auto-bundle: coverage check failed for upload %s (run %s): %s",
+            orders_upload_id,
+            run_id,
+            exc,
         )
         return
 
