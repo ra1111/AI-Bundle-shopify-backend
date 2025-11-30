@@ -1531,19 +1531,19 @@ class StorageService:
     
     async def get_catalog_snapshots_map(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
         """
-        ARCHITECT FIX: Safe method that returns catalog as SKU->CatalogSnapshot dict.
-        Uses variant_id as fallback key when SKU is missing/empty (handles Shopify stores without SKUs).
+        ARCHITECTURE: Returns catalog as variant_id->CatalogSnapshot dict.
+        Uses variant_id as primary key (always exists, immutable, unique).
+        SKU is stored in snapshot for display/merchant reference.
         """
         try:
             snapshots = await self.get_catalog_snapshots_by_upload(csv_upload_id)
             result = {}
             for snapshot in snapshots:
-                # Use SKU if available, otherwise use variant_id as fallback
-                # This handles Shopify stores where products don't have SKUs configured
-                key = snapshot.sku if snapshot.sku else snapshot.variant_id
-                if key:
-                    result[key] = snapshot
-            logger.info(f"[{csv_upload_id}] Catalog map built: {len(result)} entries (SKU + variant_id fallback)")
+                # ARCHITECTURE: Use variant_id as primary key
+                # SKU remains in snapshot.sku for display purposes
+                if snapshot.variant_id:
+                    result[snapshot.variant_id] = snapshot
+            logger.info(f"[{csv_upload_id}] Catalog map built: {len(result)} entries (variant_id as key)")
             return result
         except Exception as e:
             logger.error(f"Error building catalog map for {csv_upload_id}: {e}")

@@ -1426,16 +1426,14 @@ class BundleGenerator:
             sku_sales = Counter()
             unique_skus = set()
             for line in order_lines:
-                sku = getattr(line, 'sku', None)
                 variant_id = getattr(line, 'variant_id', None)
                 quantity = getattr(line, 'quantity', 0) or 0
 
-                # Use SKU if available, otherwise use variant_id as fallback
-                product_key = sku if sku else variant_id
-
-                if product_key:
-                    unique_skus.add(product_key)
-                    sku_sales[product_key] += quantity
+                # ARCHITECTURE: Use variant_id as primary key (always exists, immutable, unique)
+                # SKU is stored in catalog for display/merchant reference only
+                if variant_id:
+                    unique_skus.add(variant_id)
+                    sku_sales[variant_id] += quantity
 
             logger.info(
                 f"[{csv_upload_id}] Quick-start: Found {len(unique_skus)} unique products (SKU or variant_id), "
@@ -1477,10 +1475,9 @@ class BundleGenerator:
             top_skus_set = set(top_skus)
             filtered_lines = []
             for line in order_lines:
-                sku = getattr(line, 'sku', None)
                 variant_id = getattr(line, 'variant_id', None)
-                product_key = sku if sku else variant_id
-                if product_key in top_skus_set:
+                # Use variant_id as primary key (consistent with above)
+                if variant_id and variant_id in top_skus_set:
                     filtered_lines.append(line)
 
             logger.info(
@@ -4774,15 +4771,12 @@ def _build_quick_start_fbt_bundles(
 
     for line in filtered_lines:
         order_id = getattr(line, 'order_id', None)
-        sku = getattr(line, 'sku', None)
         variant_id = getattr(line, 'variant_id', None)
 
-        # Use SKU if available, otherwise use variant_id as fallback
-        # This handles Shopify stores where products don't have SKUs configured
-        product_key = sku if sku else variant_id
-
-        if order_id and product_key:
-            order_groups[order_id].append(product_key)
+        # ARCHITECTURE: Use variant_id as primary key (always exists, immutable, unique)
+        # SKU is retrieved from catalog when building bundle display data
+        if order_id and variant_id:
+            order_groups[order_id].append(variant_id)
 
     logger.info(f"[{csv_upload_id}]   Orders grouped: {len(order_groups)}")
 
