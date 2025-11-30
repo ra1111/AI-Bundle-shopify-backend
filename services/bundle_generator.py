@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import random
 import math
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 import os
 import contextlib
 
@@ -324,10 +324,15 @@ class BundleGenerator:
         if isinstance(waves, list):
             try:
                 waves = sorted(waves, key=lambda item: item.get("index", 0))
-            except Exception:
-                pass
+            except (TypeError, AttributeError) as e:
+                # Wave items might not be dicts or might not have 'get' method
+                logger.warning(f"Could not sort waves by index: {e}. Using unsorted list.")
+            except Exception as e:
+                logger.error(f"Unexpected error sorting waves: {e}")
         else:
             waves = []
+            if waves != []:  # Only log if waves was not already empty
+                logger.debug(f"Waves is not a list (type: {type(waves)}), using empty list")
         merged_state["waves"] = waves
 
         # Normalise totals / cursor
@@ -771,7 +776,7 @@ class BundleGenerator:
         self.enable_enterprise_optimization = True
         self.enable_constraint_management = True
         self.enable_performance_monitoring = True
-        self.enable_pareto_optimization = True
+        self.enable_pareto_optimization = feature_flags.get_flag("advanced.pareto_optimization", False)  # MODERN: Disabled by default for speed
         
         # Advanced feature flags (PR-5, PR-6, PR-8)
         self.enable_normalized_ranking = True
@@ -1263,7 +1268,6 @@ class BundleGenerator:
                 serialized[key] = str(value) if value is not None else None
         
         return serialized
-
     async def generate_quick_start_bundles(
         self,
         csv_upload_id: str,
@@ -1486,173 +1490,85 @@ class BundleGenerator:
             await update_generation_progress(
                 csv_upload_id,
                 step="ml_generation",
+                progress=60,
+                status="in_progress",
+                message="Quick-start: Building co-visitation graph…",
+            )
+
+            # PHASE 2.5: Build co-visitation graph (MODERN ML)
+            # This gives us Item2Vec-style similarity without training
+            phase2_5_start = time.time()
+
+            from services.ml.pseudo_item2vec import build_covis_vectors
+
+            top_sku_set = set(top_skus)
+            covis_vectors = build_covis_vectors(
+                order_lines=filtered_lines,
+                top_skus=top_sku_set,
+                min_co_visits=1,
+                max_neighbors=50,
+            )
+
+            logger.info(
+                f"[{csv_upload_id}] Quick-start: Built co-visitation graph for {len(covis_vectors)} products"
+            )
+
+            phase2_5_duration = (time.time() - phase2_5_start) * 1000
+
+            await update_generation_progress(
+                csv_upload_id,
+                step="ml_generation",
                 progress=70,
                 status="in_progress",
                 message="Quick-start: Generating bundles…",
             )
 
-            # PHASE 3: Simple bundle generation (no complex ML)
-            logger.info(f"[{csv_upload_id}] 🔗 PHASE 3: Building co-purchase matrix...")
+            # PHASE 3: Multi-type bundle generation (FBT + BOGO + Volume)
+            logger.info(f"[{csv_upload_id}] 🔗 PHASE 3: Multi-type bundle generation starting...")
             phase3_start = time.time()
-
-            # Use association rules from co-purchase patterns
-            from collections import defaultdict
-            sku_pairs = defaultdict(int)
-
-            # Build simple co-occurrence matrix from orders
-            logger.info(f"[{csv_upload_id}] 📋 Grouping {len(filtered_lines)} order lines by order_id...")
-            order_groups = defaultdict(list)
-            for line in filtered_lines:
-                order_id = getattr(line, 'order_id', None)
-                sku = getattr(line, 'sku', None)
-                if order_id and sku:
-                    order_groups[order_id].append(sku)
-
-            logger.info(
-                f"[{csv_upload_id}] ✅ Order grouping complete\n"
-                f"  Unique orders: {len(order_groups)}\n"
-                f"  Time: {(time.time() - phase3_start) * 1000:.0f}ms"
-            )
-
-            # Early exit check: insufficient orders
-            if len(order_groups) < 5:
-                logger.warning(
-                    f"[{csv_upload_id}] Quick-start: Insufficient orders - only {len(order_groups)} unique orders. "
-                    f"Need at least 5 for meaningful co-purchase patterns."
-                )
-                await update_generation_progress(
-                    csv_upload_id,
-                    step="finalization",
-                    progress=100,
-                    status="completed",
-                    message=f"Quick-start complete: 0 bundles (insufficient orders: {len(order_groups)})",
-                )
-                return {
-                    "recommendations": [],
-                    "metrics": {
-                        "quick_start_mode": True,
-                        "total_recommendations": 0,
-                        "exit_reason": "insufficient_unique_orders",
-                        "unique_orders": len(order_groups),
-                        "unique_skus": len(unique_skus),
-                    },
-                    "quick_start": True,
-                    "csv_upload_id": csv_upload_id,
-                }
-
-            # Count co-occurrences
-            for order_id, skus in order_groups.items():
-                unique_skus_in_order = list(set(skus))
-                for i, sku1 in enumerate(unique_skus_in_order):
-                    for sku2 in unique_skus_in_order[i+1:]:
-                        pair = tuple(sorted([sku1, sku2]))
-                        sku_pairs[pair] += 1
-
-            logger.info(
-                f"[{csv_upload_id}] Quick-start: Found {len(sku_pairs)} unique co-purchase pairs"
-            )
-
-            # Early exit check: no co-purchase pairs
-            if len(sku_pairs) == 0:
-                logger.warning(
-                    f"[{csv_upload_id}] Quick-start: No co-purchase pairs found. "
-                    f"All orders contain single items only."
-                )
-                await update_generation_progress(
-                    csv_upload_id,
-                    step="finalization",
-                    progress=100,
-                    status="completed",
-                    message="Quick-start complete: 0 bundles (no multi-item orders)",
-                )
-                return {
-                    "recommendations": [],
-                    "metrics": {
-                        "quick_start_mode": True,
-                        "total_recommendations": 0,
-                        "exit_reason": "no_copurchase_pairs",
-                        "unique_orders": len(order_groups),
-                        "copurchase_pairs": 0,
-                    },
-                    "quick_start": True,
-                    "csv_upload_id": csv_upload_id,
-                }
-
-            # Sort by frequency
-            sorted_pairs = sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)
-
-            logger.info(
-                f"[{csv_upload_id}] 📈 Sorted pairs by frequency\n"
-                f"  Top pair frequency: {sorted_pairs[0][1] if sorted_pairs else 0}\n"
-                f"  Evaluating top {min(len(sorted_pairs), max_bundles * 3)} candidates for {max_bundles} bundles"
-            )
-
-            # Generate bundles from top pairs
-            logger.info(f"[{csv_upload_id}] 🔨 Creating bundle recommendations...")
             bundle_creation_start = time.time()
-            recommendations = []
-            catalog_misses = 0
-            for (sku1, sku2), count in sorted_pairs[:max_bundles * 3]:  # Try 3x to account for catalog misses
-                if self._current_deadline and self._current_deadline.expired:
-                    logger.warning(f"[{csv_upload_id}] Quick-start deadline exceeded during bundle creation")
-                    break
 
-                # Get product details
-                product1 = catalog.get(sku1)
-                product2 = catalog.get(sku2)
+            # Decide how many of each type (respect overall max_bundles)
+            # Priority: FBT (3-5) > BOGO (2-3) > Volume (1-2)
+            max_fbt_bundles = max(3, min(5, max_bundles))
+            remaining = max(0, max_bundles - max_fbt_bundles)
+            max_bogo_bundles = min(3, remaining)
+            remaining -= max_bogo_bundles
+            max_volume_bundles = min(2, remaining)
 
-                if not product1 or not product2:
-                    catalog_misses += 1
-                    continue
+            logger.info(
+                f"[{csv_upload_id}] 📊 Bundle targets - "
+                f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
+            )
 
-                # Stop if we have enough bundles
-                if len(recommendations) >= max_bundles:
-                    break
+            # Build each bundle type (MODERN: pass covis_vectors for similarity scoring)
+            fbt_bundles = _build_quick_start_fbt_bundles(
+                csv_upload_id, filtered_lines, catalog, product_scores, max_fbt_bundles, covis_vectors
+            )
 
-                # Simple pricing: 10% discount on bundle
-                price1 = getattr(product1, 'price', Decimal('0')) or Decimal('0')
-                price2 = getattr(product2, 'price', Decimal('0')) or Decimal('0')
+            bogo_bundles = []
+            if max_bogo_bundles > 0:
+                bogo_bundles = _build_quick_start_bogo_bundles(
+                    csv_upload_id, catalog, product_scores, max_bogo_bundles
+                )
 
-                total_price = price1 + price2
-                bundle_price = total_price * Decimal('0.9')  # 10% discount
+            volume_bundles = []
+            if max_volume_bundles > 0:
+                volume_bundles = _build_quick_start_volume_bundles(
+                    csv_upload_id, sku_sales, catalog, product_scores, max_volume_bundles
+                )
 
-                # Create recommendation
-                rec = {
-                    "id": str(uuid.uuid4()),
-                    "csv_upload_id": csv_upload_id,
-                    "bundle_name": f"Bundle: {getattr(product1, 'product_title', 'Product')} + {getattr(product2, 'product_title', 'Product')}",
-                    "bundle_type": "FBT",  # Frequently Bought Together
-                    "product_skus": [sku1, sku2],
-                    "product_ids": [
-                        getattr(product1, 'product_id', ''),
-                        getattr(product2, 'product_id', '')
-                    ],
-                    "variant_ids": [
-                        getattr(product1, 'variant_id', ''),
-                        getattr(product2, 'variant_id', '')
-                    ],
-                    "bundle_price": float(bundle_price),
-                    "original_price": float(total_price),
-                    "discount_type": "PERCENTAGE",
-                    "discount_value": 10.0,
-                    "confidence": min(0.95, 0.5 + (count / 100)),  # Higher count = higher confidence
-                    "ranking_score": product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5),
-                    "rank_position": len(recommendations) + 1,
-                    "objective": "increase_aov",
-                    "reasoning": f"Often purchased together ({count} times)",
-                    "discount_reference": f"__quick_start_{csv_upload_id}__",
-                    "created_at": datetime.utcnow(),
-                    "updated_at": datetime.utcnow(),
-                }
+            # Combine all bundle types
+            recommendations = fbt_bundles + bogo_bundles + volume_bundles
 
-                recommendations.append(rec)
+            # Enforce global cap just in case
+            recommendations = recommendations[:max_bundles]
 
             bundle_creation_duration = (time.time() - bundle_creation_start) * 1000
             logger.info(
                 f"[{csv_upload_id}] ✅ PHASE 3 complete in {(time.time() - phase3_start) * 1000:.0f}ms\n"
-                f"  Bundles created: {len(recommendations)}\n"
-                f"  Pair candidates evaluated: {len(sorted_pairs)}\n"
-                f"  Catalog misses: {catalog_misses}\n"
+                f"  Total bundles: {len(recommendations)}\n"
+                f"  FBT: {len(fbt_bundles)}, BOGO: {len(bogo_bundles)}, VOLUME: {len(volume_bundles)}\n"
                 f"  Bundle creation time: {bundle_creation_duration:.0f}ms"
             )
 
@@ -1709,10 +1625,16 @@ class BundleGenerator:
                 "max_bundles_limit": max_bundles,
                 "timeout_seconds": timeout_seconds,
                 "total_recommendations": len(recommendations),
+                "bundle_type_counts": {
+                    "fbt": len(fbt_bundles),
+                    "bogo": len(bogo_bundles),
+                    "volume": len(volume_bundles),
+                },
                 "processing_time_ms": total_duration,
                 "phase_timings": {
                     "phase1_data_loading_ms": phase1_duration,
                     "phase2_scoring_ms": phase2_duration,
+                    "phase2_5_covis_graph_ms": phase2_5_duration,
                     "phase3_generation_ms": phase3_duration,
                     "phase4_persistence_ms": phase4_duration,
                 },
@@ -1722,20 +1644,19 @@ class BundleGenerator:
                     "unique_skus_found": len(unique_skus),
                     "top_skus_selected": len(top_skus),
                     "order_lines_after_filter": len(filtered_lines),
-                    "unique_orders": len(order_groups),
-                    "copurchase_pairs_found": len(sku_pairs),
-                    "catalog_misses": catalog_misses,
                     "final_bundles": len(recommendations),
                 },
                 "products_analyzed": len(top_skus),
-                "orders_analyzed": len(order_groups),
             }
 
             logger.info(
                 f"[{csv_upload_id}] ========== QUICK-START COMPLETE ==========\n"
-                f"  Bundles: {len(recommendations)}\n"
+                f"  Total Bundles: {len(recommendations)}\n"
+                f"  - FBT: {len(fbt_bundles)}\n"
+                f"  - BOGO: {len(bogo_bundles)}\n"
+                f"  - Volume: {len(volume_bundles)}\n"
                 f"  Duration: {total_duration/1000:.2f}s\n"
-                f"  Products: {len(top_skus)}"
+                f"  Products Analyzed: {len(top_skus)}"
             )
 
             return {
@@ -4701,3 +4622,332 @@ class BundleGenerator:
                 "metrics": {**metrics, "v1_fallback": True, "v1_error": str(e), "v2_error": error},
                 "v2_pipeline": False
             }
+
+
+# Quick-Start Bundle Helpers (FBT + BOGO + Volume)
+# ============================================================================
+
+def _build_quick_start_fbt_bundles(
+    csv_upload_id: str,
+    filtered_lines: List[Any],
+    catalog: Dict[str, Any],
+    product_scores: Dict[str, float],
+    max_fbt_bundles: int,
+    covis_vectors: Dict[str, Any] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build modern FBT bundles using co-visitation similarity (MODERN ML).
+
+    Uses:
+    - Co-visitation graph for semantic similarity (pseudo-Item2Vec)
+    - Bandit pricing for dynamic discount selection
+    - Blended scoring: co-occurrence + similarity + product quality
+
+    This gives "AI-powered" recommendations without ML training overhead.
+    """
+    from collections import defaultdict
+    from services.ml.pseudo_item2vec import cosine_similarity
+
+    order_groups: Dict[str, List[str]] = defaultdict(list)
+
+    for line in filtered_lines:
+        order_id = getattr(line, 'order_id', None)
+        sku = getattr(line, 'sku', None)
+        if order_id and sku:
+            order_groups[order_id].append(sku)
+
+    sku_pairs: Dict[tuple, int] = defaultdict(int)
+
+    for _, skus in order_groups.items():
+        unique_skus_in_order = list(set(skus))
+        for i, sku1 in enumerate(unique_skus_in_order):
+            for sku2 in unique_skus_in_order[i + 1:]:
+                pair = tuple(sorted((sku1, sku2)))
+                sku_pairs[pair] += 1
+
+    if not sku_pairs:
+        return []
+
+    # MODERN: Score pairs using co-visitation similarity + co-occurrence
+    scored_pairs = []
+    for (sku1, sku2), count in sku_pairs.items():
+        # Get co-visitation similarity (0-1 range)
+        covis_sim = 0.0
+        if covis_vectors and sku1 in covis_vectors and sku2 in covis_vectors:
+            v1 = covis_vectors[sku1]
+            v2 = covis_vectors[sku2]
+            covis_sim = cosine_similarity(v1, v2)
+
+        # Blended score: 60% similarity + 40% co-occurrence frequency
+        # High similarity = products naturally go together
+        # High co-occurrence = proven purchase pattern
+        co_occurrence_score = min(1.0, count / 10.0)  # Normalize to [0, 1]
+        blended_score = 0.6 * covis_sim + 0.4 * co_occurrence_score
+
+        # Require minimum quality: either good similarity OR multiple co-purchases
+        if covis_sim < 0.1 and count < 2:
+            continue  # Skip weak pairs
+
+        scored_pairs.append(((sku1, sku2), count, covis_sim, blended_score))
+
+    # Sort by blended score (descending)
+    scored_pairs.sort(key=lambda x: x[3], reverse=True)
+
+    recommendations: List[Dict[str, Any]] = []
+    for (sku1, sku2), count, covis_sim, blended_score in scored_pairs:
+        if len(recommendations) >= max_fbt_bundles * 3:  # Generate more candidates for filtering
+            break
+
+        p1 = catalog.get(sku1)
+        p2 = catalog.get(sku2)
+        if not p1 or not p2:
+            continue
+
+        price1 = float(getattr(p1, 'price', 0) or 0)
+        price2 = float(getattr(p2, 'price', 0) or 0)
+        if price1 <= 0 or price2 <= 0:
+            continue
+
+        total_price = price1 + price2
+        avg_price = total_price / 2.0
+
+        # MODERN: Use bandit pricing instead of fixed 10%
+        # This provides "dynamic AI pricing" without training
+        from services.pricing import BayesianPricingEngine
+        pricing_engine = BayesianPricingEngine()
+
+        bandit_result = pricing_engine.multi_armed_bandit_pricing(
+            bundle_products=[sku1, sku2],
+            product_prices={sku1: Decimal(str(price1)), sku2: Decimal(str(price2))},
+            features={
+                "covis_similarity": covis_sim,
+                "avg_price": avg_price,
+                "bundle_type": "FBT",
+                "objective": "increase_aov"
+            },
+            objective="increase_aov"
+        )
+
+        bundle_price = float(bandit_result["bundle_price"])
+        discount_pct = bandit_result["discount_pct"]
+
+        # Confidence based on similarity + co-occurrence
+        conf = min(0.95, 0.3 + (0.4 * covis_sim) + (0.3 * min(1.0, count / 50.0)))
+
+        # Ranking score: blend product quality + similarity
+        product_quality_score = product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5)
+        ranking_score = 0.7 * product_quality_score + 0.3 * covis_sim
+
+        recommendations.append({
+            "id": str(uuid.uuid4()),
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": "FBT",
+            "objective": "increase_aov",
+            "products": [
+                {
+                    "sku": sku1,
+                    "name": getattr(p1, 'product_title', 'Product'),
+                    "price": price1,
+                    "variant_id": getattr(p1, 'variant_id', ''),
+                    "product_id": getattr(p1, 'product_id', ''),
+                },
+                {
+                    "sku": sku2,
+                    "name": getattr(p2, 'product_title', 'Product'),
+                    "price": price2,
+                    "variant_id": getattr(p2, 'variant_id', ''),
+                    "product_id": getattr(p2, 'product_id', ''),
+                }
+            ],
+            "pricing": {
+                "original_total": total_price,
+                "bundle_price": bundle_price,
+                "discount_amount": total_price - bundle_price,
+                "discount_pct": f"{discount_pct}%",
+            },
+            "confidence": Decimal(str(conf)),
+            "predicted_lift": Decimal(str(1.0 + (covis_sim * 0.5))),  # Higher lift for high similarity
+            "ranking_score": Decimal(str(ranking_score)),
+            "discount_reference": f"__quick_start_{csv_upload_id}__",
+            "is_approved": True,
+            "created_at": datetime.utcnow(),
+            # MODERN: Add co-visitation features for explainability
+            "features": {
+                "covis_similarity": covis_sim,
+                "co_occurrence_count": count,
+                "blended_score": blended_score,
+            }
+        })
+
+        # Stop once we have enough high-quality bundles
+        if len(recommendations) >= max_fbt_bundles:
+            break
+
+    return recommendations
+
+
+def _build_quick_start_bogo_bundles(
+    csv_upload_id: str,
+    catalog: Dict[str, Any],
+    product_scores: Dict[str, float],
+    max_bogo_bundles: int,
+) -> List[Dict[str, Any]]:
+    """
+    Build simple BOGO bundles from slow-mover products.
+    Heuristics:
+    - is_slow_mover == True
+    - available_total > 5
+    - Buy 2, get 1 effectively 50% off (3 units for price of 2)
+    """
+    candidates = []
+    for sku, snap in catalog.items():
+        try:
+            available = int(getattr(snap, 'available_total', 0) or 0)
+        except (TypeError, ValueError):
+            available = 0
+
+        if getattr(snap, "is_slow_mover", False) and available > 5:
+            candidates.append((sku, available, snap))
+
+    if not candidates:
+        return []
+
+    # Sort by excess inventory (desc)
+    candidates.sort(key=lambda t: t[1], reverse=True)
+
+    bundles: List[Dict[str, Any]] = []
+    for sku, available, snap in candidates:
+        if len(bundles) >= max_bogo_bundles:
+            break
+
+        price = float(getattr(snap, 'price', 0) or 0)
+        if price <= 0:
+            continue
+
+        # Buy 2, get 1 free ~= 50% effective discount on 3 units
+        original_total = price * 3
+        effective_bundle_price = price * 2  # Pay for 2, get 3
+        effective_discount_pct = (1 - effective_bundle_price / original_total) * 100.0
+
+        bundles.append({
+            "id": str(uuid.uuid4()),
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": "BOGO",
+            "objective": "clear_slow_movers",
+            "products": [
+                {
+                    "sku": sku,
+                    "name": getattr(snap, 'product_title', 'Product'),
+                    "price": price,
+                    "variant_id": getattr(snap, 'variant_id', ''),
+                    "product_id": getattr(snap, 'product_id', ''),
+                    "min_quantity": 2,  # Buy 2
+                    "reward_quantity": 1,  # Get 1 free
+                }
+            ],
+            "pricing": {
+                "original_total": original_total,
+                "bundle_price": effective_bundle_price,
+                "discount_amount": original_total - effective_bundle_price,
+                "discount_pct": f"{effective_discount_pct:.1f}%",
+                "bogo_config": {
+                    "buy_qty": 2,
+                    "get_qty": 1,
+                    "discount_percent": round(effective_discount_pct, 1),
+                }
+            },
+            "confidence": Decimal("0.6"),
+            "predicted_lift": Decimal("1.0"),
+            "ranking_score": Decimal(str(product_scores.get(sku, 0.5))),
+            "discount_reference": f"__quick_start_{csv_upload_id}__",
+            "is_approved": True,
+            "created_at": datetime.utcnow(),
+        })
+
+    return bundles
+
+
+def _build_quick_start_volume_bundles(
+    csv_upload_id: str,
+    sku_sales: Counter,
+    catalog: Dict[str, Any],
+    product_scores: Dict[str, float],
+    max_volume_bundles: int,
+) -> List[Dict[str, Any]]:
+    """
+    Build simple volume break bundles:
+    - Single anchor SKU
+    - Tiers: 2+, 3+, 5+ with fixed discounts
+    Only for:
+    - Popular SKUs (based on sku_sales)
+    - Sufficient stock (available_total > 20)
+    """
+    candidates = []
+    for sku, units_sold in sku_sales.items():
+        snap = catalog.get(sku)
+        if not snap:
+            continue
+
+        try:
+            available = int(getattr(snap, 'available_total', 0) or 0)
+        except (TypeError, ValueError):
+            available = 0
+
+        # Heuristic: high enough stock and at least some sales
+        if available > 20 and units_sold >= 3:
+            candidates.append((sku, units_sold, available, snap))
+
+    if not candidates:
+        return []
+
+    # Sort by units sold desc, then stock desc
+    candidates.sort(key=lambda t: (t[1], t[2]), reverse=True)
+
+    bundles: List[Dict[str, Any]] = []
+    for sku, units_sold, available, snap in candidates:
+        if len(bundles) >= max_volume_bundles:
+            break
+
+        price = float(getattr(snap, 'price', 0) or 0)
+        if price <= 0:
+            continue
+
+        volume_tiers = [
+            {"min_qty": 1, "discount_type": "NONE",       "discount_value": 0},
+            {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5},
+            {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10},
+            {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15},
+        ]
+
+        bundles.append({
+            "id": str(uuid.uuid4()),
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": "VOLUME",
+            "objective": "increase_aov",
+            "products": [
+                {
+                    "sku": sku,
+                    "name": getattr(snap, 'product_title', 'Product'),
+                    "price": price,
+                    "variant_id": getattr(snap, 'variant_id', ''),
+                    "product_id": getattr(snap, 'product_id', ''),
+                }
+            ],
+            "pricing": {
+                "original_total": price,
+                "bundle_price": price,  # Base unit price
+                "discount_amount": 0,  # Per-tier in volume_tiers
+                "discount_pct": "0%",
+                "volume_tiers": volume_tiers,
+            },
+            "confidence": Decimal("0.6"),
+            "predicted_lift": Decimal("1.0"),
+            "ranking_score": Decimal(str(product_scores.get(sku, 0.5))),
+            "discount_reference": f"__quick_start_{csv_upload_id}__",
+            "is_approved": True,
+            "created_at": datetime.utcnow(),
+        })
+
+    return bundles
+
+

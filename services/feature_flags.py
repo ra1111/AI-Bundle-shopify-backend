@@ -45,7 +45,7 @@ class FeatureFlagsManager:
             "phase.explainability": True,
 
             # Advanced features (PR implementations)
-            "advanced.pareto_optimization": True,
+            "advanced.pareto_optimization": False,  # MODERN: Disabled by default for speed (NSGA-II is slow)
             "advanced.constraint_management": True,
             "advanced.performance_monitoring": True,
             "advanced.normalized_ranking": True,
@@ -352,11 +352,17 @@ class FeatureFlagsManager:
             logger.warning(f"Could not load flags from storage: {e}")
     
     async def _persist_flag(self, flag_key: str, value: Any, shop_id: Optional[str], updated_by: str):
-        """Persist feature flag to storage"""
+        """Persist feature flag to storage (not yet implemented)"""
         try:
-            # This would persist to database in a real implementation
+            # TODO: Implement database persistence for feature flags
+            # This would persist to database in a production implementation:
             # await storage.upsert_feature_flag(flag_key, value, shop_id, updated_by)
-            pass
+
+            logger.debug(
+                f"Feature flag persistence not yet implemented | "
+                f"flag={flag_key} value={value} shop_id={shop_id} updated_by={updated_by}"
+            )
+            # For now, flags are only stored in memory cache
 
         except Exception as e:
             logger.warning(f"Could not persist flag to storage: {e}")

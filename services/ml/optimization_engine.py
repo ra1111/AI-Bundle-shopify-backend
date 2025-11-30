@@ -749,41 +749,68 @@ class EnterpriseOptimizationEngine:
             return candidate
     
     def _non_dominated_sorting(self, population: List[ParetoSolution]) -> List[List[ParetoSolution]]:
-        """Non-dominated sorting for NSGA-II"""
+        """Non-dominated sorting for NSGA-II algorithm"""
+        if not population:
+            return []
+
         fronts = []
-        
+        n = len(population)
+
+        # Track dominance relationships for each solution
+        dominated_by = [[] for _ in range(n)]  # Solutions that dominate this solution
+        dominates = [[] for _ in range(n)]     # Solutions dominated by this solution
+        domination_count = [0] * n             # Number of solutions dominating this one
+
         # Calculate dominance relationships
         for i, sol_i in enumerate(population):
-            sol_i.dominance_rank = 0
-            dominated_solutions = []
-            dominating_count = 0
-            
             for j, sol_j in enumerate(population):
                 if i != j:
                     if self._dominates(sol_i, sol_j):
-                        dominated_solutions.append(j)
+                        dominates[i].append(j)
                     elif self._dominates(sol_j, sol_i):
-                        dominating_count += 1
-            
-            if dominating_count == 0:
-                sol_i.dominance_rank = 0
-                if not fronts:
-                    fronts.append([])
-                fronts[0].append(sol_i)
-        
+                        dominated_by[i].append(j)
+                        domination_count[i] += 1
+
+        # First front: solutions not dominated by any other
+        first_front = []
+        for i in range(n):
+            if domination_count[i] == 0:
+                population[i].dominance_rank = 0
+                first_front.append(i)
+
+        if first_front:
+            fronts.append([population[i] for i in first_front])
+
         # Build subsequent fronts
-        front_index = 0
-        while front_index < len(fronts) and fronts[front_index]:
-            next_front = []
-            
-            for sol in fronts[front_index]:
-                # This is simplified - full NSGA-II implementation would be more complex
-                pass
-            
-            front_index += 1
-            if next_front:
-                fronts.append(next_front)
-        
+        current_front_indices = first_front
+        front_num = 1
+
+        while current_front_indices:
+            next_front_indices = []
+
+            # For each solution in current front
+            for i in current_front_indices:
+                # For each solution it dominates
+                for j in dominates[i]:
+                    # Reduce domination count
+                    domination_count[j] -= 1
+
+                    # If no longer dominated by anyone, add to next front
+                    if domination_count[j] == 0:
+                        population[j].dominance_rank = front_num
+                        next_front_indices.append(j)
+
+            if next_front_indices:
+                fronts.append([population[i] for i in next_front_indices])
+                current_front_indices = next_front_indices
+                front_num += 1
+            else:
+                break
+
+        logger.debug(
+            f"Non-dominated sorting complete: {len(population)} solutions sorted into {len(fronts)} fronts"
+        )
+
         return fronts
     
     def _dominates(self, sol_a: ParetoSolution, sol_b: ParetoSolution) -> bool:

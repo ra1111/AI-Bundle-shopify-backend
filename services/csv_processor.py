@@ -836,14 +836,18 @@ class CSVProcessor:
                     dt = dt.replace(tzinfo=None)
                 return dt
             except ValueError:
-                pass
+                # Expected - this format doesn't match, try next one
+                continue
 
+        # Try timezone-aware formats with manual cleanup
         if '+' in ds or ds.endswith('Z'):
             try:
                 clean = re.sub(r'[+-]\d{2}:?\d{2}$|Z$', '', ds)
                 return self.parse_datetime(clean)
-            except Exception:
-                pass
+            except RecursionError as e:
+                logger.error(f"Recursion error parsing datetime with timezone cleanup: {ds} - {e}")
+            except Exception as e:
+                logger.debug(f"Failed to parse datetime after timezone cleanup: {ds} - {e}")
 
         logger.warning(f"Could not parse datetime: {ds}")
         return datetime.now()

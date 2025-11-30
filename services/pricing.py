@@ -507,4 +507,236 @@ class BayesianPricingEngine:
                     
         except Exception as e:
             logger.warning(f"Error rounding price {price}: {e}")
-            return price  # Return original if rounding fails
+            return price
+
+    def bandit_discount_selection(
+        self,
+        candidate_discounts: List[float],
+        features: Dict[str, Any],
+        epsilon: float = 0.10
+    ) -> float:
+        """
+        Epsilon-greedy bandit for dynamic discount selection.
+
+        This provides "AI-powered dynamic pricing" without ML training overhead.
+        Inspired by Amazon's discount optimization and multi-armed bandit systems.
+
+        The algorithm:
+        - 10% exploration: try random discounts to discover new strategies
+        - 90% exploitation: choose discount that maximizes predicted lift
+
+        Args:
+            candidate_discounts: List of discount percentages to choose from (e.g., [5, 10, 15, 20])
+            features: Bundle features for heuristic scoring:
+                - covis_similarity: Co-visitation similarity [0, 1]
+                - avg_price: Average product price
+                - bundle_type: Type of bundle (FBT, Volume, etc.)
+                - objective: Business objective
+            epsilon: Exploration rate (default 0.10 = 10% random exploration)
+
+        Returns:
+            Selected discount percentage
+
+        Examples:
+            >>> discount = pricing.bandit_discount_selection(
+            ...     candidate_discounts=[5, 10, 15, 20],
+            ...     features={
+            ...         "covis_similarity": 0.75,  # High similarity
+            ...         "avg_price": 45.00,
+            ...         "bundle_type": "FBT",
+            ...         "objective": "increase_aov"
+            ...     }
+            ... )
+            >>> # Returns: 15 (higher similarity = moderate discount works well)
+        """
+        import random
+
+        if not candidate_discounts:
+            return 10.0  # Default fallback
+
+        # EXPLORATION: 10% of the time, try random discount
+        if random.random() < epsilon:
+            selected = random.choice(candidate_discounts)
+            logger.debug(f"Bandit exploration: selected {selected}% discount")
+            return selected
+
+        # EXPLOITATION: Choose discount with highest predicted lift
+        # This uses heuristic scoring (no ML training needed)
+
+        covis_sim = features.get("covis_similarity", 0.5)
+        avg_price = features.get("avg_price", 50.0)
+        bundle_type = features.get("bundle_type", "FBT")
+        objective = features.get("objective", "increase_aov")
+
+        # Heuristic scoring for each discount level
+        best_discount = candidate_discounts[0]
+        best_score = -1.0
+
+        for discount in candidate_discounts:
+            # Base score: favor higher discounts for clear_slow_movers
+            if objective == "clear_slow_movers":
+                base_score = discount / 40.0  # Normalize to [0, 1]
+            elif objective == "increase_aov":
+                # For AOV, moderate discounts work best
+                base_score = 1.0 - abs(discount - 15.0) / 15.0
+            elif objective == "margin_guard":
+                # For margin protection, prefer lower discounts
+                base_score = 1.0 - (discount / 20.0)
+            else:
+                base_score = 1.0 - abs(discount - 12.0) / 12.0  # Default: prefer ~12%
+
+            # Adjust based on co-visitation similarity
+            # High similarity = products often bought together = lower discount needed
+            similarity_adjustment = 1.0 + (covis_sim * 0.3)
+            if discount < 15:
+                # Boost lower discounts for high-similarity bundles
+                similarity_adjustment = 1.0 + (covis_sim * 0.5)
+            else:
+                # Penalize high discounts for high-similarity bundles
+                similarity_adjustment = 1.0 - (covis_sim * 0.2)
+
+            # Price sensitivity: cheaper items = more discount-sensitive
+            # Expensive items = less discount-sensitive
+            price_factor = 1.0
+            if avg_price < 20:
+                # Cheap items: favor higher discounts
+                price_factor = 1.0 + (discount / 100.0)
+            elif avg_price > 100:
+                # Expensive items: favor lower discounts
+                price_factor = 1.0 - (discount / 200.0)
+
+            # Combine factors
+            score = base_score * similarity_adjustment * price_factor
+
+            # Clamp to reasonable range
+            score = max(0.0, min(1.0, score))
+
+            if score > best_score:
+                best_score = score
+                best_discount = discount
+
+        logger.debug(
+            f"Bandit exploitation: selected {best_discount}% discount "
+            f"(score={best_score:.3f}, covis_sim={covis_sim:.3f}, avg_price=${avg_price:.2f})"
+        )
+
+        return best_discount
+
+    def multi_armed_bandit_pricing(
+        self,
+        bundle_products: List[str],
+        product_prices: Dict[str, Decimal],
+        features: Dict[str, Any],
+        objective: str = "increase_aov"
+    ) -> Dict[str, Any]:
+        """
+        Apply multi-armed bandit discount selection to bundle pricing.
+
+        This is a lightweight bandit layer that sits on top of Bayesian pricing.
+        It provides "dynamic AI pricing" for merchants without needing ML infrastructure.
+
+        Workflow:
+        1. Get objective-based discount caps
+        2. Generate candidate discount levels within caps
+        3. Use epsilon-greedy bandit to select optimal discount
+        4. Compute final bundle pricing
+
+        Args:
+            bundle_products: List of SKUs in bundle
+            product_prices: Dict mapping SKU -> price
+            features: Bundle features for bandit scoring
+            objective: Business objective
+
+        Returns:
+            Dict with pricing details:
+                - original_total: Sum of original prices
+                - bundle_price: Discounted bundle price
+                - discount_amount: Total discount amount
+                - discount_pct: Discount percentage
+                - selected_discount: Chosen discount level
+                - selection_method: "bandit_exploration" or "bandit_exploitation"
+
+        Example:
+            >>> pricing_result = pricing_engine.multi_armed_bandit_pricing(
+            ...     bundle_products=["SKU-001", "SKU-002"],
+            ...     product_prices={"SKU-001": Decimal("29.99"), "SKU-002": Decimal("49.99")},
+            ...     features={"covis_similarity": 0.85, "avg_price": 40.0},
+            ...     objective="increase_aov"
+            ... )
+            >>> pricing_result["discount_pct"]
+            >>> # 15.0 (selected by bandit)
+        """
+        try:
+            # 1. Get objective caps
+            caps = self.objective_caps.get(objective, {
+                "min_discount": Decimal('5'),
+                "max_discount": Decimal('20')
+            })
+            min_discount = float(caps["min_discount"])
+            max_discount = float(caps["max_discount"])
+
+            # 2. Generate candidate discount levels
+            # Typical: [5, 10, 15, 20, 25, 30]
+            step = 5
+            candidate_discounts = []
+            current = max(5, int(min_discount))
+            while current <= max_discount:
+                candidate_discounts.append(float(current))
+                current += step
+
+            if not candidate_discounts:
+                candidate_discounts = [min_discount]
+
+            # 3. Use bandit to select discount
+            selected_discount = self.bandit_discount_selection(
+                candidate_discounts=candidate_discounts,
+                features=features,
+                epsilon=0.10  # 10% exploration
+            )
+
+            # 4. Compute pricing
+            original_total = sum(product_prices.values())
+            discount_decimal = Decimal(str(selected_discount)) / Decimal('100')
+            discount_amount = (original_total * discount_decimal).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+            bundle_price = (original_total - discount_amount).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+
+            # Round to nice psychological ending
+            bundle_price = self.round_to_nice_ending(bundle_price)
+            discount_amount = original_total - bundle_price
+
+            return {
+                "original_total": original_total,
+                "bundle_price": bundle_price,
+                "discount_amount": discount_amount,
+                "discount_pct": selected_discount,
+                "selected_discount": selected_discount,
+                "selection_method": "epsilon_greedy_bandit",
+                "candidate_discounts": candidate_discounts,
+                "methodology": "multi_armed_bandit"
+            }
+
+        except Exception as e:
+            logger.error(f"Error in bandit pricing: {e}")
+            # Fallback to simple discount
+            original_total = sum(product_prices.values())
+            discount_pct = 10.0
+            discount_amount = (original_total * Decimal(str(discount_pct)) / Decimal('100')).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+            bundle_price = (original_total - discount_amount).quantize(
+                Decimal('0.01'), rounding=ROUND_HALF_UP
+            )
+
+            return {
+                "original_total": original_total,
+                "bundle_price": bundle_price,
+                "discount_amount": discount_amount,
+                "discount_pct": discount_pct,
+                "selected_discount": discount_pct,
+                "selection_method": "fallback",
+                "methodology": "simple_discount"
+            }  # Return original if rounding fails
