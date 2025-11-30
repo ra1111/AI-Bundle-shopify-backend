@@ -1427,20 +1427,25 @@ class BundleGenerator:
             unique_skus = set()
             for line in order_lines:
                 sku = getattr(line, 'sku', None)
+                variant_id = getattr(line, 'variant_id', None)
                 quantity = getattr(line, 'quantity', 0) or 0
-                if sku:
-                    unique_skus.add(sku)
-                    sku_sales[sku] += quantity
+
+                # Use SKU if available, otherwise use variant_id as fallback
+                product_key = sku if sku else variant_id
+
+                if product_key:
+                    unique_skus.add(product_key)
+                    sku_sales[product_key] += quantity
 
             logger.info(
-                f"[{csv_upload_id}] Quick-start: Found {len(unique_skus)} unique SKUs, "
+                f"[{csv_upload_id}] Quick-start: Found {len(unique_skus)} unique products (SKU or variant_id), "
                 f"total quantity sold: {sum(sku_sales.values())}"
             )
 
             # Early exit check: insufficient product variety
             if len(unique_skus) < 2:
                 logger.warning(
-                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_skus)} unique SKUs. "
+                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_skus)} unique products. "
                     f"Need at least 2 for bundles."
                 )
                 await update_generation_progress(
@@ -1470,10 +1475,13 @@ class BundleGenerator:
 
             # Filter order lines to only include top products
             top_skus_set = set(top_skus)
-            filtered_lines = [
-                line for line in order_lines
-                if getattr(line, 'sku', None) in top_skus_set
-            ]
+            filtered_lines = []
+            for line in order_lines:
+                sku = getattr(line, 'sku', None)
+                variant_id = getattr(line, 'variant_id', None)
+                product_key = sku if sku else variant_id
+                if product_key in top_skus_set:
+                    filtered_lines.append(line)
 
             logger.info(
                 f"[{csv_upload_id}] Quick-start: Filtered {len(order_lines)} → {len(filtered_lines)} order lines "
@@ -4747,11 +4755,13 @@ def _build_quick_start_fbt_bundles(
     Build modern FBT bundles using co-visitation similarity (MODERN ML).
 
     Uses:
+    - Product keys (SKU or variant_id as fallback) for product identification
     - Co-visitation graph for semantic similarity (pseudo-Item2Vec)
     - Bandit pricing for dynamic discount selection
     - Blended scoring: co-occurrence + similarity + product quality
 
     This gives "AI-powered" recommendations without ML training overhead.
+    Handles Shopify stores without SKUs by using variant_id as fallback.
     """
     from collections import defaultdict
     from services.ml.pseudo_item2vec import cosine_similarity
@@ -4765,8 +4775,14 @@ def _build_quick_start_fbt_bundles(
     for line in filtered_lines:
         order_id = getattr(line, 'order_id', None)
         sku = getattr(line, 'sku', None)
-        if order_id and sku:
-            order_groups[order_id].append(sku)
+        variant_id = getattr(line, 'variant_id', None)
+
+        # Use SKU if available, otherwise use variant_id as fallback
+        # This handles Shopify stores where products don't have SKUs configured
+        product_key = sku if sku else variant_id
+
+        if order_id and product_key:
+            order_groups[order_id].append(product_key)
 
     logger.info(f"[{csv_upload_id}]   Orders grouped: {len(order_groups)}")
 
@@ -4779,13 +4795,13 @@ def _build_quick_start_fbt_bundles(
                 pair = tuple(sorted((sku1, sku2)))
                 sku_pairs[pair] += 1
 
-    logger.info(f"[{csv_upload_id}] 📊 SKU PAIRS FOUND:")
+    logger.info(f"[{csv_upload_id}] 📊 PRODUCT PAIRS FOUND (SKU or variant_id):")
     logger.info(f"[{csv_upload_id}]   Total unique pairs: {len(sku_pairs)}")
     for pair, count in sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)[:10]:
         logger.info(f"[{csv_upload_id}]     {pair[0]} + {pair[1]}: {count} times")
 
     if not sku_pairs:
-        logger.warning(f"[{csv_upload_id}] ⚠️  No SKU pairs found! Returning 0 bundles.")
+        logger.warning(f"[{csv_upload_id}] ⚠️  No product pairs found! Returning 0 bundles.")
         return []
 
     # MODERN: Score pairs using co-visitation similarity + co-occurrence
@@ -5034,10 +5050,10 @@ def _build_quick_start_volume_bundles(
 ) -> List[Dict[str, Any]]:
     """
     Build simple volume break bundles:
-    - Single anchor SKU
+    - Single anchor product (SKU or variant_id)
     - Tiers: 2+, 3+, 5+ with fixed discounts
     Only for:
-    - Popular SKUs (based on sku_sales)
+    - Popular products (based on sku_sales, which uses SKU or variant_id)
     - Sufficient stock (available_total > 20)
     """
     logger.info(f"[{csv_upload_id}] 📦 VOLUME BUNDLE GENERATION - STARTED")
