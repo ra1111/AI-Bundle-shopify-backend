@@ -1268,6 +1268,21 @@ class BundleGenerator:
                 serialized[key] = str(value) if value is not None else None
         
         return serialized
+
+    def _ensure_ai_copy_present(self, recommendation: Dict[str, Any]) -> Dict[str, Any]:
+        """Ensure a recommendation has ai_copy; supply fallback if missing/invalid."""
+        ai_copy = recommendation.get("ai_copy")
+        if not ai_copy or not isinstance(ai_copy, dict):
+            ai_copy = self.ai_generator.generate_fallback_copy(
+                recommendation.get("products", []),
+                recommendation.get("bundle_type", "FBT"),
+            )
+        # Ensure core fields exist for downstream rendering
+        ai_copy.setdefault("title", "Bundle Deal")
+        ai_copy.setdefault("description", "Great products bundled together for savings.")
+        ai_copy.setdefault("valueProposition", "Save with this bundle.")
+        recommendation["ai_copy"] = ai_copy
+        return ai_copy
     async def generate_quick_start_bundles(
         self,
         csv_upload_id: str,
@@ -1652,6 +1667,10 @@ class BundleGenerator:
 
             # Enforce global cap just in case
             recommendations = recommendations[:max_bundles]
+
+            # Ensure ai_copy is always present to satisfy DB NOT NULL constraint.
+            for rec in recommendations:
+                self._ensure_ai_copy_present(rec)
 
             bundle_creation_duration = (time.time() - bundle_creation_start) * 1000
             logger.info(
@@ -5097,5 +5116,3 @@ def _build_quick_start_volume_bundles(
     logger.info(f"[{csv_upload_id}]   Bundles created: {len(bundles)}")
 
     return bundles
-
-
