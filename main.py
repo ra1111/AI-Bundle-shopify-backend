@@ -182,12 +182,13 @@ async def startup():
     # Don't initialize DB on Cloud Run startup - do it separately
     if os.getenv("INIT_DB_ON_STARTUP", "false").lower() == "true":
         try:
-            await asyncio.wait_for(init_db(), timeout=30)  # Increased timeout
-            logger.info("Database initialized successfully")
+            logger.info("Initializing database tables...")
+            await asyncio.wait_for(init_db(), timeout=120)  # 2 minutes for slow connections
+            logger.info("✅ Database initialized successfully")
         except asyncio.TimeoutError:
-            logger.warning("DB init timed out, continuing without init")
+            logger.error("❌ DB init timed out after 120s, continuing without init")
         except Exception as e:
-            logger.warning("DB init failed (continuing to serve): %s", e)
+            logger.error(f"❌ DB init failed (continuing to serve): {e}", exc_info=True)
     else:
         logger.info("Skipping DB init on startup")
 @app.on_event("shutdown")
