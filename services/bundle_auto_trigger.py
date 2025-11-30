@@ -160,8 +160,15 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
     # Ensure ingestion for variants/catalog is complete before queueing Phase 1.
     try:
         coverage = await storage.summarize_upload_coverage(orders_upload_id, run_id)
+        order_lines = coverage.get("order_lines", 0)
         variant_count = coverage.get("variants", 0)
         catalog_count = coverage.get("catalog", 0)
+
+        # Invariants: all required datasets must exist
+        assert order_lines > 0, f"Invariant failed: order_lines missing for upload {orders_upload_id}"
+        assert variant_count > 0, f"Invariant failed: variants missing for upload {orders_upload_id}"
+        assert catalog_count > 0, f"Invariant failed: catalog missing for upload {orders_upload_id}"
+
         if variant_count == 0 or catalog_count == 0:
             logger.warning(
                 "Auto-bundle: NOT scheduling bundle generation for %s (variants=%d catalog=%d)",
@@ -176,6 +183,23 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
                 extra_metrics=coverage,
             )
             return
+
+        if coverage.get("catalog_coverage_ratio", 1.0) < 1.0:
+            logger.warning(
+                "Auto-bundle: partial catalog coverage for upload %s (ratio=%.3f missing=%d)",
+                orders_upload_id,
+                coverage.get("catalog_coverage_ratio", 0.0),
+                coverage.get("missing_catalog_variants", 0),
+            )
+    except AssertionError as exc:
+        logger.warning("Auto-bundle: coverage invariant failed for upload %s: %s", orders_upload_id, exc)
+        await update_csv_upload_status(
+            csv_upload_id=orders_upload_id,
+            status="ingestion_incomplete",
+            error_message=str(exc),
+            extra_metrics=coverage if "coverage" in locals() else None,
+        )
+        return
     except Exception as exc:
         logger.warning(
             "Auto-bundle: coverage check failed for upload %s (run %s): %s",

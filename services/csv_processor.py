@@ -424,6 +424,7 @@ class CSVProcessor:
         """Insert rows into `variants`."""
         variants: List[Dict[str, Any]] = []
         run_id = await storage.get_run_id_for_upload(upload_id)
+        target_upload_id = await self._canonical_upload_id(upload_id, run_id)
         t0 = time.time()
         for r in rows:
             try:
@@ -444,23 +445,42 @@ class CSVProcessor:
                     "compare_at_price": compare_at_price if compare_at_price != 0 else None,
                     "inventory_item_id": (r.get("inventory_item_id") or "").strip(),
                     "inventory_item_created_at": self.parse_datetime(r.get("inventory_item_created_at")),
-                    "csv_upload_id": upload_id,
+                    "csv_upload_id": target_upload_id,
                 })
             except Exception as e:
                 logger.warning(f"Error processing variants row: {e}")
                 continue
 
-        logger.info(f"CSV: variants prepared upload_id={upload_id} run_id={run_id} count={len(variants)}")
+        logger.info(
+            "CSV: variants prepared upload_id=%s run_id=%s canonical_upload_id=%s count=%d",
+            upload_id,
+            run_id,
+            target_upload_id,
+            len(variants),
+        )
         if variants:
             await storage.create_variants(variants)
             dur_ms = int((time.time() - t0) * 1000)
-            logger.info(f"CSV: variants created upload_id={upload_id} run_id={run_id} count={len(variants)} durMs={dur_ms}")
+            logger.info(
+                "CSV: variants created upload_id=%s run_id=%s canonical_upload_id=%s count=%d durMs=%d",
+                upload_id,
+                run_id,
+                target_upload_id,
+                len(variants),
+                dur_ms,
+            )
+            try:
+                coverage = await storage.summarize_upload_coverage(target_upload_id, run_id)
+                logger.info("[%s] Post-variants ingestion coverage: %s", upload_id, coverage)
+            except Exception as exc:
+                logger.warning("[%s] Coverage summary after variants failed: %s", upload_id, exc)
 
     # ---------- Inventory ----------
 
     async def process_inventory_levels_csv(self, rows: List[Dict[str, str]], upload_id: str) -> None:
         inventory_levels = []
         run_id = await storage.get_run_id_for_upload(upload_id)
+        target_upload_id = await self._canonical_upload_id(upload_id, run_id)
         t0 = time.time()
         for row in rows:
             try:
@@ -477,7 +497,7 @@ class CSVProcessor:
 
                 inventory_levels.append({
                     "inventory_item_id": (row.get('inventory_item_id') or '').strip(),
-                    "csv_upload_id": upload_id,
+                    "csv_upload_id": target_upload_id,
                     "location_id": location_id,
                     "available": available,
                     "updated_at": self.parse_datetime(row.get('updated_at')),
@@ -486,11 +506,29 @@ class CSVProcessor:
                 logger.warning(f"Error processing inventory row: {e}")
                 continue
 
-        logger.info(f"CSV: inventory prepared upload_id={upload_id} run_id={run_id} count={len(inventory_levels)}")
+        logger.info(
+            "CSV: inventory prepared upload_id=%s run_id=%s canonical_upload_id=%s count=%d",
+            upload_id,
+            run_id,
+            target_upload_id,
+            len(inventory_levels),
+        )
         if inventory_levels:
             await storage.create_inventory_levels(inventory_levels)
             dur_ms = int((time.time() - t0) * 1000)
-            logger.info(f"CSV: inventory created upload_id={upload_id} run_id={run_id} count={len(inventory_levels)} durMs={dur_ms}")
+            logger.info(
+                "CSV: inventory created upload_id=%s run_id=%s canonical_upload_id=%s count=%d durMs=%d",
+                upload_id,
+                run_id,
+                target_upload_id,
+                len(inventory_levels),
+                dur_ms,
+            )
+            try:
+                coverage = await storage.summarize_upload_coverage(target_upload_id, run_id)
+                logger.info("[%s] Post-inventory ingestion coverage: %s", upload_id, coverage)
+            except Exception as exc:
+                logger.warning("[%s] Coverage summary after inventory failed: %s", upload_id, exc)
 
     # ---------- Catalog snapshot ----------
 
@@ -498,6 +536,7 @@ class CSVProcessor:
         """Insert rows into `catalog_snapshot` (wide product+variant view)."""
         snaps: List[Dict[str, Any]] = []
         run_id = await storage.get_run_id_for_upload(upload_id)
+        target_upload_id = await self._canonical_upload_id(upload_id, run_id)
         t0 = time.time()
         pre_filtered = 0
 
@@ -547,7 +586,7 @@ class CSVProcessor:
 
                 snap = {
                     "product_id": pid,
-                    "csv_upload_id": upload_id,
+                    "csv_upload_id": target_upload_id,
                     "product_title": row.get('product_title', 'Unknown Product'),
                     "product_type": row.get('product_type', ''),
                     "tags": row.get('tags', ''),
@@ -596,16 +635,36 @@ class CSVProcessor:
             for sku, price, variant_id in prices:
                 logger.info(f"[{upload_id}]     SKU='{sku}' | price=${price} | variant_id={variant_id}")
 
-        logger.info(f"CSV: catalog prepared upload_id={upload_id} run_id={run_id} count={len(snaps)} skipped_status={pre_filtered}")
+        logger.info(
+            "CSV: catalog prepared upload_id=%s run_id=%s canonical_upload_id=%s count=%d skipped_status=%d",
+            upload_id,
+            run_id,
+            target_upload_id,
+            len(snaps),
+            pre_filtered,
+        )
         if snaps:
             await storage.create_catalog_snapshots(snaps)
             dur_ms = int((time.time() - t0) * 1000)
-            logger.info(f"[{upload_id}] ✅ CSV: catalog created upload_id={upload_id} run_id={run_id} count={len(snaps)} durMs={dur_ms}")
+            logger.info(
+                "[%s] ✅ CSV: catalog created upload_id=%s run_id=%s canonical_upload_id=%s count=%d durMs=%d",
+                upload_id,
+                upload_id,
+                run_id,
+                target_upload_id,
+                len(snaps),
+                dur_ms,
+            )
             # Best-effort post-computation; non-fatal if it fails
             try:
-                await storage.recompute_catalog_objectives(upload_id)
+                await storage.recompute_catalog_objectives(target_upload_id)
             except Exception as e:
-                logger.error(f"Objective recompute failed for {upload_id}: {e}")
+                logger.error(f"Objective recompute failed for {upload_id} (target {target_upload_id}): {e}")
+            try:
+                coverage = await storage.summarize_upload_coverage(target_upload_id, run_id)
+                logger.info("[%s] Post-catalog ingestion coverage: %s", upload_id, coverage)
+            except Exception as exc:
+                logger.warning("[%s] Coverage summary after catalog failed: %s", upload_id, exc)
 
     async def _post_ingest_hooks(self, csv_type: str, upload_id: str, row_count: int) -> None:
         """Apply post-processing hooks such as cache resets and data enrichment."""
@@ -621,6 +680,35 @@ class CSVProcessor:
 
         if csv_type in {"orders", "variants", "inventory_levels", "catalog_joined"}:
             await self._maybe_trigger_enrichment(upload_id, f"{csv_type}_ingest", True)
+
+    async def _canonical_upload_id(self, upload_id: str, run_id: Optional[str]) -> str:
+        """
+        Prefer the orders upload id for a run so all ingested tables can share
+        the same csv_upload_id for downstream lookups. Falls back to the current
+        upload_id if no orders upload is found.
+        """
+        if not run_id:
+            return upload_id
+        try:
+            orders_upload = await storage.get_latest_orders_upload_for_run(run_id)
+            if orders_upload and getattr(orders_upload, "id", None):
+                orders_id = getattr(orders_upload, "id")
+                if orders_id != upload_id:
+                    logger.info(
+                        "Canonical upload alignment: using orders upload %s for run %s (current upload %s)",
+                        orders_id,
+                        run_id,
+                        upload_id,
+                    )
+                return orders_id or upload_id
+        except Exception as exc:
+            logger.warning(
+                "Canonical upload lookup failed for upload %s run %s: %s",
+                upload_id,
+                run_id,
+                exc,
+            )
+        return upload_id
 
     async def _maybe_trigger_enrichment(self, upload_id: str, reason: str, has_new_records: bool) -> None:
         if not has_new_records:

@@ -278,6 +278,20 @@ class StorageService:
             query = select(CsvUpload).where(CsvUpload.run_id == run_id)
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_latest_orders_upload_for_run(self, run_id: str) -> Optional[CsvUpload]:
+        """Return the most recent orders upload for a given run."""
+        if not run_id:
+            return None
+        async with self.get_session() as session:
+            query = (
+                select(CsvUpload)
+                .where(CsvUpload.run_id == run_id, CsvUpload.csv_type == "orders")
+                .order_by(desc(CsvUpload.created_at))
+                .limit(1)
+            )
+            result = await session.execute(query)
+            return result.scalars().first()
     
     async def update_csv_upload(self, upload_id: str, updates: Dict[str, Any]) -> Optional[CsvUpload]:
         """Update CSV upload record"""
@@ -1081,6 +1095,14 @@ class StorageService:
             "variants": variants.get("variant_count", 0),
             "catalog": variants.get("catalog_count", 0),
         }
+        if summary["variants"] > 0:
+            summary["missing_catalog_variants"] = max(summary["variants"] - summary["catalog"], 0)
+            summary["catalog_coverage_ratio"] = (
+                summary["catalog"] / summary["variants"] if summary["variants"] else 0.0
+            )
+        else:
+            summary["missing_catalog_variants"] = 0
+            summary["catalog_coverage_ratio"] = 0.0
         logger.info(
             "[%s] Coverage summary | run=%s orders=%d order_lines=%d variants=%d catalog=%d",
             csv_upload_id,

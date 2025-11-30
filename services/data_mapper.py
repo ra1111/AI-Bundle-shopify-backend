@@ -193,6 +193,8 @@ class DataMapper:
             "variant_count": 0,
             "catalog_count": 0,
             "blocked_no_variants_or_catalog": False,
+            "missing_catalog_variants": 0,
+            "catalog_coverage_ratio": 0.0,
         }
 
         unresolved_samples: List[str] = []
@@ -228,6 +230,17 @@ class DataMapper:
                 metrics["order_line_count"] = coverage.get("order_lines", 0)
                 metrics["variant_count"] = coverage.get("variants", 0)
                 metrics["catalog_count"] = coverage.get("catalog", 0)
+                metrics["missing_catalog_variants"] = coverage.get("missing_catalog_variants", 0)
+                metrics["catalog_coverage_ratio"] = coverage.get("catalog_coverage_ratio", 0.0)
+                if metrics["catalog_coverage_ratio"] < 1.0:
+                    logger.warning(
+                        "[%s] Catalog coverage incomplete (ratio=%.3f missing=%d variants=%d catalog=%d)",
+                        csv_upload_id,
+                        metrics["catalog_coverage_ratio"],
+                        metrics["missing_catalog_variants"],
+                        metrics["variant_count"],
+                        metrics["catalog_count"],
+                    )
             except Exception as exc:
                 logger.warning(
                     "[%s] Coverage summary failed (run=%s): %s",
