@@ -839,70 +839,103 @@ class StorageService:
             - quick_start_bundle_count (int)
             - csv_upload_status (str or None)
         """
-        # Check cache first
-        now = time.time()
-        if csv_upload_id in self._preflight_cache:
-            cached_result, cached_time = self._preflight_cache[csv_upload_id]
-            if now - cached_time < self._PREFLIGHT_CACHE_TTL:
-                logger.debug(
-                    f"[{csv_upload_id}] Pre-flight check cache HIT "
-                    f"(age: {now - cached_time:.1f}s)"
+        import traceback
+        step_start = time.time()
+        logger.info(f"[{csv_upload_id}] 🔍 Pre-flight check STARTING | shop_id={shop_id}")
+        
+        try:
+            # Check cache first
+            now = time.time()
+            if csv_upload_id in self._preflight_cache:
+                cached_result, cached_time = self._preflight_cache[csv_upload_id]
+                if now - cached_time < self._PREFLIGHT_CACHE_TTL:
+                    logger.info(
+                        f"[{csv_upload_id}] ✅ Pre-flight check cache HIT "
+                        f"(age: {now - cached_time:.1f}s) | result={cached_result}"
+                    )
+                    return cached_result
+                else:
+                    # Cache expired, remove it
+                    del self._preflight_cache[csv_upload_id]
+                    logger.info(f"[{csv_upload_id}] Pre-flight cache expired, fetching fresh data")
+
+            normalized_shop_id = resolve_shop_id(shop_id)
+            logger.info(f"[{csv_upload_id}] Pre-flight: normalized_shop_id={normalized_shop_id}")
+
+            async with self.get_session() as session:
+                logger.info(f"[{csv_upload_id}] Pre-flight: got session, executing query...")
+                query_start = time.time()
+                
+                # Single query to get all pre-flight info using a SQL query with JOINs
+                query = text("""
+                    SELECT
+                        COALESCE(sss.initial_sync_completed, FALSE) as sync_completed,
+                        cu.status as upload_status,
+                        COUNT(br.id) FILTER (WHERE br.discount_reference LIKE :quick_start_pattern) as quick_start_count
+                    FROM csv_uploads cu
+                    LEFT JOIN shop_sync_status sss ON sss.shop_id = cu.shop_id
+                    LEFT JOIN bundle_recommendations br ON br.csv_upload_id = cu.id
+                    WHERE cu.id = :csv_upload_id
+                    GROUP BY sss.initial_sync_completed, cu.status
+                """)
+
+                result = await session.execute(
+                    query,
+                    {
+                        "csv_upload_id": csv_upload_id,
+                        "quick_start_pattern": "__quick_start_%"
+                    }
                 )
-                return cached_result
-            else:
-                # Cache expired, remove it
-                del self._preflight_cache[csv_upload_id]
+                query_duration = (time.time() - query_start) * 1000
+                logger.info(f"[{csv_upload_id}] Pre-flight: query executed in {query_duration:.1f}ms")
+                
+                row = result.fetchone()
+                logger.info(f"[{csv_upload_id}] Pre-flight: query result row={row}")
 
-        normalized_shop_id = resolve_shop_id(shop_id)
+                if not row:
+                    # CSV upload not found - assume first install, no existing bundles
+                    logger.warning(f"[{csv_upload_id}] Pre-flight: NO ROW FOUND - CSV upload missing from database!")
+                    return {
+                        "is_first_time_install": True,
+                        "has_existing_quick_start": False,
+                        "quick_start_bundle_count": 0,
+                        "csv_upload_status": None,
+                    }
 
-        async with self.get_session() as session:
-            # Single query to get all pre-flight info using a SQL query with JOINs
-            query = text("""
-                SELECT
-                    COALESCE(sss.initial_sync_completed, FALSE) as sync_completed,
-                    cu.status as upload_status,
-                    COUNT(br.id) FILTER (WHERE br.discount_reference LIKE :quick_start_pattern) as quick_start_count
-                FROM csv_uploads cu
-                LEFT JOIN shop_sync_status sss ON sss.shop_id = cu.shop_id
-                LEFT JOIN bundle_recommendations br ON br.csv_upload_id = cu.id
-                WHERE cu.id = :csv_upload_id
-                GROUP BY sss.initial_sync_completed, cu.status
-            """)
+                sync_completed = row[0] if row[0] is not None else False
+                upload_status = row[1]
+                quick_start_count = row[2] if row[2] is not None else 0
+                
+                logger.info(
+                    f"[{csv_upload_id}] Pre-flight: parsed values | "
+                    f"sync_completed={sync_completed}, upload_status={upload_status}, quick_start_count={quick_start_count}"
+                )
 
-            result = await session.execute(
-                query,
-                {
-                    "csv_upload_id": csv_upload_id,
-                    "quick_start_pattern": "__quick_start_%"
+                result_dict = {
+                    "is_first_time_install": not sync_completed,
+                    "has_existing_quick_start": quick_start_count > 0,
+                    "quick_start_bundle_count": int(quick_start_count),
+                    "csv_upload_status": upload_status,
                 }
+
+                # Store in cache
+                self._preflight_cache[csv_upload_id] = (result_dict, time.time())
+                total_duration = (time.time() - step_start) * 1000
+                logger.info(
+                    f"[{csv_upload_id}] ✅ Pre-flight check COMPLETE in {total_duration:.1f}ms | result={result_dict}"
+                )
+
+                return result_dict
+                
+        except Exception as e:
+            total_duration = (time.time() - step_start) * 1000
+            logger.error(
+                f"[{csv_upload_id}] ❌ Pre-flight check FAILED after {total_duration:.1f}ms!\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error message: {str(e)}\n"
+                f"  Traceback:\n{traceback.format_exc()}"
             )
-            row = result.fetchone()
-
-            if not row:
-                # CSV upload not found - assume first install, no existing bundles
-                return {
-                    "is_first_time_install": True,
-                    "has_existing_quick_start": False,
-                    "quick_start_bundle_count": 0,
-                    "csv_upload_status": None,
-                }
-
-            sync_completed = row[0] if row[0] is not None else False
-            upload_status = row[1]
-            quick_start_count = row[2] if row[2] is not None else 0
-
-            result = {
-                "is_first_time_install": not sync_completed,
-                "has_existing_quick_start": quick_start_count > 0,
-                "quick_start_bundle_count": int(quick_start_count),
-                "csv_upload_status": upload_status,
-            }
-
-            # Store in cache
-            self._preflight_cache[csv_upload_id] = (result, time.time())
-            logger.debug(f"[{csv_upload_id}] Pre-flight check cache MISS, result cached")
-
-            return result
+            raise
 
     async def backfill_bundle_recommendation_shop_ids(self) -> int:
         """Populate missing bundle_recommendations.shop_id values from their CSV uploads."""

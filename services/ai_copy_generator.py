@@ -5,6 +5,8 @@ Generates marketing copy using OpenAI
 from typing import List, Dict, Any, Optional
 import logging
 import json
+import time
+import traceback
 
 from services.ml.llm_utils import (
     get_async_client,
@@ -14,6 +16,12 @@ from services.ml.llm_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _generate_request_id() -> str:
+    """Generate a short request ID for log correlation."""
+    import uuid
+    return str(uuid.uuid4())[:8]
 
 
 class AICopyGenerator:
@@ -30,60 +38,143 @@ class AICopyGenerator:
         self, 
         products: List[Dict[str, Any]], 
         bundle_type: str, 
-        context: str = ""
+        context: str = "",
+        request_id: str = None
     ) -> Dict[str, str]:
         """Generate marketing copy for a product bundle"""
-        if not should_use_llm():
-            logger.warning("OpenAI API key not found, using fallback copy")
-            return self.generate_fallback_copy(products, bundle_type)
+        req_id = request_id or _generate_request_id()
+        start_time = time.time()
+        
+        logger.info(
+            f"[{req_id}] ✨ AI Copy generation STARTED\n"
+            f"  Bundle type: {bundle_type}\n"
+            f"  Products: {len(products)}\n"
+            f"  Model: {self.model}"
+        )
+        
+        try:
+            # Step 1: Check if LLM is available
+            logger.info(f"[{req_id}] 🔑 Checking OpenAI API key...")
+            if not should_use_llm():
+                logger.warning(f"[{req_id}] ⚠️ OpenAI API key not found, using fallback copy")
+                fallback = self.generate_fallback_copy(products, bundle_type)
+                duration = (time.time() - start_time) * 1000
+                logger.info(f"[{req_id}] ✅ Fallback copy generated in {duration:.0f}ms")
+                return fallback
 
-        # Create prompt for OpenAI
-        prompt = self.create_bundle_prompt(products, bundle_type, context)
+            logger.info(f"[{req_id}] ✅ OpenAI API key verified")
 
-        async def _call():
-            return await self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are an expert e-commerce copywriter specializing in product bundles. Generate compelling, conversion-optimized marketing copy that highlights value and encourages purchase.",
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt,
-                    },
-                ],
-                max_tokens=self.max_tokens,
-                temperature=self.temperature,
+            # Step 2: Create prompt
+            logger.info(f"[{req_id}] 📝 Creating prompt for {len(products)} products...")
+            prompt_start = time.time()
+            prompt = self.create_bundle_prompt(products, bundle_type, context)
+            prompt_duration = (time.time() - prompt_start) * 1000
+            logger.info(f"[{req_id}] ✅ Prompt created in {prompt_duration:.0f}ms (length: {len(prompt)} chars)")
+
+            # Step 3: Call OpenAI API
+            logger.info(
+                f"[{req_id}] 🤖 Calling OpenAI API...\n"
+                f"  Model: {self.model}\n"
+                f"  Max tokens: {self.max_tokens}\n"
+                f"  Temperature: {self.temperature}"
+            )
+            api_start = time.time()
+
+            async def _call():
+                return await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "You are an expert e-commerce copywriter specializing in product bundles. Generate compelling, conversion-optimized marketing copy that highlights value and encourages purchase.",
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt,
+                        },
+                    ],
+                    max_tokens=self.max_tokens,
+                    temperature=self.temperature,
+                )
+
+            response = await run_with_common_errors(
+                "bundle copy generation",
+                _call,
+            )
+            api_duration = (time.time() - api_start) * 1000
+
+            # Step 4: Check response
+            if response is None:
+                logger.error(f"[{req_id}] ❌ OpenAI API returned None after {api_duration:.0f}ms")
+                fallback = self.generate_fallback_copy(products, bundle_type)
+                total_duration = (time.time() - start_time) * 1000
+                logger.info(f"[{req_id}] ✅ Fallback copy generated after API failure, total: {total_duration:.0f}ms")
+                return fallback
+                
+            if not response.choices:
+                logger.error(f"[{req_id}] ❌ OpenAI API returned empty choices after {api_duration:.0f}ms")
+                fallback = self.generate_fallback_copy(products, bundle_type)
+                total_duration = (time.time() - start_time) * 1000
+                logger.info(f"[{req_id}] ✅ Fallback copy generated after empty response, total: {total_duration:.0f}ms")
+                return fallback
+
+            logger.info(
+                f"[{req_id}] ✅ OpenAI API responded in {api_duration:.0f}ms\n"
+                f"  Choices: {len(response.choices)}\n"
+                f"  Usage: {response.usage.total_tokens if response.usage else 'N/A'} tokens"
             )
 
-        response = await run_with_common_errors(
-            "bundle copy generation",
-            _call,
-        )
+            content = response.choices[0].message.content
+            if not content:
+                logger.warning(f"[{req_id}] ⚠️ Empty content from OpenAI; using fallback copy")
+                fallback = self.generate_fallback_copy(products, bundle_type)
+                total_duration = (time.time() - start_time) * 1000
+                logger.info(f"[{req_id}] ✅ Fallback copy generated, total: {total_duration:.0f}ms")
+                return fallback
 
-        if response is None or not response.choices:
+            logger.info(f"[{req_id}] 📦 Received content ({len(content)} chars), parsing...")
+
+            # Step 5: Parse response
+            parse_start = time.time()
+            try:
+                ai_copy = json.loads(content)
+                # Validate required fields
+                required_fields = ["title", "description", "valueProposition", "explanation"]
+                if all(field in ai_copy for field in required_fields):
+                    parse_duration = (time.time() - parse_start) * 1000
+                    total_duration = (time.time() - start_time) * 1000
+                    logger.info(
+                        f"[{req_id}] ✅ AI Copy generation COMPLETE in {total_duration:.0f}ms\n"
+                        f"  Title: {ai_copy.get('title', 'N/A')[:50]}...\n"
+                        f"  Parse time: {parse_duration:.0f}ms"
+                    )
+                    return ai_copy
+                else:
+                    missing = [f for f in required_fields if f not in ai_copy]
+                    logger.warning(f"[{req_id}] ⚠️ AI response missing fields: {missing}")
+                    result = self.parse_text_response(content, bundle_type)
+                    total_duration = (time.time() - start_time) * 1000
+                    logger.info(f"[{req_id}] ✅ Text response parsed, total: {total_duration:.0f}ms")
+                    return result
+
+            except json.JSONDecodeError as je:
+                logger.warning(f"[{req_id}] ⚠️ JSON parse failed: {je}, trying text parse...")
+                result = self.parse_text_response(content, bundle_type)
+                total_duration = (time.time() - start_time) * 1000
+                logger.info(f"[{req_id}] ✅ Text response parsed after JSON error, total: {total_duration:.0f}ms")
+                return result
+                
+        except Exception as e:
+            total_duration = (time.time() - start_time) * 1000
+            logger.error(
+                f"[{req_id}] ❌ AI Copy generation FAILED after {total_duration:.0f}ms!\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error message: {str(e)}\n"
+                f"  Traceback:\n{traceback.format_exc()}"
+            )
+            # Return fallback instead of crashing
+            logger.info(f"[{req_id}] 🔄 Generating fallback copy after exception...")
             return self.generate_fallback_copy(products, bundle_type)
-
-        content = response.choices[0].message.content
-        if not content:
-            logger.warning("Empty response from OpenAI; using fallback copy")
-            return self.generate_fallback_copy(products, bundle_type)
-
-        # Try to parse as JSON, fallback if needed
-        try:
-            ai_copy = json.loads(content)
-            # Validate required fields
-            required_fields = ["title", "description", "valueProposition", "explanation"]
-            if all(field in ai_copy for field in required_fields):
-                return ai_copy
-            else:
-                logger.warning("AI response missing required fields")
-                return self.parse_text_response(content, bundle_type)
-
-        except json.JSONDecodeError:
-            # Parse as structured text
-            return self.parse_text_response(content, bundle_type)
     
     def create_bundle_prompt(
         self, 

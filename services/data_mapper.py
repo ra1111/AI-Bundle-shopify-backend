@@ -179,6 +179,10 @@ class DataMapper:
 
     async def enrich_order_lines_with_variants(self, csv_upload_id: str) -> Dict[str, Any]:
         """Enrich order lines with variant mappings and compute metrics"""
+        import traceback
+        
+        logger.info(f"[{csv_upload_id}] 🔄 DataMapper.enrich_order_lines_with_variants STARTED")
+        
         metrics = {
             "total_order_lines": 0,
             "resolved_variants": 0,
@@ -196,9 +200,13 @@ class DataMapper:
         mapping_duration = 0.0
         
         try:
+            logger.info(f"[{csv_upload_id}] 📂 Step 1: Resolving run_id...")
             # Resolve run_id to correlate across files
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            logger.info(f"[{csv_upload_id}] ✅ run_id resolved: {run_id or 'None (using upload_id)'}")
+            
             # Get all order lines for this upload (or entire run if available)
+            logger.info(f"[{csv_upload_id}] 📦 Step 2: Fetching order lines...")
             with self._start_span(
                 "data_mapping.fetch_order_lines",
                 {"csv_upload_id": csv_upload_id, "run_id": run_id or ""},
@@ -210,16 +218,22 @@ class DataMapper:
 
             if timing_enabled and fetch_start is not None:
                 fetch_duration = time.perf_counter() - fetch_start
+            
+            logger.info(
+                f"[{csv_upload_id}] ✅ Order lines fetched in {fetch_duration * 1000:.0f}ms\n"
+                f"  Count: {len(order_lines)}"
+            )
 
             metrics["total_order_lines"] = len(order_lines)
             
             if not order_lines:
-                logger.info(f"Data mapping completed: {metrics}")
+                logger.warning(f"[{csv_upload_id}] ⚠️ No order lines found - returning early")
                 return {
                     "metrics": metrics,
                     "enriched_lines": []
                 }
 
+            logger.info(f"[{csv_upload_id}] 🗂️ Step 3: Prefetching catalog/variant/inventory data...")
             with self._start_span(
                 "data_mapping.prefetch",
                 {
@@ -232,6 +246,12 @@ class DataMapper:
                 prefetch_data = await self._prefetch_data(csv_upload_id, run_id, order_lines)
                 if timing_enabled and prefetch_start is not None:
                     prefetch_duration = time.perf_counter() - prefetch_start
+            
+            logger.info(
+                f"[{csv_upload_id}] ✅ Prefetch complete in {prefetch_duration * 1000:.0f}ms\n"
+                f"  Variants: {len(prefetch_data.get('variant_map', {}))}\n"
+                f"  Catalog: {len(prefetch_data.get('catalog_map', {}))}"
+            )
 
             scope = prefetch_data.get("scope", self._scope_key(csv_upload_id, run_id))
             default_batch = feature_flags.get_flag("data_mapping.prefetch_batch_size", 100) or 100
@@ -356,7 +376,14 @@ class DataMapper:
             }
             
         except Exception as e:
-            logger.error(f"Error in data mapping: {e}")
+            overall_duration = (time.perf_counter() - overall_start) * 1000 if overall_start else 0
+            logger.error(
+                f"[{csv_upload_id}] ❌ DataMapper.enrich_order_lines_with_variants FAILED!\n"
+                f"  Duration: {overall_duration:.0f}ms\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error message: {str(e)}\n"
+                f"  Traceback:\n{traceback.format_exc()}"
+            )
             raise
 
     async def _prefetch_data(self, csv_upload_id: str, run_id: Optional[str], _order_lines: List[Any]) -> Dict[str, Any]:

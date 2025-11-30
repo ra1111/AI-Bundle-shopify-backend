@@ -217,11 +217,13 @@ async def approve_recommendation(
 
 async def generate_bundles_background(csv_upload_id: Optional[str], resume_only: bool = False):
     """Background task to generate bundle recommendations with concurrency control and async deferrals."""
+    import traceback
     from services.concurrency_control import concurrency_controller
     
     start_time = time.time()
     scope = f"for CSV upload {csv_upload_id}" if csv_upload_id else "overall"
     logger.info(f"{'Resuming' if resume_only else 'Starting'} bundle generation {scope}")
+    logger.info(f"[{csv_upload_id}] ========== BUNDLE GENERATION BACKGROUND TASK STARTED ==========")
     
     if not csv_upload_id:
         logger.error("Bundle generation requires a valid CSV upload ID")
@@ -262,13 +264,16 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 preflight_info = None
 
                 if QUICK_START_ENABLED and not resume_only:
+                    preflight_start = time.time()
+                    logger.info(f"[{csv_upload_id}] 🔍 Step: Pre-flight check STARTING...")
                     try:
                         # OPTIMIZATION: Use consolidated pre-flight query (single DB round-trip)
                         preflight_info = await storage.get_quick_start_preflight_info(csv_upload_id, shop_id)
                         is_first_install = preflight_info["is_first_time_install"]
+                        preflight_duration = (time.time() - preflight_start) * 1000
 
                         logger.info(
-                            f"[{csv_upload_id}] Pre-flight check complete:\n"
+                            f"[{csv_upload_id}] ✅ Pre-flight check COMPLETE in {preflight_duration:.0f}ms:\n"
                             f"  First-time install: {is_first_install}\n"
                             f"  Existing quick-start bundles: {preflight_info['quick_start_bundle_count']}\n"
                             f"  Upload status: {preflight_info['csv_upload_status']}"
@@ -282,16 +287,29 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                             )
                             is_first_install = False
                     except Exception as e:
-                        logger.warning(f"Failed to check pre-flight status: {e}")
+                        preflight_duration = (time.time() - preflight_start) * 1000
+                        logger.error(
+                            f"[{csv_upload_id}] ❌ Pre-flight check FAILED after {preflight_duration:.0f}ms!\n"
+                            f"  Error type: {type(e).__name__}\n"
+                            f"  Error message: {str(e)}\n"
+                            f"  Traceback:\n{traceback.format_exc()}"
+                        )
                         # Fall back to individual check
                         try:
+                            logger.info(f"[{csv_upload_id}] 🔄 Attempting fallback first-time install check...")
                             is_first_install = await storage.is_first_time_install(shop_id)
-                            logger.info(f"Shop {shop_id} first-time install check (fallback): {is_first_install}")
+                            logger.info(f"[{csv_upload_id}] ✅ Fallback check succeeded: is_first_install={is_first_install}")
                         except Exception as fallback_e:
-                            logger.warning(f"Fallback first-time install check also failed: {fallback_e}")
+                            logger.error(
+                                f"[{csv_upload_id}] ❌ Fallback first-time install check ALSO FAILED!\n"
+                                f"  Error type: {type(fallback_e).__name__}\n"
+                                f"  Error message: {str(fallback_e)}\n"
+                                f"  Traceback:\n{traceback.format_exc()}"
+                            )
 
                 # FAST PATH: Quick-start mode for first-time installations
                 if is_first_install and QUICK_START_ENABLED:
+                    quick_start_overall_start = time.time()
                     logger.info(
                         f"[{csv_upload_id}] 🚀 QUICK-START MODE ACTIVATED for first-time install\n"
                         f"  Shop: {shop_id}\n"
@@ -303,6 +321,7 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
 
                     try:
                         # Run quick-start generation (fast preview)
+                        logger.info(f"[{csv_upload_id}] 🔧 Starting generate_quick_start_bundles()...")
                         generation_result = await asyncio.wait_for(
                             generator.generate_quick_start_bundles(
                                 csv_upload_id,
@@ -312,9 +331,10 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                             ),
                             timeout=float(QUICK_START_TIMEOUT_SECONDS + 30)  # Extra 30s buffer
                         )
+                        quick_start_overall_duration = (time.time() - quick_start_overall_start) * 1000
 
                         logger.info(
-                            f"[{csv_upload_id}] ✅ Quick-start completed successfully\n"
+                            f"[{csv_upload_id}] ✅ Quick-start completed successfully in {quick_start_overall_duration:.0f}ms\n"
                             f"  Bundles: {generation_result.get('metrics', {}).get('total_recommendations', 0)}\n"
                             f"  Duration: {generation_result.get('metrics', {}).get('processing_time_ms', 0) / 1000:.2f}s"
                         )
@@ -344,16 +364,22 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         return
 
                     except asyncio.TimeoutError:
-                        logger.warning(
-                            f"[{csv_upload_id}] ⚠️ Quick-start timed out after {QUICK_START_TIMEOUT_SECONDS}s\n"
-                            f"  Falling back to full generation pipeline"
+                        quick_start_overall_duration = (time.time() - quick_start_overall_start) * 1000
+                        logger.error(
+                            f"[{csv_upload_id}] ⏱️ TIMEOUT: Quick-start exceeded {QUICK_START_TIMEOUT_SECONDS}s!\n"
+                            f"  Actual duration: {quick_start_overall_duration:.0f}ms\n"
+                            f"  Falling back to full generation pipeline\n"
+                            f"  Traceback:\n{traceback.format_exc()}"
                         )
                         # Fall through to normal generation
                     except Exception as quick_exc:
+                        quick_start_overall_duration = (time.time() - quick_start_overall_start) * 1000
                         logger.error(
-                            f"[{csv_upload_id}] ❌ Quick-start failed: {quick_exc}\n"
-                            f"  Falling back to full generation pipeline",
-                            exc_info=True
+                            f"[{csv_upload_id}] ❌ Quick-start FAILED after {quick_start_overall_duration:.0f}ms!\n"
+                            f"  Error type: {type(quick_exc).__name__}\n"
+                            f"  Error message: {str(quick_exc)}\n"
+                            f"  Falling back to full generation pipeline\n"
+                            f"  Traceback:\n{traceback.format_exc()}"
                         )
                         # Fall through to normal generation
 
@@ -640,7 +666,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
             except Exception as e:
                 # Bundle generation failed - update status atomically
                 generation_time = time.time() - start_time
-                logger.exception(f"Bundle generation failed for shop {shop_id} after {generation_time:.2f}s: {e}")
+                logger.error(
+                    f"[{csv_upload_id}] ❌ BUNDLE GENERATION FAILED (inner try block)\n"
+                    f"  Shop: {shop_id}\n"
+                    f"  Duration: {generation_time:.2f}s\n"
+                    f"  Error type: {type(e).__name__}\n"
+                    f"  Error message: {str(e)}\n"
+                    f"  Full traceback:\n{traceback.format_exc()}"
+                )
 
                 # Log additional details if this was a timeout or infinite loop issue
                 if "timeout" in str(e).lower() or generation_time > 300:
@@ -672,7 +705,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
             # Lock is automatically released when exiting the context manager
             
     except asyncio.TimeoutError as e:
-        logger.error(f"TIMEOUT: Bundle generation process timeout for CSV upload {csv_upload_id}: {e}")
+        generation_time = time.time() - start_time
+        logger.error(
+            f"[{csv_upload_id}] ⏱️ TIMEOUT: Bundle generation process timeout!\n"
+            f"  Duration: {generation_time:.2f}s\n"
+            f"  Timeout limit: {BUNDLE_GENERATION_TIMEOUT_SECONDS}s\n"
+            f"  Error: {str(e)}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
         # Update status without lock since this was a timeout
         await concurrency_controller.atomic_status_update_with_precondition(
             csv_upload_id, 
@@ -689,7 +729,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
         return
         
     except TimeoutError as e:
-        logger.error(f"Could not acquire bundle generation lock for CSV upload {csv_upload_id}: {e}")
+        generation_time = time.time() - start_time
+        logger.error(
+            f"[{csv_upload_id}] 🔒 LOCK TIMEOUT: Could not acquire bundle generation lock!\n"
+            f"  Duration: {generation_time:.2f}s\n"
+            f"  Error: {str(e)}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
         # Update status without lock since we couldn't acquire it
         await concurrency_controller.atomic_status_update_with_precondition(
             csv_upload_id, 
@@ -706,7 +752,14 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
         return
         
     except ValueError as e:
-        logger.error(f"Invalid CSV upload or shop identification: {e}")
+        generation_time = time.time() - start_time
+        logger.error(
+            f"[{csv_upload_id}] ❌ INVALID: CSV upload or shop identification error!\n"
+            f"  Duration: {generation_time:.2f}s\n"
+            f"  Error type: {type(e).__name__}\n"
+            f"  Error: {str(e)}\n"
+            f"  Traceback:\n{traceback.format_exc()}"
+        )
         await concurrency_controller.atomic_status_update_with_precondition(
             csv_upload_id, 
             "bundle_generation_failed",
@@ -723,7 +776,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
         
     except Exception as e:
         generation_time = time.time() - start_time
-        logger.exception(f"Unexpected error in bundle generation after {generation_time:.2f}s: {e}")
+        logger.error(
+            f"[{csv_upload_id}] 💥 UNEXPECTED ERROR in bundle generation!\n"
+            f"  Duration: {generation_time:.2f}s\n"
+            f"  Error type: {type(e).__name__}\n"
+            f"  Error message: {str(e)}\n"
+            f"  Full traceback:\n{traceback.format_exc()}"
+        )
         
         # Update status without lock in case of unexpected errors
         await concurrency_controller.atomic_status_update_with_precondition(

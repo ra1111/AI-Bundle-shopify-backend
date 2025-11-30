@@ -1289,6 +1289,8 @@ class BundleGenerator:
         Returns:
             Dict with recommendations, metrics, and quick_start flag
         """
+        import traceback
+        
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
 
@@ -1314,14 +1316,32 @@ class BundleGenerator:
 
         try:
             # PHASE 1: Load and enrich order data (simplified)
+            logger.info(f"[{csv_upload_id}] 📦 PHASE 1: Loading order lines from database...")
             phase1_start = time.time()
-            order_lines = await storage.get_order_lines(csv_upload_id)
+            
+            try:
+                order_lines = await storage.get_order_lines(csv_upload_id)
+                phase1_db_duration = (time.time() - phase1_start) * 1000
+                logger.info(
+                    f"[{csv_upload_id}] ✅ Database query completed in {phase1_db_duration:.0f}ms\n"
+                    f"  Order lines loaded: {len(order_lines)}"
+                )
+            except Exception as db_e:
+                phase1_db_duration = (time.time() - phase1_start) * 1000
+                logger.error(
+                    f"[{csv_upload_id}] ❌ PHASE 1 FAILED: Database query failed after {phase1_db_duration:.0f}ms!\n"
+                    f"  Error type: {type(db_e).__name__}\n"
+                    f"  Error message: {str(db_e)}\n"
+                    f"  Traceback:\n{traceback.format_exc()}"
+                )
+                raise
 
             logger.info(
-                f"[{csv_upload_id}] Quick-start Phase 1: Loaded {len(order_lines)} order lines"
+                f"[{csv_upload_id}] ✅ Quick-start Phase 1: Loaded {len(order_lines)} order lines"
             )
 
             # Early exit check: insufficient data
+            logger.info(f"[{csv_upload_id}] 🔍 Checking data sufficiency (minimum: 10 order lines)...")
             if len(order_lines) < 10:
                 logger.warning(
                     f"[{csv_upload_id}] Quick-start: Insufficient data - only {len(order_lines)} order lines. "
@@ -1416,12 +1436,31 @@ class BundleGenerator:
             )
 
             # PHASE 2: Simple objective scoring (only high-priority objectives)
+            logger.info(f"[{csv_upload_id}] 📊 PHASE 2: Starting product scoring...")
             phase2_start = time.time()
 
             # Use only 2 high-priority objectives for speed
             quick_objectives = ['increase_aov', 'clear_slow_movers']
+            logger.info(f"[{csv_upload_id}] Using objectives: {quick_objectives}")
 
-            catalog = await storage.get_catalog_snapshots_map(csv_upload_id)
+            logger.info(f"[{csv_upload_id}] 🗂️ Loading catalog snapshots map...")
+            catalog_start = time.time()
+            try:
+                catalog = await storage.get_catalog_snapshots_map(csv_upload_id)
+                catalog_duration = (time.time() - catalog_start) * 1000
+                logger.info(
+                    f"[{csv_upload_id}] ✅ Catalog loaded in {catalog_duration:.0f}ms\n"
+                    f"  Catalog entries: {len(catalog)}"
+                )
+            except Exception as cat_e:
+                catalog_duration = (time.time() - catalog_start) * 1000
+                logger.error(
+                    f"[{csv_upload_id}] ❌ PHASE 2 FAILED: Catalog loading failed after {catalog_duration:.0f}ms!\n"
+                    f"  Error type: {type(cat_e).__name__}\n"
+                    f"  Error message: {str(cat_e)}\n"
+                    f"  Traceback:\n{traceback.format_exc()}"
+                )
+                raise
 
             # Simple scoring based on inventory flags
             product_scores = {}
@@ -1453,6 +1492,7 @@ class BundleGenerator:
             )
 
             # PHASE 3: Simple bundle generation (no complex ML)
+            logger.info(f"[{csv_upload_id}] 🔗 PHASE 3: Building co-purchase matrix...")
             phase3_start = time.time()
 
             # Use association rules from co-purchase patterns
@@ -1460,6 +1500,7 @@ class BundleGenerator:
             sku_pairs = defaultdict(int)
 
             # Build simple co-occurrence matrix from orders
+            logger.info(f"[{csv_upload_id}] 📋 Grouping {len(filtered_lines)} order lines by order_id...")
             order_groups = defaultdict(list)
             for line in filtered_lines:
                 order_id = getattr(line, 'order_id', None)
@@ -1468,7 +1509,9 @@ class BundleGenerator:
                     order_groups[order_id].append(sku)
 
             logger.info(
-                f"[{csv_upload_id}] Quick-start Phase 3: Built order groups from {len(order_groups)} unique orders"
+                f"[{csv_upload_id}] ✅ Order grouping complete\n"
+                f"  Unique orders: {len(order_groups)}\n"
+                f"  Time: {(time.time() - phase3_start) * 1000:.0f}ms"
             )
 
             # Early exit check: insufficient orders
@@ -1539,11 +1582,14 @@ class BundleGenerator:
             sorted_pairs = sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)
 
             logger.info(
-                f"[{csv_upload_id}] Quick-start: Top pair frequency: {sorted_pairs[0][1] if sorted_pairs else 0}, "
-                f"evaluating top {min(len(sorted_pairs), max_bundles)} candidates"
+                f"[{csv_upload_id}] 📈 Sorted pairs by frequency\n"
+                f"  Top pair frequency: {sorted_pairs[0][1] if sorted_pairs else 0}\n"
+                f"  Evaluating top {min(len(sorted_pairs), max_bundles * 3)} candidates for {max_bundles} bundles"
             )
 
             # Generate bundles from top pairs
+            logger.info(f"[{csv_upload_id}] 🔨 Creating bundle recommendations...")
+            bundle_creation_start = time.time()
             recommendations = []
             catalog_misses = 0
             for (sku1, sku2), count in sorted_pairs[:max_bundles * 3]:  # Try 3x to account for catalog misses
@@ -1601,10 +1647,13 @@ class BundleGenerator:
 
                 recommendations.append(rec)
 
+            bundle_creation_duration = (time.time() - bundle_creation_start) * 1000
             logger.info(
-                f"[{csv_upload_id}] Quick-start Phase 3 complete: "
-                f"Generated {len(recommendations)} bundles from {len(sorted_pairs)} pair candidates "
-                f"(catalog misses: {catalog_misses})"
+                f"[{csv_upload_id}] ✅ PHASE 3 complete in {(time.time() - phase3_start) * 1000:.0f}ms\n"
+                f"  Bundles created: {len(recommendations)}\n"
+                f"  Pair candidates evaluated: {len(sorted_pairs)}\n"
+                f"  Catalog misses: {catalog_misses}\n"
+                f"  Bundle creation time: {bundle_creation_duration:.0f}ms"
             )
 
             phase3_duration = (time.time() - phase3_start) * 1000
@@ -1618,11 +1667,28 @@ class BundleGenerator:
             )
 
             # PHASE 4: Save recommendations
+            logger.info(f"[{csv_upload_id}] 💾 PHASE 4: Saving {len(recommendations)} bundle recommendations...")
             phase4_start = time.time()
 
             if recommendations:
-                await storage.create_bundle_recommendations(recommendations)
-                logger.info(f"[{csv_upload_id}] Quick-start: Saved {len(recommendations)} preview bundles")
+                try:
+                    await storage.create_bundle_recommendations(recommendations)
+                    save_duration = (time.time() - phase4_start) * 1000
+                    logger.info(
+                        f"[{csv_upload_id}] ✅ Saved {len(recommendations)} preview bundles in {save_duration:.0f}ms"
+                    )
+                except Exception as save_e:
+                    save_duration = (time.time() - phase4_start) * 1000
+                    logger.error(
+                        f"[{csv_upload_id}] ❌ PHASE 4 FAILED: Database save failed after {save_duration:.0f}ms!\n"
+                        f"  Recommendations to save: {len(recommendations)}\n"
+                        f"  Error type: {type(save_e).__name__}\n"
+                        f"  Error message: {str(save_e)}\n"
+                        f"  Traceback:\n{traceback.format_exc()}"
+                    )
+                    raise
+            else:
+                logger.info(f"[{csv_upload_id}] ⚠️ No recommendations to save (0 bundles generated)")
 
             phase4_duration = (time.time() - phase4_start) * 1000
 
@@ -2627,10 +2693,17 @@ class BundleGenerator:
             }
             
         except Exception as e:
+            import traceback as tb_module
             # Calculate total time even on failure
             total_pipeline_duration = int((time.time() - pipeline_start) * 1000)
 
-            logger.error(f"[{csv_upload_id}] ========== BUNDLE GENERATION PIPELINE FAILED ==========")
+            logger.error(
+                f"[{csv_upload_id}] ========== BUNDLE GENERATION PIPELINE FAILED ==========\n"
+                f"  Duration until failure: {total_pipeline_duration}ms ({total_pipeline_duration/1000:.1f}s)\n"
+                f"  Error type: {type(e).__name__}\n"
+                f"  Error message: {str(e)}\n"
+                f"  Full traceback:\n{tb_module.format_exc()}"
+            )
             logger.error(f"[{csv_upload_id}] Error: {str(e)}")
             logger.error(f"[{csv_upload_id}] Total Duration Before Failure: {total_pipeline_duration}ms ({total_pipeline_duration/1000:.1f}s)")
 
