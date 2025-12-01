@@ -292,6 +292,20 @@ class StorageService:
             )
             result = await session.execute(query)
             return result.scalars().first()
+
+    async def get_latest_upload_for_run(self, run_id: str, csv_type: str) -> Optional[CsvUpload]:
+        """Return the most recent upload of a given type for a run."""
+        if not run_id or not csv_type:
+            return None
+        async with self.get_session() as session:
+            query = (
+                select(CsvUpload)
+                .where(CsvUpload.run_id == run_id, CsvUpload.csv_type == csv_type)
+                .order_by(desc(CsvUpload.created_at))
+                .limit(1)
+            )
+            result = await session.execute(query)
+            return result.scalars().first()
     
     async def update_csv_upload(self, upload_id: str, updates: Dict[str, Any]) -> Optional[CsvUpload]:
         """Update CSV upload record"""

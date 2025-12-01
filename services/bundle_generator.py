@@ -1283,6 +1283,30 @@ class BundleGenerator:
         ai_copy.setdefault("valueProposition", "Save with this bundle.")
         recommendation["ai_copy"] = ai_copy
         return ai_copy
+
+    async def _canonical_upload_id(self, upload_id: str) -> str:
+        """
+        Prefer the most recent orders upload for the run as canonical, else fall back to the provided id.
+        This keeps downstream catalog/variant lookups aligned with ingestion that writes to the orders upload id.
+        """
+        try:
+            run_id = await storage.get_run_id_for_upload(upload_id)
+            if not run_id:
+                return upload_id
+            orders_upload = await storage.get_latest_orders_upload_for_run(run_id)
+            if orders_upload and getattr(orders_upload, "id", None):
+                orders_id = getattr(orders_upload, "id")
+                if orders_id != upload_id:
+                    logger.info(
+                        "[%s] Canonical upload alignment: using orders upload %s for run %s",
+                        upload_id,
+                        orders_id,
+                        run_id,
+                    )
+                return orders_id
+        except Exception as exc:
+            logger.warning("[%s] Canonical upload lookup failed: %s", upload_id, exc)
+        return upload_id
     async def generate_quick_start_bundles(
         self,
         csv_upload_id: str,
@@ -1506,11 +1530,12 @@ class BundleGenerator:
             logger.info(f"[{csv_upload_id}] 🗂️ Loading catalog snapshots map...")
             catalog_start = time.time()
             try:
-                catalog = await storage.get_catalog_snapshots_map(csv_upload_id)
+                canonical_upload_id = await self._canonical_upload_id(csv_upload_id)
+                catalog = await storage.get_catalog_snapshots_map(canonical_upload_id)
                 catalog_duration = (time.time() - catalog_start) * 1000
                 logger.info(
                     f"[{csv_upload_id}] ✅ Catalog loaded in {catalog_duration:.0f}ms\n"
-                    f"  Catalog entries: {len(catalog)}"
+                    f"  Catalog entries: {len(catalog)} (source upload={canonical_upload_id})"
                 )
 
                 # EXTENSIVE LOGGING: Catalog contents
@@ -1561,8 +1586,16 @@ class BundleGenerator:
                 logger.info(f"[{csv_upload_id}]   Variant IDs in BOTH: {len(order_variant_ids & catalog_variant_id_set)}")
 
                 if missing_in_catalog:
-                    logger.error(f"[{csv_upload_id}] ❌ Variant IDs in orders but NOT in catalog ({len(missing_in_catalog)}): {sorted(missing_in_catalog)}")
-                    logger.error(f"[{csv_upload_id}]    This will cause catalog lookup failures and 0 bundles!")
+                    logger.warning(
+                        "[%s] ⚠️ Variant IDs in orders but NOT in catalog (%d): %s",
+                        csv_upload_id,
+                        len(missing_in_catalog),
+                        sorted(list(missing_in_catalog))[:20],
+                    )
+                    logger.warning(
+                        "[%s] Missing catalog rows will drop some FBT pairs but will not block all bundles.",
+                        csv_upload_id,
+                    )
                 else:
                     logger.info(f"[{csv_upload_id}] ✅ All order variant_ids found in catalog!")
 
