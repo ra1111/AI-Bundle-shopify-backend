@@ -495,7 +495,9 @@ class DataMapper:
 
         if scope not in self._catalog_map_by_scope:
             tasks["catalog_map"] = asyncio.create_task(
-                storage.get_catalog_snapshots_map_by_run(run_id) if run_id else storage.get_catalog_snapshots_map(csv_upload_id)
+                storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
+                if run_id
+                else storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             )
 
         if tasks:
@@ -846,7 +848,10 @@ class DataMapper:
         try:
             # ARCHITECTURE: Catalog is keyed by variant_id (primary key)
             # Use variant_id directly for lookup instead of querying variant table first
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            run_id = await storage.get_run_id_for_upload(csv_upload_id)
+            catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+            if not catalog_map and run_id:
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
             if not catalog_map:
                 return None
 

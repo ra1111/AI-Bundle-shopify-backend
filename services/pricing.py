@@ -38,7 +38,7 @@ class BayesianPricingEngine:
         """Compute bundle pricing with Bayesian discount shrinkage"""
         try:
             # ARCHITECT FIX: Preload catalog_map once for in-memory lookups
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             # Check if all SKUs exist in catalog - return success=False if missing
             missing_skus = [sku for sku in bundle_products if sku not in catalog_map]
@@ -187,7 +187,7 @@ class BayesianPricingEngine:
         try:
             # Get overall discount statistics
             all_sales = await storage.get_all_sales_data(csv_upload_id, days=90)
-            catalog_items_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            catalog_items_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             total_revenue = Decimal('0')
             total_discount = Decimal('0')
