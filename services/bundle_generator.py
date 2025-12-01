@@ -1555,7 +1555,7 @@ class BundleGenerator:
                         catalog_lookup_exc,
                     )
 
-                catalog = await storage.get_catalog_snapshots_map(catalog_upload_id)
+                catalog = await storage.get_catalog_snapshots_map_by_variant(catalog_upload_id)
 
                 # If still empty and we have a run_id, try run-scoped map as a fallback.
                 if not catalog and run_id:
@@ -1565,7 +1565,7 @@ class BundleGenerator:
                         catalog_upload_id,
                         run_id,
                     )
-                    catalog = await storage.get_catalog_snapshots_map_by_run(run_id)
+                    catalog = await storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
                     if catalog:
                         logger.info(
                             "[%s] Fallback catalog load by run_id succeeded with %d entries",
@@ -4320,7 +4320,41 @@ class BundleGenerator:
         reason_counts: Dict[str, int] = defaultdict(int)
 
         try:
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            canonical_upload_id = await self._canonical_upload_id(csv_upload_id)
+            run_id = await storage.get_run_id_for_upload(canonical_upload_id)
+
+            catalog_upload_id = canonical_upload_id
+            if run_id:
+                try:
+                    latest_catalog = await storage.get_latest_upload_for_run(run_id, "catalog_joined")
+                    if latest_catalog and getattr(latest_catalog, "id", None):
+                        catalog_upload_id = latest_catalog.id
+                        if catalog_upload_id != canonical_upload_id:
+                            logger.info(
+                                "[%s] Inventory track using catalog upload %s for run %s (orders upload=%s)",
+                                csv_upload_id,
+                                catalog_upload_id,
+                                run_id,
+                                canonical_upload_id,
+                            )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Inventory track failed to resolve catalog upload for run %s: %s",
+                        csv_upload_id,
+                        run_id,
+                        exc,
+                    )
+
+            catalog_map = await storage.get_catalog_snapshots_map_by_variant(catalog_upload_id)
+
+            if not catalog_map and run_id:
+                logger.warning(
+                    "[%s] Inventory track catalog map empty for upload %s; retrying by run_id=%s",
+                    csv_upload_id,
+                    catalog_upload_id,
+                    run_id,
+                )
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
         except Exception as exc:
             logger.warning("[%s] Inventory track failed to load catalog map: %s", csv_upload_id, exc)
             duration_ms = int((time.time() - start) * 1000)

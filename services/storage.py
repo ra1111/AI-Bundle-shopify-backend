@@ -1751,7 +1751,7 @@ class StorageService:
             return list(result.scalars().all())
     
     async def get_catalog_snapshots_map(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
-        """Get catalog snapshots as a map keyed by SKU"""
+        """Get catalog snapshots as a map keyed by SKU."""
         async with self.get_session() as session:
             query = select(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)
             result = await session.execute(query)
@@ -1759,6 +1759,7 @@ class StorageService:
             return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku is not None}
 
     async def get_catalog_snapshots_map_by_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
+        """Get catalog snapshots as a map keyed by SKU for a run."""
         async with self.get_session() as session:
             query = (
                 select(CatalogSnapshot)
@@ -1768,6 +1769,26 @@ class StorageService:
             result = await session.execute(query)
             snapshots = list(result.scalars().all())
             return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku}
+
+    async def get_catalog_snapshots_map_by_variant(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
+        """Get catalog snapshots as a map keyed by variant_id."""
+        async with self.get_session() as session:
+            query = select(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)
+            result = await session.execute(query)
+            snapshots = list(result.scalars().all())
+            return {snapshot.variant_id: snapshot for snapshot in snapshots if snapshot.variant_id}
+
+    async def get_catalog_snapshots_map_by_variant_and_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
+        """Get catalog snapshots keyed by variant_id for a run."""
+        async with self.get_session() as session:
+            query = (
+                select(CatalogSnapshot)
+                .join(CsvUpload, CatalogSnapshot.csv_upload_id == CsvUpload.id)
+                .where(CsvUpload.run_id == run_id)
+            )
+            result = await session.execute(query)
+            snapshots = list(result.scalars().all())
+            return {snapshot.variant_id: snapshot for snapshot in snapshots if snapshot.variant_id}
 
     async def get_order_lines_by_run(self, run_id: str) -> List[OrderLine]:
         if not run_id:
