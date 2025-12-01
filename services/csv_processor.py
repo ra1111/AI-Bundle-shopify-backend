@@ -548,9 +548,8 @@ class CSVProcessor:
                     continue
 
                 product_status = (row.get('product_status') or '').upper()
-                if product_status in {'ARCHIVED', 'DRAFT'}:
-                    pre_filtered += 1
-                    continue
+                # REMOVED: Filter for ARCHIVED/DRAFT status - import all products
+                # This allows bundle generation to work with all historical order data
 
                 price = Decimal(str(row.get('price', '0') or '0'))
                 compare_at_price = Decimal(str(row.get('compare_at_price', '0') or '0'))
