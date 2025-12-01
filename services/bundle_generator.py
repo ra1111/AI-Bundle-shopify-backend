@@ -828,7 +828,7 @@ class BundleGenerator:
             feature_flags.get_flag("bundling.staged_publish_enabled", True), True
         )
         self.staged_thresholds = self._parse_stage_thresholds(
-            feature_flags.get_flag("bundling.staged_thresholds", [3, 5, 10, 20, 40])
+            feature_flags.get_flag("bundling.staged_thresholds", default=[3, 5, 10, 20, 40])
         )
         self.staged_hard_cap = self._coerce_int(
             feature_flags.get_flag("bundling.staged_hard_cap", 40), default=40, minimum=0
@@ -1531,11 +1531,52 @@ class BundleGenerator:
             catalog_start = time.time()
             try:
                 canonical_upload_id = await self._canonical_upload_id(csv_upload_id)
-                catalog = await storage.get_catalog_snapshots_map(canonical_upload_id)
+                run_id = await storage.get_run_id_for_upload(canonical_upload_id)
+
+                # Prefer the latest catalog upload for the run; fall back to canonical orders upload if not found.
+                catalog_upload_id = canonical_upload_id
+                try:
+                    catalog_upload = await storage.get_latest_upload_for_run(run_id, "catalog_joined") if run_id else None
+                    if catalog_upload and getattr(catalog_upload, "id", None):
+                        catalog_upload_id = catalog_upload.id
+                        if catalog_upload_id != canonical_upload_id:
+                            logger.info(
+                                "[%s] Using latest catalog upload %s for run %s (orders upload=%s)",
+                                csv_upload_id,
+                                catalog_upload_id,
+                                run_id,
+                                canonical_upload_id,
+                            )
+                except Exception as catalog_lookup_exc:
+                    logger.warning(
+                        "[%s] Failed to resolve latest catalog upload for run %s: %s",
+                        csv_upload_id,
+                        run_id,
+                        catalog_lookup_exc,
+                    )
+
+                catalog = await storage.get_catalog_snapshots_map(catalog_upload_id)
+
+                # If still empty and we have a run_id, try run-scoped map as a fallback.
+                if not catalog and run_id:
+                    logger.warning(
+                        "[%s] Catalog map empty for upload %s; retrying by run_id=%s",
+                        csv_upload_id,
+                        catalog_upload_id,
+                        run_id,
+                    )
+                    catalog = await storage.get_catalog_snapshots_map_by_run(run_id)
+                    if catalog:
+                        logger.info(
+                            "[%s] Fallback catalog load by run_id succeeded with %d entries",
+                            csv_upload_id,
+                            len(catalog),
+                        )
+
                 catalog_duration = (time.time() - catalog_start) * 1000
                 logger.info(
                     f"[{csv_upload_id}] ✅ Catalog loaded in {catalog_duration:.0f}ms\n"
-                    f"  Catalog entries: {len(catalog)} (source upload={canonical_upload_id})"
+                    f"  Catalog entries: {len(catalog)} (source upload={catalog_upload_id})"
                 )
 
                 # EXTENSIVE LOGGING: Catalog contents
@@ -4980,6 +5021,82 @@ def _build_quick_start_fbt_bundles(
         if len(recommendations) >= max_fbt_bundles:
             break
 
+    # Fallback: if we didn't hit desired volume, try best-available pairs that exist in catalog.
+    desired_min = max(5, max_fbt_bundles)
+    if len(recommendations) < desired_min:
+        logger.warning(
+            "[%s] FBT shortfall: %d < %d. Filling with best available pairs present in catalog.",
+            csv_upload_id,
+            len(recommendations),
+            desired_min,
+        )
+        existing_pairs = {
+            tuple(sorted([p["products"][0]["variant_id"], p["products"][1]["variant_id"]]))
+            for p in recommendations
+        }
+        fallback_pairs = sorted(variant_pairs.items(), key=lambda x: x[1], reverse=True)
+        for (variant_id_1, variant_id_2), count in fallback_pairs:
+            if len(recommendations) >= desired_min:
+                break
+            pair_key = tuple(sorted((variant_id_1, variant_id_2)))
+            if pair_key in existing_pairs:
+                continue
+            p1 = catalog.get(variant_id_1)
+            p2 = catalog.get(variant_id_2)
+            if not p1 or not p2:
+                continue
+            price1 = float(getattr(p1, "price", 0) or 0)
+            price2 = float(getattr(p2, "price", 0) or 0)
+            if price1 <= 0 or price2 <= 0:
+                continue
+            total_price = price1 + price2
+            avg_price = total_price / 2.0
+            conf = min(0.9, 0.25 + 0.2 * min(1.0, count / 10.0))
+            ranking_score = 0.5 * product_scores.get(variant_id_1, 0.5) + 0.5 * product_scores.get(
+                variant_id_2, 0.5
+            )
+            recommendations.append(
+                {
+                    "id": str(uuid.uuid4()),
+                    "csv_upload_id": csv_upload_id,
+                    "bundle_type": "FBT",
+                    "objective": "increase_aov",
+                    "products": [
+                        {
+                            "sku": getattr(p1, "sku", ""),
+                            "name": getattr(p1, "product_title", "Product"),
+                            "price": price1,
+                            "variant_id": variant_id_1,
+                            "product_id": getattr(p1, "product_id", ""),
+                        },
+                        {
+                            "sku": getattr(p2, "sku", ""),
+                            "name": getattr(p2, "product_title", "Product"),
+                            "price": price2,
+                            "variant_id": variant_id_2,
+                            "product_id": getattr(p2, "product_id", ""),
+                        },
+                    ],
+                    "pricing": {
+                        "original_total": total_price,
+                        "bundle_price": total_price * 0.9,
+                        "discount_amount": total_price * 0.1,
+                        "discount_pct": "10%",
+                    },
+                    "confidence": Decimal(str(conf)),
+                    "predicted_lift": Decimal(str(1.0 + 0.1 * conf)),
+                    "ranking_score": Decimal(str(ranking_score)),
+                    "discount_reference": f"__quick_start_{csv_upload_id}__",
+                    "is_approved": True,
+                    "created_at": datetime.utcnow(),
+                    "features": {
+                        "fallback": True,
+                        "co_occurrence_count": count,
+                    },
+                }
+            )
+            existing_pairs.add(pair_key)
+
     logger.info(f"[{csv_upload_id}] 🎉 FBT BUNDLE GENERATION - COMPLETED")
     logger.info(f"[{csv_upload_id}]   Bundles created: {len(recommendations)}")
     logger.info(f"[{csv_upload_id}]   Catalog misses: {catalog_miss_count}")
@@ -5126,7 +5243,34 @@ def _build_quick_start_volume_bundles(
 
     if not candidates:
         logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
-        return []
+        # Fallback: pick top-N by available stock (and price > 0) to ensure we emit some volume bundles.
+        fallback_pool = []
+        for variant_id, units_sold in variant_sales.items():
+            snap = catalog.get(variant_id)
+            if not snap:
+                continue
+            try:
+                available = int(getattr(snap, 'available_total', 0) or 0)
+            except (TypeError, ValueError):
+                available = 0
+            price = float(getattr(snap, 'price', 0) or 0)
+            if price <= 0:
+                continue
+            fallback_pool.append((variant_id, units_sold, available, snap))
+
+        # Sort by availability desc, then sales desc
+        fallback_pool.sort(key=lambda t: (t[2], t[1]), reverse=True)
+        fallback_pool = fallback_pool[: max_volume_bundles or 2]
+
+        if not fallback_pool:
+            return []
+
+        logger.info(
+            "[%s] Fallback volume candidates selected by stock: %s",
+            csv_upload_id,
+            [(vid, avail) for vid, _, avail, _ in fallback_pool],
+        )
+        candidates = fallback_pool
 
     # Sort by units sold desc, then stock desc
     candidates.sort(key=lambda t: (t[1], t[2]), reverse=True)
