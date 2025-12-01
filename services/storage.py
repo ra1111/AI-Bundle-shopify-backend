@@ -1531,19 +1531,38 @@ class StorageService:
     
     async def get_catalog_snapshots_map(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
         """
-        ARCHITECTURE: Returns catalog as variant_id->CatalogSnapshot dict.
-        Uses variant_id as primary key (always exists, immutable, unique).
-        SKU is stored in snapshot for display/merchant reference.
+        ARCHITECTURE: Returns catalog with DUAL KEYS for backward compatibility.
+
+        Keys:
+        - variant_id (primary) - Always exists, immutable, unique
+        - sku (fallback) - For legacy ML pipeline compatibility
+
+        This allows:
+        - Quick-start path: Uses variant_id
+        - Full generation path: Uses SKU
+        - Gradual migration to variant_id across entire codebase
         """
         try:
             snapshots = await self.get_catalog_snapshots_by_upload(csv_upload_id)
             result = {}
+            variant_id_count = 0
+            sku_count = 0
+
             for snapshot in snapshots:
-                # ARCHITECTURE: Use variant_id as primary key
-                # SKU remains in snapshot.sku for display purposes
+                # Primary key: variant_id
                 if snapshot.variant_id:
                     result[snapshot.variant_id] = snapshot
-            logger.info(f"[{csv_upload_id}] Catalog map built: {len(result)} entries (variant_id as key)")
+                    variant_id_count += 1
+
+                # Fallback key: SKU (for backward compatibility with ML pipeline)
+                # Skip 'no-sku-*' placeholders to avoid polluting catalog
+                if snapshot.sku and not snapshot.sku.startswith('no-sku-'):
+                    result[snapshot.sku] = snapshot
+                    sku_count += 1
+
+            logger.info(
+                f"[{csv_upload_id}] Catalog map built: {variant_id_count} variant_ids + {sku_count} SKUs = {len(result)} total keys"
+            )
             return result
         except Exception as e:
             logger.error(f"Error building catalog map for {csv_upload_id}: {e}")

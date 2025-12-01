@@ -844,21 +844,13 @@ class DataMapper:
     async def get_product_data_for_variant(self, variant_id: str, csv_upload_id: str) -> Optional[Dict[str, Any]]:
         """Get product data for a variant"""
         try:
-            variant = await storage.get_variant_by_id(variant_id, csv_upload_id)
-            if not variant:
+            # ARCHITECTURE: Catalog is keyed by variant_id (primary key)
+            # Use variant_id directly for lookup instead of querying variant table first
+            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+            if not catalog_map:
                 return None
-            
-            # Try variant_id first (architect's recommendation), skip synthetic SKUs
-            if variant.sku and variant.sku.startswith("no-sku-"):
-                logger.warning(f"Skipping synthetic SKU: {variant.sku}")
-                return None
-                
-            # Get product data from catalog_snapshot using variant.sku as fallback
-            product_data = None
-            if variant.sku:
-                # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-SKU queries
-                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-                product_data = catalog_map.get(variant.sku) if catalog_map else None
+
+            product_data = catalog_map.get(variant_id)
             if not product_data:
                 return None
             
