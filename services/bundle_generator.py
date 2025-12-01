@@ -1492,7 +1492,7 @@ class BundleGenerator:
                 step="scoring",
                 progress=40,
                 status="in_progress",
-                message=f"Quick-start: Analyzing {len(top_skus)} products…",
+                message=f"Quick-start: Analyzing {len(top_variants)} products…",
             )
 
             # PHASE 2: Simple objective scoring (only high-priority objectives)
@@ -1614,10 +1614,11 @@ class BundleGenerator:
 
             from services.ml.pseudo_item2vec import build_covis_vectors
 
-            top_sku_set = set(top_skus)
+            # NOTE: filtered_lines already contains only top products, so no need for top_skus filter
+            # build_covis_vectors extracts SKUs from order_lines internally
             covis_vectors = build_covis_vectors(
                 order_lines=filtered_lines,
-                top_skus=top_sku_set,
+                top_skus=None,  # No additional filtering needed - filtered_lines is already filtered
                 min_co_visits=1,
                 max_neighbors=50,
             )
@@ -1758,12 +1759,12 @@ class BundleGenerator:
                 # Detailed filtering funnel metrics
                 "funnel": {
                     "order_lines_loaded": len(order_lines),
-                    "unique_skus_found": len(unique_skus),
-                    "top_skus_selected": len(top_skus),
+                    "unique_variants_found": len(unique_variants),
+                    "top_variants_selected": len(top_variants),
                     "order_lines_after_filter": len(filtered_lines),
                     "final_bundles": len(recommendations),
                 },
-                "products_analyzed": len(top_skus),
+                "products_analyzed": len(top_variants),
             }
 
             logger.info(
@@ -1773,7 +1774,7 @@ class BundleGenerator:
                 f"  - BOGO: {len(bogo_bundles)}\n"
                 f"  - Volume: {len(volume_bundles)}\n"
                 f"  Duration: {total_duration/1000:.2f}s\n"
-                f"  Products Analyzed: {len(top_skus)}"
+                f"  Products Analyzed: {len(top_variants)}"
             )
 
             return {
@@ -4771,6 +4772,14 @@ def _build_quick_start_fbt_bundles(
     logger.info(f"[{csv_upload_id}]   Input: {len(filtered_lines)} order lines")
     logger.info(f"[{csv_upload_id}]   Target: {max_fbt_bundles} FBT bundles")
 
+    # Build variant_id -> SKU mapping (covis_vectors is keyed by SKU, not variant_id)
+    variant_to_sku = {}
+    for key, snap in catalog.items():
+        variant_id = getattr(snap, 'variant_id', None)
+        sku = getattr(snap, 'sku', None)
+        if variant_id and sku:
+            variant_to_sku[variant_id] = sku
+
     order_groups: Dict[str, List[str]] = defaultdict(list)
 
     for line in filtered_lines:
@@ -4807,10 +4816,13 @@ def _build_quick_start_fbt_bundles(
     filtered_out_count = 0
     for (variant_id_1, variant_id_2), count in variant_pairs.items():
         # Get co-visitation similarity (0-1 range)
+        # NOTE: covis_vectors is keyed by SKU, so we need to map variant_id -> SKU
         covis_sim = 0.0
-        if covis_vectors and variant_id_1 in covis_vectors and variant_id_2 in covis_vectors:
-            v1 = covis_vectors[variant_id_1]
-            v2 = covis_vectors[variant_id_2]
+        sku1 = variant_to_sku.get(variant_id_1)
+        sku2 = variant_to_sku.get(variant_id_2)
+        if covis_vectors and sku1 and sku2 and sku1 in covis_vectors and sku2 in covis_vectors:
+            v1 = covis_vectors[sku1]
+            v2 = covis_vectors[sku2]
             covis_sim = cosine_similarity(v1, v2)
 
         # Blended score: 60% similarity + 40% co-occurrence frequency
@@ -4887,7 +4899,7 @@ def _build_quick_start_fbt_bundles(
         conf = min(0.95, 0.3 + (0.4 * covis_sim) + (0.3 * min(1.0, count / 50.0)))
 
         # Ranking score: blend product quality + similarity
-        product_quality_score = product_scores.get(sku1, 0.5) + product_scores.get(sku2, 0.5)
+        product_quality_score = product_scores.get(variant_id_1, 0.5) + product_scores.get(variant_id_2, 0.5)
         ranking_score = 0.7 * product_quality_score + 0.3 * covis_sim
 
         recommendations.append({
@@ -4966,13 +4978,15 @@ def _build_quick_start_bogo_bundles(
     logger.info(f"[{csv_upload_id}]   Target: {max_bogo_bundles} BOGO bundles")
 
     candidates = []
-    for sku, snap in catalog.items():
+    for key, snap in catalog.items():
         try:
             available = int(getattr(snap, 'available_total', 0) or 0)
         except (TypeError, ValueError):
             available = 0
 
         if getattr(snap, "is_slow_mover", False) and available > 5:
+            # Use SKU for display (catalog has dual keys: variant_id and SKU)
+            sku = getattr(snap, 'sku', '')
             candidates.append((sku, available, snap))
 
     logger.info(f"[{csv_upload_id}]   Slow-mover candidates found: {len(candidates)}/{len(catalog)}")
@@ -4993,6 +5007,9 @@ def _build_quick_start_bogo_bundles(
         if price <= 0:
             continue
 
+        # Extract variant_id for product_scores lookup (product_scores is keyed by variant_id)
+        variant_id = getattr(snap, 'variant_id', '')
+
         # Buy 2, get 1 free ~= 50% effective discount on 3 units
         original_total = price * 3
         effective_bundle_price = price * 2  # Pay for 2, get 3
@@ -5008,7 +5025,7 @@ def _build_quick_start_bogo_bundles(
                     "sku": sku,
                     "name": getattr(snap, 'product_title', 'Product'),
                     "price": price,
-                    "variant_id": getattr(snap, 'variant_id', ''),
+                    "variant_id": variant_id,
                     "product_id": getattr(snap, 'product_id', ''),
                     "min_quantity": 2,  # Buy 2
                     "reward_quantity": 1,  # Get 1 free
@@ -5027,7 +5044,7 @@ def _build_quick_start_bogo_bundles(
             },
             "confidence": Decimal("0.6"),
             "predicted_lift": Decimal("1.0"),
-            "ranking_score": Decimal(str(product_scores.get(sku, 0.5))),
+            "ranking_score": Decimal(str(product_scores.get(variant_id, 0.5))),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
@@ -5120,7 +5137,7 @@ def _build_quick_start_volume_bundles(
             },
             "confidence": Decimal("0.6"),
             "predicted_lift": Decimal("1.0"),
-            "ranking_score": Decimal(str(product_scores.get(sku, 0.5))),
+            "ranking_score": Decimal(str(product_scores.get(variant_id, 0.5))),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
