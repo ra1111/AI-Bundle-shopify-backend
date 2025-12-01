@@ -1423,8 +1423,8 @@ class BundleGenerator:
 
             # Limit to top products by sales volume
             from collections import Counter
-            sku_sales = Counter()
-            unique_skus = set()
+            variant_sales = Counter()  # Track sales by variant_id
+            unique_variants = set()     # Track unique variant_ids
             for line in order_lines:
                 variant_id = getattr(line, 'variant_id', None)
                 quantity = getattr(line, 'quantity', 0) or 0
@@ -1432,18 +1432,18 @@ class BundleGenerator:
                 # ARCHITECTURE: Use variant_id as primary key (always exists, immutable, unique)
                 # SKU is stored in catalog for display/merchant reference only
                 if variant_id:
-                    unique_skus.add(variant_id)
-                    sku_sales[variant_id] += quantity
+                    unique_variants.add(variant_id)
+                    variant_sales[variant_id] += quantity
 
             logger.info(
-                f"[{csv_upload_id}] Quick-start: Found {len(unique_skus)} unique products (SKU or variant_id), "
-                f"total quantity sold: {sum(sku_sales.values())}"
+                f"[{csv_upload_id}] Quick-start: Found {len(unique_variants)} unique products (by variant_id), "
+                f"total quantity sold: {sum(variant_sales.values())}"
             )
 
             # Early exit check: insufficient product variety
-            if len(unique_skus) < 2:
+            if len(unique_variants) < 2:
                 logger.warning(
-                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_skus)} unique products. "
+                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_variants)} unique products. "
                     f"Need at least 2 for bundles."
                 )
                 await update_generation_progress(
@@ -1451,7 +1451,7 @@ class BundleGenerator:
                     step="finalization",
                     progress=100,
                     status="completed",
-                    message=f"Quick-start complete: 0 bundles (insufficient variety: {len(unique_skus)} products)",
+                    message=f"Quick-start complete: 0 bundles (insufficient variety: {len(unique_variants)} products)",
                 )
                 return {
                     "recommendations": [],
@@ -1459,25 +1459,25 @@ class BundleGenerator:
                         "quick_start_mode": True,
                         "total_recommendations": 0,
                         "exit_reason": "insufficient_product_variety",
-                        "unique_skus": len(unique_skus),
+                        "unique_variants": len(unique_variants),
                     },
                     "quick_start": True,
                     "csv_upload_id": csv_upload_id,
                 }
 
-            # Get top N products
-            top_skus = [sku for sku, _ in sku_sales.most_common(max_products)]
+            # Get top N products by sales
+            top_variants = [variant_id for variant_id, _ in variant_sales.most_common(max_products)]
             logger.info(
-                f"[{csv_upload_id}] Quick-start: Selected top {len(top_skus)} products from {len(unique_skus)} total"
+                f"[{csv_upload_id}] Quick-start: Selected top {len(top_variants)} products from {len(unique_variants)} total"
             )
 
             # Filter order lines to only include top products
-            top_skus_set = set(top_skus)
+            top_variants_set = set(top_variants)
             filtered_lines = []
             for line in order_lines:
                 variant_id = getattr(line, 'variant_id', None)
                 # Use variant_id as primary key (consistent with above)
-                if variant_id and variant_id in top_skus_set:
+                if variant_id and variant_id in top_variants_set:
                     filtered_lines.append(line)
 
             logger.info(
@@ -1514,12 +1514,16 @@ class BundleGenerator:
                 )
 
                 # EXTENSIVE LOGGING: Catalog contents
-                catalog_skus = list(catalog.keys())
-                logger.info(f"[{csv_upload_id}] 📋 QUICK-START PHASE 2 - CATALOG ANALYSIS:")
-                logger.info(f"[{csv_upload_id}]   SKUs in catalog: {len(catalog_skus)}")
-                logger.info(f"[{csv_upload_id}]   All catalog SKUs: {sorted(catalog_skus)}")
+                # NOTE: Catalog is keyed by variant_id (primary key), but we log SKUs for debugging
+                catalog_variant_ids = list(catalog.keys())
+                catalog_skus = [getattr(snap, 'sku', '') for snap in catalog.values()]
 
-                # Show SKU type breakdown in catalog
+                logger.info(f"[{csv_upload_id}] 📋 QUICK-START PHASE 2 - CATALOG ANALYSIS:")
+                logger.info(f"[{csv_upload_id}]   Products in catalog (by variant_id): {len(catalog_variant_ids)}")
+                logger.info(f"[{csv_upload_id}]   All catalog variant_ids: {sorted(catalog_variant_ids)}")
+                logger.info(f"[{csv_upload_id}]   All catalog SKUs (for reference): {sorted(filter(None, catalog_skus))}")
+
+                # Show SKU type breakdown in catalog (for debugging data quality)
                 no_sku_catalog = [s for s in catalog_skus if s and s.startswith('no-sku-')]
                 acc_catalog = [s for s in catalog_skus if s and s.startswith('ACC-')]
                 other_catalog = [s for s in catalog_skus if s and not s.startswith('no-sku-') and not s.startswith('ACC-')]
@@ -1529,41 +1533,41 @@ class BundleGenerator:
                 logger.info(f"[{csv_upload_id}]   Catalog SKUs with other formats: {len(other_catalog)}")
 
                 # Check for price data
-                skus_with_price = [sku for sku, snap in catalog.items() if getattr(snap, 'price', 0) and float(getattr(snap, 'price', 0)) > 0]
-                skus_without_price = [sku for sku in catalog_skus if sku not in skus_with_price]
+                variants_with_price = [vid for vid, snap in catalog.items() if getattr(snap, 'price', 0) and float(getattr(snap, 'price', 0)) > 0]
+                variants_without_price = [vid for vid in catalog_variant_ids if vid not in variants_with_price]
 
-                logger.info(f"[{csv_upload_id}]   SKUs with valid prices (>$0): {len(skus_with_price)}")
-                logger.info(f"[{csv_upload_id}]   SKUs with invalid/zero prices: {len(skus_without_price)}")
+                logger.info(f"[{csv_upload_id}]   Products with valid prices (>$0): {len(variants_with_price)}")
+                logger.info(f"[{csv_upload_id}]   Products with invalid/zero prices: {len(variants_without_price)}")
 
-                if skus_with_price:
+                if variants_with_price:
                     logger.info(f"[{csv_upload_id}] 💰 CATALOG PRICES (all entries):")
-                    for sku in sorted(skus_with_price):
-                        price = float(getattr(catalog[sku], 'price', 0))
-                        variant_id = getattr(catalog[sku], 'variant_id', 'N/A')
-                        logger.info(f"[{csv_upload_id}]     SKU='{sku}' | price=${price} | variant_id={variant_id}")
+                    for variant_id in sorted(variants_with_price):
+                        price = float(getattr(catalog[variant_id], 'price', 0))
+                        sku = getattr(catalog[variant_id], 'sku', '')
+                        logger.info(f"[{csv_upload_id}]     variant_id='{variant_id}' | SKU='{sku}' | price=${price}")
 
-                if skus_without_price:
-                    logger.warning(f"[{csv_upload_id}] ⚠️  SKUs in catalog with ZERO/NULL prices: {skus_without_price}")
+                if variants_without_price:
+                    logger.warning(f"[{csv_upload_id}] ⚠️  Variant IDs in catalog with ZERO/NULL prices: {variants_without_price}")
 
-                # Cross-check with order SKUs
-                order_skus = set(filter(None, [getattr(line, 'sku', None) for line in order_lines]))
-                catalog_sku_set = set(catalog_skus)
-                missing_in_catalog = order_skus - catalog_sku_set
-                missing_in_orders = catalog_sku_set - order_skus
+                # Cross-check with order variant_ids (primary key comparison)
+                order_variant_ids = set(filter(None, [getattr(line, 'variant_id', None) for line in order_lines]))
+                catalog_variant_id_set = set(catalog_variant_ids)
+                missing_in_catalog = order_variant_ids - catalog_variant_id_set
+                missing_in_orders = catalog_variant_id_set - order_variant_ids
 
-                logger.info(f"[{csv_upload_id}] 🔍 SKU CROSS-CHECK (Orders vs Catalog):")
-                logger.info(f"[{csv_upload_id}]   SKUs in orders: {len(order_skus)}")
-                logger.info(f"[{csv_upload_id}]   SKUs in catalog: {len(catalog_sku_set)}")
-                logger.info(f"[{csv_upload_id}]   SKUs in BOTH: {len(order_skus & catalog_sku_set)}")
+                logger.info(f"[{csv_upload_id}] 🔍 VARIANT_ID CROSS-CHECK (Orders vs Catalog):")
+                logger.info(f"[{csv_upload_id}]   Variant IDs in orders: {len(order_variant_ids)}")
+                logger.info(f"[{csv_upload_id}]   Variant IDs in catalog: {len(catalog_variant_id_set)}")
+                logger.info(f"[{csv_upload_id}]   Variant IDs in BOTH: {len(order_variant_ids & catalog_variant_id_set)}")
 
                 if missing_in_catalog:
-                    logger.error(f"[{csv_upload_id}] ❌ SKUs in orders but NOT in catalog ({len(missing_in_catalog)}): {sorted(missing_in_catalog)}")
+                    logger.error(f"[{csv_upload_id}] ❌ Variant IDs in orders but NOT in catalog ({len(missing_in_catalog)}): {sorted(missing_in_catalog)}")
                     logger.error(f"[{csv_upload_id}]    This will cause catalog lookup failures and 0 bundles!")
                 else:
-                    logger.info(f"[{csv_upload_id}] ✅ All order SKUs found in catalog!")
+                    logger.info(f"[{csv_upload_id}] ✅ All order variant_ids found in catalog!")
 
                 if missing_in_orders:
-                    logger.info(f"[{csv_upload_id}] ℹ️  SKUs in catalog but not in orders ({len(missing_in_orders)}): {sorted(missing_in_orders)}")
+                    logger.info(f"[{csv_upload_id}] ℹ️  Variant IDs in catalog but not in orders ({len(missing_in_orders)}): {sorted(missing_in_orders)}")
 
             except Exception as cat_e:
                 catalog_duration = (time.time() - catalog_start) * 1000
@@ -1577,8 +1581,8 @@ class BundleGenerator:
 
             # Simple scoring based on inventory flags
             product_scores = {}
-            for sku in top_skus:
-                snapshot = catalog.get(sku)
+            for variant_id in top_variants:
+                snapshot = catalog.get(variant_id)
                 if not snapshot:
                     continue
 
@@ -1592,7 +1596,7 @@ class BundleGenerator:
                 if getattr(snapshot, 'is_high_margin', False):
                     score += 0.2
 
-                product_scores[sku] = score
+                product_scores[variant_id] = score
 
             phase2_duration = (time.time() - phase2_start) * 1000
 
@@ -1664,7 +1668,7 @@ class BundleGenerator:
             volume_bundles = []
             if max_volume_bundles > 0:
                 volume_bundles = _build_quick_start_volume_bundles(
-                    csv_upload_id, sku_sales, catalog, product_scores, max_volume_bundles
+                    csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles
                 )
 
             # Combine all bundle types
@@ -4780,33 +4784,33 @@ def _build_quick_start_fbt_bundles(
 
     logger.info(f"[{csv_upload_id}]   Orders grouped: {len(order_groups)}")
 
-    sku_pairs: Dict[tuple, int] = defaultdict(int)
+    variant_pairs: Dict[tuple, int] = defaultdict(int)  # RENAMED: Now explicitly variant_id pairs
 
-    for _, skus in order_groups.items():
-        unique_skus_in_order = list(set(skus))
-        for i, sku1 in enumerate(unique_skus_in_order):
-            for sku2 in unique_skus_in_order[i + 1:]:
-                pair = tuple(sorted((sku1, sku2)))
-                sku_pairs[pair] += 1
+    for _, variant_ids in order_groups.items():
+        unique_variants_in_order = list(set(variant_ids))
+        for i, variant_id_1 in enumerate(unique_variants_in_order):
+            for variant_id_2 in unique_variants_in_order[i + 1:]:
+                pair = tuple(sorted((variant_id_1, variant_id_2)))
+                variant_pairs[pair] += 1
 
-    logger.info(f"[{csv_upload_id}] 📊 PRODUCT PAIRS FOUND (SKU or variant_id):")
-    logger.info(f"[{csv_upload_id}]   Total unique pairs: {len(sku_pairs)}")
-    for pair, count in sorted(sku_pairs.items(), key=lambda x: x[1], reverse=True)[:10]:
+    logger.info(f"[{csv_upload_id}] 📊 PRODUCT PAIRS FOUND (by variant_id):")
+    logger.info(f"[{csv_upload_id}]   Total unique pairs: {len(variant_pairs)}")
+    for pair, count in sorted(variant_pairs.items(), key=lambda x: x[1], reverse=True)[:10]:
         logger.info(f"[{csv_upload_id}]     {pair[0]} + {pair[1]}: {count} times")
 
-    if not sku_pairs:
+    if not variant_pairs:
         logger.warning(f"[{csv_upload_id}] ⚠️  No product pairs found! Returning 0 bundles.")
         return []
 
     # MODERN: Score pairs using co-visitation similarity + co-occurrence
     scored_pairs = []
     filtered_out_count = 0
-    for (sku1, sku2), count in sku_pairs.items():
+    for (variant_id_1, variant_id_2), count in variant_pairs.items():
         # Get co-visitation similarity (0-1 range)
         covis_sim = 0.0
-        if covis_vectors and sku1 in covis_vectors and sku2 in covis_vectors:
-            v1 = covis_vectors[sku1]
-            v2 = covis_vectors[sku2]
+        if covis_vectors and variant_id_1 in covis_vectors and variant_id_2 in covis_vectors:
+            v1 = covis_vectors[variant_id_1]
+            v2 = covis_vectors[variant_id_2]
             covis_sim = cosine_similarity(v1, v2)
 
         # Blended score: 60% similarity + 40% co-occurrence frequency
@@ -4818,13 +4822,13 @@ def _build_quick_start_fbt_bundles(
         # Require minimum quality: either good similarity OR multiple co-purchases
         if covis_sim < 0.1 and count < 2:
             filtered_out_count += 1
-            logger.debug(f"[{csv_upload_id}]   Filtered: {sku1}+{sku2} (covis={covis_sim:.2f}, count={count})")
+            logger.debug(f"[{csv_upload_id}]   Filtered: {variant_id_1}+{variant_id_2} (covis={covis_sim:.2f}, count={count})")
             continue  # Skip weak pairs
 
-        scored_pairs.append(((sku1, sku2), count, covis_sim, blended_score))
+        scored_pairs.append(((variant_id_1, variant_id_2), count, covis_sim, blended_score))
 
     logger.info(f"[{csv_upload_id}] ✅ Scoring complete:")
-    logger.info(f"[{csv_upload_id}]   Pairs after filtering: {len(scored_pairs)}/{len(sku_pairs)}")
+    logger.info(f"[{csv_upload_id}]   Pairs after filtering: {len(scored_pairs)}/{len(variant_pairs)}")
     logger.info(f"[{csv_upload_id}]   Filtered out (weak): {filtered_out_count}")
 
     # Sort by blended score (descending)
@@ -4834,26 +4838,26 @@ def _build_quick_start_fbt_bundles(
     catalog_miss_count = 0
     price_fail_count = 0
 
-    for (sku1, sku2), count, covis_sim, blended_score in scored_pairs:
+    for (variant_id_1, variant_id_2), count, covis_sim, blended_score in scored_pairs:
         if len(recommendations) >= max_fbt_bundles * 3:  # Generate more candidates for filtering
             break
 
-        p1 = catalog.get(sku1)
-        p2 = catalog.get(sku2)
+        p1 = catalog.get(variant_id_1)
+        p2 = catalog.get(variant_id_2)
         if not p1 or not p2:
             catalog_miss_count += 1
-            logger.warning(f"[{csv_upload_id}]   ❌ Catalog miss: SKU1='{sku1}' SKU2='{sku2}' | p1_exists={p1 is not None}, p2_exists={p2 is not None}")
+            logger.warning(f"[{csv_upload_id}]   ❌ Catalog miss: variant_id_1='{variant_id_1}' variant_id_2='{variant_id_2}' | p1_exists={p1 is not None}, p2_exists={p2 is not None}")
             if not p1:
-                logger.warning(f"[{csv_upload_id}]      SKU '{sku1}' not found in catalog (tried exact match)")
+                logger.warning(f"[{csv_upload_id}]      variant_id '{variant_id_1}' not found in catalog")
             if not p2:
-                logger.warning(f"[{csv_upload_id}]      SKU '{sku2}' not found in catalog (tried exact match)")
+                logger.warning(f"[{csv_upload_id}]      variant_id '{variant_id_2}' not found in catalog")
             continue
 
         price1 = float(getattr(p1, 'price', 0) or 0)
         price2 = float(getattr(p2, 'price', 0) or 0)
         if price1 <= 0 or price2 <= 0:
             price_fail_count += 1
-            logger.warning(f"[{csv_upload_id}]   ❌ Price invalid: SKU1='{sku1}' SKU2='{sku2}' | price1=${price1}, price2=${price2}")
+            logger.warning(f"[{csv_upload_id}]   ❌ Price invalid: variant_id_1='{variant_id_1}' variant_id_2='{variant_id_2}' | price1=${price1}, price2=${price2}")
             continue
 
         total_price = price1 + price2
@@ -4865,8 +4869,8 @@ def _build_quick_start_fbt_bundles(
         pricing_engine = BayesianPricingEngine()
 
         bandit_result = pricing_engine.multi_armed_bandit_pricing(
-            bundle_products=[sku1, sku2],
-            product_prices={sku1: Decimal(str(price1)), sku2: Decimal(str(price2))},
+            bundle_products=[variant_id_1, variant_id_2],
+            product_prices={variant_id_1: Decimal(str(price1)), variant_id_2: Decimal(str(price2))},
             features={
                 "covis_similarity": covis_sim,
                 "avg_price": avg_price,
@@ -4893,17 +4897,17 @@ def _build_quick_start_fbt_bundles(
             "objective": "increase_aov",
             "products": [
                 {
-                    "sku": sku1,
+                    "sku": getattr(p1, 'sku', ''),  # SKU for display only
                     "name": getattr(p1, 'product_title', 'Product'),
                     "price": price1,
-                    "variant_id": getattr(p1, 'variant_id', ''),
+                    "variant_id": variant_id_1,  # Primary key
                     "product_id": getattr(p1, 'product_id', ''),
                 },
                 {
-                    "sku": sku2,
+                    "sku": getattr(p2, 'sku', ''),  # SKU for display only
                     "name": getattr(p2, 'product_title', 'Product'),
                     "price": price2,
-                    "variant_id": getattr(p2, 'variant_id', ''),
+                    "variant_id": variant_id_2,  # Primary key
                     "product_id": getattr(p2, 'product_id', ''),
                 }
             ],
@@ -5037,25 +5041,25 @@ def _build_quick_start_bogo_bundles(
 
 def _build_quick_start_volume_bundles(
     csv_upload_id: str,
-    sku_sales: Counter,
+    variant_sales: Counter,  # RENAMED: Now explicitly variant_id-based
     catalog: Dict[str, Any],
     product_scores: Dict[str, float],
     max_volume_bundles: int,
 ) -> List[Dict[str, Any]]:
     """
     Build simple volume break bundles:
-    - Single anchor product (SKU or variant_id)
+    - Single anchor product (by variant_id)
     - Tiers: 2+, 3+, 5+ with fixed discounts
     Only for:
-    - Popular products (based on sku_sales, which uses SKU or variant_id)
+    - Popular products (based on variant_sales)
     - Sufficient stock (available_total > 20)
     """
     logger.info(f"[{csv_upload_id}] 📦 VOLUME BUNDLE GENERATION - STARTED")
     logger.info(f"[{csv_upload_id}]   Target: {max_volume_bundles} VOLUME bundles")
 
     candidates = []
-    for sku, units_sold in sku_sales.items():
-        snap = catalog.get(sku)
+    for variant_id, units_sold in variant_sales.items():
+        snap = catalog.get(variant_id)
         if not snap:
             continue
 
@@ -5066,9 +5070,9 @@ def _build_quick_start_volume_bundles(
 
         # Heuristic: high enough stock and at least some sales
         if available > 20 and units_sold >= 3:
-            candidates.append((sku, units_sold, available, snap))
+            candidates.append((variant_id, units_sold, available, snap))
 
-    logger.info(f"[{csv_upload_id}]   High-stock candidates found: {len(candidates)}/{len(sku_sales)}")
+    logger.info(f"[{csv_upload_id}]   High-stock candidates found: {len(candidates)}/{len(variant_sales)}")
 
     if not candidates:
         logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
@@ -5078,7 +5082,7 @@ def _build_quick_start_volume_bundles(
     candidates.sort(key=lambda t: (t[1], t[2]), reverse=True)
 
     bundles: List[Dict[str, Any]] = []
-    for sku, units_sold, available, snap in candidates:
+    for variant_id, units_sold, available, snap in candidates:
         if len(bundles) >= max_volume_bundles:
             break
 
@@ -5100,10 +5104,10 @@ def _build_quick_start_volume_bundles(
             "objective": "increase_aov",
             "products": [
                 {
-                    "sku": sku,
+                    "sku": getattr(snap, 'sku', ''),  # SKU for display only
                     "name": getattr(snap, 'product_title', 'Product'),
                     "price": price,
-                    "variant_id": getattr(snap, 'variant_id', ''),
+                    "variant_id": variant_id,  # Primary key
                     "product_id": getattr(snap, 'product_id', ''),
                 }
             ],
