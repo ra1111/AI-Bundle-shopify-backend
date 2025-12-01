@@ -5236,14 +5236,15 @@ def _build_quick_start_volume_bundles(
             available = 0
 
         # Heuristic: high enough stock and at least some sales
-        if available > 20 and units_sold >= 3:
+        # Lowered thresholds for quick-start: stock > 5, sales >= 2
+        if available > 5 and units_sold >= 2:
             candidates.append((variant_id, units_sold, available, snap))
 
     logger.info(f"[{csv_upload_id}]   High-stock candidates found: {len(candidates)}/{len(variant_sales)}")
 
     if not candidates:
         logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
-        # Fallback: pick top-N by available stock (and price > 0) to ensure we emit some volume bundles.
+        # Fallback: pick top-N by sales (any stock, just need price > 0) to ensure we emit volume bundles.
         fallback_pool = []
         for variant_id, units_sold in variant_sales.items():
             snap = catalog.get(variant_id)
@@ -5256,19 +5257,21 @@ def _build_quick_start_volume_bundles(
             price = float(getattr(snap, 'price', 0) or 0)
             if price <= 0:
                 continue
+            # Accept ANY product with valid price, regardless of stock level
             fallback_pool.append((variant_id, units_sold, available, snap))
 
-        # Sort by availability desc, then sales desc
-        fallback_pool.sort(key=lambda t: (t[2], t[1]), reverse=True)
-        fallback_pool = fallback_pool[: max_volume_bundles or 2]
-
         if not fallback_pool:
+            logger.error(f"[{csv_upload_id}] ❌ No products with valid prices for VOLUME bundles!")
             return []
 
+        # Sort by sales desc (prioritize popular products), then availability
+        fallback_pool.sort(key=lambda t: (t[1], t[2]), reverse=True)
+        fallback_pool = fallback_pool[: max_volume_bundles or 2]
+
         logger.info(
-            "[%s] Fallback volume candidates selected by stock: %s",
+            "[%s] Fallback volume candidates selected (top sellers): %s",
             csv_upload_id,
-            [(vid, avail) for vid, _, avail, _ in fallback_pool],
+            [(vid, f"sales={sales}, stock={avail}") for vid, sales, avail, _ in fallback_pool],
         )
         candidates = fallback_pool
 
