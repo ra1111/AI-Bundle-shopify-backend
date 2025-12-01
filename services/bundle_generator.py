@@ -5246,9 +5246,18 @@ def _build_quick_start_volume_bundles(
         logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
         # Fallback: pick top-N by sales (any stock, just need price > 0) to ensure we emit volume bundles.
         fallback_pool = []
+        catalog_misses = 0
+        zero_prices = 0
+
+        logger.info(f"[{csv_upload_id}] 🔍 VOLUME FALLBACK DIAGNOSTICS:")
+        logger.info(f"[{csv_upload_id}]   variant_sales has {len(variant_sales)} products")
+        logger.info(f"[{csv_upload_id}]   Checking each for catalog presence and valid price...")
+
         for variant_id, units_sold in variant_sales.items():
             snap = catalog.get(variant_id)
             if not snap:
+                catalog_misses += 1
+                logger.debug(f"[{csv_upload_id}]     ❌ variant_id '{variant_id}' not in catalog")
                 continue
             try:
                 available = int(getattr(snap, 'available_total', 0) or 0)
@@ -5256,12 +5265,18 @@ def _build_quick_start_volume_bundles(
                 available = 0
             price = float(getattr(snap, 'price', 0) or 0)
             if price <= 0:
+                zero_prices += 1
+                logger.debug(f"[{csv_upload_id}]     ⚠️  variant_id '{variant_id}' has price={price}")
                 continue
             # Accept ANY product with valid price, regardless of stock level
             fallback_pool.append((variant_id, units_sold, available, snap))
 
+        logger.info(f"[{csv_upload_id}]   Results: {len(fallback_pool)} valid, {catalog_misses} not in catalog, {zero_prices} with price<=0")
+
         if not fallback_pool:
             logger.error(f"[{csv_upload_id}] ❌ No products with valid prices for VOLUME bundles!")
+            logger.error(f"[{csv_upload_id}]   Checked {len(variant_sales)} products from sales data")
+            logger.error(f"[{csv_upload_id}]   {catalog_misses} missing from catalog, {zero_prices} have price<=0")
             return []
 
         # Sort by sales desc (prioritize popular products), then availability
