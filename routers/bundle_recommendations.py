@@ -279,13 +279,32 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                             f"  Upload status: {preflight_info['csv_upload_status']}"
                         )
 
-                        # Skip quick-start if bundles already exist
+                        # Skip quick-start if bundles already exist - return early
                         if preflight_info["has_existing_quick_start"]:
+                            bundle_count = preflight_info['quick_start_bundle_count']
                             logger.info(
-                                f"[{csv_upload_id}] Skipping quick-start: "
-                                f"{preflight_info['quick_start_bundle_count']} quick-start bundles already exist"
+                                f"[{csv_upload_id}] ✅ Bundle recommendations already exist\n"
+                                f"  Existing bundles: {bundle_count}\n"
+                                f"  Skipping quick-start generation\n"
+                                f"  Upload status: {preflight_info['csv_upload_status']}"
                             )
-                            is_first_install = False
+
+                            # Mark upload as completed if not already
+                            if preflight_info['csv_upload_status'] != 'completed':
+                                await storage.safe_mark_upload_completed(csv_upload_id)
+                                logger.info(f"[{csv_upload_id}] Marked upload as completed")
+
+                            # Update progress to show completion
+                            await update_generation_progress(
+                                csv_upload_id,
+                                step="finalization",
+                                progress=100,
+                                status="completed",
+                                message=f"Bundle recommendations already exist ({bundle_count} bundles)",
+                            )
+
+                            # Return early - no need to regenerate
+                            return
                     except Exception as e:
                         preflight_duration = (time.time() - preflight_start) * 1000
                         logger.error(
@@ -350,15 +369,13 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         except Exception as notify_exc:
                             logger.warning(f"Failed to send quick-start notification: {notify_exc}")
 
-                        # Queue full generation in background for comprehensive results
+                        # DISABLED: Auto-scheduling of full generation after quick-start
+                        # User can manually trigger full generation if needed
                         logger.info(
-                            f"[{csv_upload_id}] 📋 Scheduling full bundle generation in background\n"
-                            f"  This will run with normal timeout ({BUNDLE_GENERATION_SOFT_WATCHDOG_SECONDS}s watchdog)"
+                            f"[{csv_upload_id}] ✅ Quick-start complete - NOT scheduling full generation\n"
+                            f"  Quick bundles are ready for immediate use\n"
+                            f"  Full generation can be triggered manually if needed"
                         )
-
-                        # Schedule full generation asynchronously
-                        # Note: This will run later with full pipeline
-                        pipeline_scheduler.schedule(_run_full_generation_after_quickstart(csv_upload_id, shop_id))
 
                         # Return early - quick-start is complete
                         return

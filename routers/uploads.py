@@ -136,23 +136,47 @@ async def upload_csv(
 
 @router.get("/upload-status/{upload_id}")
 async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
-    """Get upload processing status"""
+    """
+    ⚠️ DEPRECATED: Use /api/shopify/status/{upload_id} instead
+
+    This endpoint is maintained for backward compatibility but will be removed in a future version.
+    Please migrate to /api/shopify/status/{upload_id} which provides:
+    - Simplified status values (processing/completed/failed)
+    - bundle_count field
+    - Better error handling
+    """
     try:
+        logger.warning(
+            f"⚠️ DEPRECATED ENDPOINT CALLED: /api/upload-status/{upload_id} "
+            f"- Please migrate to /api/shopify/status/{upload_id}"
+        )
+
         result = await db.get(CsvUpload, upload_id)
         if not result:
             raise HTTPException(status_code=404, detail="Upload not found")
-        
+
+        # Map internal status to simplified status
+        frontend_status = result.status
+        if result.status in {"bundle_generation_completed"}:
+            frontend_status = "completed"
+        elif result.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+            frontend_status = "processing"
+        elif result.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
+            frontend_status = "failed"
+
         return {
             "id": result.id,
             "filename": result.filename,
             "csvType": result.csv_type,
             "runId": result.run_id,
-            "status": result.status,
+            "status": frontend_status,  # Simplified status
             "totalRows": result.total_rows,
             "processedRows": result.processed_rows,
-            "errorMessage": result.error_message
+            "errorMessage": result.error_message,
+            "_deprecated": True,
+            "_useInstead": f"/api/shopify/status/{upload_id}"
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:

@@ -162,22 +162,57 @@ async def shopify_upload(
 async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
     """Check processing status for a CsvUpload created via the Shopify endpoint."""
 
+    logger.info(f"🔍 STATUS CHECK: upload_id={upload_id}")
+
     upload = await db.get(CsvUpload, upload_id)
     if not upload:
+        logger.warning(f"❌ STATUS CHECK: upload {upload_id} NOT FOUND")
         raise HTTPException(status_code=404, detail=f"Upload {upload_id} not found")
 
+    logger.info(
+        f"✅ STATUS CHECK: upload_id={upload_id} status={upload.status} "
+        f"rows={upload.processed_rows}/{upload.total_rows}"
+    )
+
+    # Check for bundles regardless of status (they might exist from previous runs)
     bundle_count: Optional[int] = None
-    if upload.status == "completed":
+    completed_statuses = {
+        "completed",
+        "bundle_generation_completed",
+        "bundle_generation_in_progress",
+        "bundle_generation_queued",
+        "bundle_generation_async",
+    }
+
+    if upload.status in completed_statuses or upload.status == "processing":
+        # Always check for existing bundles
         stmt = select(func.count(BundleRecommendation.id)).where(
             BundleRecommendation.csv_upload_id == upload_id
         )
         result = await db.execute(stmt)
-        bundle_count = result.scalar() or 0
+        count = result.scalar() or 0
+        bundle_count = count if count > 0 else None
+
+    # Normalize status values for frontend simplicity
+    # Map internal detailed statuses to simple states
+    frontend_status = upload.status
+    if upload.status in {"bundle_generation_completed"}:
+        frontend_status = "completed"
+    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+        frontend_status = "processing"
+    elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
+        frontend_status = "failed"
+
+    logger.info(
+        f"📊 STATUS RESPONSE: upload_id={upload_id} "
+        f"internal_status={upload.status} → frontend_status={frontend_status} "
+        f"bundle_count={bundle_count}"
+    )
 
     return UploadStatusResponse(
         upload_id=upload.id,
         shop_id=upload.shop_id,
-        status=upload.status,
+        status=frontend_status,  # Simplified status for frontend
         total_rows=upload.total_rows,
         processed_rows=upload.processed_rows,
         error_message=upload.error_message,
