@@ -169,7 +169,7 @@ class CSVProcessor:
         if upload_id in self._run_id_cache:
             return self._run_id_cache[upload_id]
 
-        run_id = await self._get_run_id_cached(upload_id)
+        run_id = await storage.get_run_id_for_upload(upload_id)
         self._run_id_cache[upload_id] = run_id
         return run_id
 
