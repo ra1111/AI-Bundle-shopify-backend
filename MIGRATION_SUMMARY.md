@@ -5,6 +5,13 @@
 
 ---
 
+## 2025-12-03 – Order line upsert fix
+- Added Alembic migration `20251203_000003_add_order_lines_partial_unique_indexes` to create the partial unique indexes backing `ON CONFLICT (order_id, sku) WHERE line_item_id IS NULL` and `(order_id, line_item_id)`.
+- Fixes ingestion errors like: `InvalidColumnReferenceError: there is no unique or exclusion constraint matching the ON CONFLICT specification`.
+- Action: run `alembic upgrade head` before next deploy so CSV uploads can upsert order_lines safely.
+
+---
+
 ## **What Changed**
 
 ### **✅ SIMPLIFIED: One Endpoint to Rule Them All**
