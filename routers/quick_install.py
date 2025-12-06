@@ -12,7 +12,7 @@ from typing import Optional
 from io import StringIO
 import csv
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, BackgroundTasks
+from fastapi import APIRouter, HTTPException, UploadFile, File, Depends, BackgroundTasks, Form, Request
 from pydantic import BaseModel
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -152,6 +152,7 @@ async def _process_quick_install_async(
 @router.post("/quick-install")
 async def quick_install(
     file: UploadFile = File(...),
+    shop_id: str = Form(...),
     background_tasks: BackgroundTasks = Depends(),
     db: AsyncSession = Depends(get_db),
 ):
@@ -163,13 +164,15 @@ async def quick_install(
     - Duplicate prevention (check for existing jobs)
     - Cooldown period (30 days between runs)
     - Retry logic for failed installs
+    
+    Request parameters:
+    - file: CSV file (multipart/form-data)
+    - shop_id: Shop identifier (form parameter from frontend)
     """
 
-    logger.info(f"[quick_install] Received upload from request")
+    logger.info(f"[quick_install] Received upload for shop_id={shop_id}")
 
-    # Get shop_id from session/auth (for now, extract from request or use default)
-    # TODO: Get from actual authentication context
-    shop_id = "default-shop"  # This should come from session/auth
+    # Normalize shop_id
     shop_id = resolve_shop_id(shop_id)
 
     # Validate file
@@ -312,15 +315,24 @@ async def quick_install(
 
 @router.get("/quick-install/status")
 async def get_quick_install_status(
+    shop_id: str = None,
     db: AsyncSession = Depends(get_db),
 ) -> QuickInstallStatusResponse:
     """
     Check the status of quick install for the current shop.
     Returns different responses based on whether install has run and current state.
+    
+    Request parameters:
+    - shop_id: Shop identifier (query parameter: ?shop_id=store.myshopify.com)
     """
 
-    # TODO: Get from actual authentication context
-    shop_id = "default-shop"
+    # Extract shop_id from query parameter
+    if not shop_id:
+        raise HTTPException(
+            status_code=400,
+            detail="shop_id required as query parameter: ?shop_id=store.myshopify.com"
+        )
+
     shop_id = resolve_shop_id(shop_id)
 
     logger.info(f"[quick_install] Status check for shop_id={shop_id}")
