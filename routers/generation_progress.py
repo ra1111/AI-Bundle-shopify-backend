@@ -8,6 +8,7 @@ import logging
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
+from starlette.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import ProgrammingError, OperationalError
@@ -18,6 +19,24 @@ router = APIRouter()
 
 PROGRESS_TTL = timedelta(hours=24)
 logger = logging.getLogger(__name__)
+
+
+async def _ensure_progress_table(db: AsyncSession) -> None:
+    """Best-effort creation of generation_progress when migrations haven't run."""
+    try:
+        await db.rollback()
+        await db.run_sync(
+            lambda sync_conn: GenerationProgress.__table__.create(
+                bind=sync_conn, checkfirst=True
+            )
+        )
+        await db.commit()
+        logger.warning("generation_progress table created lazily at request time")
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.error(
+            "Failed to auto-create generation_progress table: %s", exc, exc_info=True
+        )
+        await db.rollback()
 
 
 @router.get("/generation-progress/{upload_id}")
@@ -31,11 +50,10 @@ async def get_generation_progress(
     except ProgrammingError as exc:
         if "generation_progress" in str(exc):
             logger.error("generation_progress table missing while polling %s", upload_id)
-            raise HTTPException(
-                status_code=503,
-                detail="Generation progress storage not initialized; run migrations.",
-            )
-        raise
+            await _ensure_progress_table(db)
+            result = await db.execute(stmt)
+        else:
+            raise
     except OperationalError:
         raise HTTPException(status_code=503, detail="Database unavailable")
     except Exception as exc:
@@ -45,7 +63,20 @@ async def get_generation_progress(
     record = result.scalar_one_or_none()
 
     if not record:
-        raise HTTPException(status_code=404, detail="Generation progress not found")
+        return JSONResponse(
+            status_code=202,
+            content={
+                "upload_id": upload_id,
+                "step": "pending",
+                "progress": 0,
+                "status": "in_progress",
+                "message": "Generation progress not found yet.",
+                "metadata": {},
+                "updated_at": datetime.now(timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            },
+        )
 
     updated_at = record.updated_at
     if updated_at is None:

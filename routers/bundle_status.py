@@ -120,6 +120,19 @@ async def get_bundle_status(
 ) -> Dict[str, Any]:
     upload = await _load_upload(upload_id, db)
     if not upload:
+        progress_payload = await _load_progress(upload_id, db)
+        if progress_payload:
+            # Return a soft 202 with progress when the upload record is missing
+            return {
+                "upload_id": upload_id,
+                "shop_id": None,
+                "status": progress_payload.get("status", "processing"),
+                "total_rows": 0,
+                "processed_rows": 0,
+                "error_message": "Upload record not found; reporting progress only.",
+                "bundle_count": None,
+                "generation_progress": progress_payload,
+            }
         raise HTTPException(status_code=404, detail="Upload not found")
 
     bundle_count = None
@@ -150,4 +163,3 @@ async def get_bundle_status(
         response["generation_progress"] = progress_payload
 
     return response
-
