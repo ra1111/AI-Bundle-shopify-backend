@@ -23,7 +23,7 @@ from routers.uploads import process_csv_background
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/bundles", tags=["Quick Install"])
+router = APIRouter(prefix="/api/quick-install", tags=["Quick Install"])
 
 # Configuration
 QUICK_INSTALL_COOLDOWN_DAYS = 30
@@ -149,7 +149,7 @@ async def _process_quick_install_async(
 # Endpoints
 # ============================================================================
 
-@router.post("/quick-install")
+@router.post("/upload")
 async def quick_install(
     file: UploadFile = File(...),
     shop_id: str = Form(...),
@@ -313,7 +313,7 @@ async def quick_install(
     )
 
 
-@router.get("/quick-install/status")
+@router.get("/status")
 async def get_quick_install_status(
     shop_id: str = None,
     db: AsyncSession = Depends(get_db),
@@ -457,7 +457,7 @@ async def get_bundle_status(
 # Cleanup Job (run via Cloud Scheduler or cron)
 # ============================================================================
 
-@router.post("/cron/cleanup-stuck-jobs")
+@router.post("/cron/cleanup")
 async def cleanup_stuck_jobs(db: AsyncSession = Depends(get_db)):
     """
     Mark jobs as FAILED if stuck in PROCESSING for >10 minutes.
