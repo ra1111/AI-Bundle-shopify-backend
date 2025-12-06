@@ -45,6 +45,15 @@ async def get_generation_progress(
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     stmt = select(GenerationProgress).where(GenerationProgress.upload_id == upload_id)
+    pending_payload = {
+        "upload_id": upload_id,
+        "step": "pending",
+        "progress": 0,
+        "status": "in_progress",
+        "message": "Generation progress not found yet.",
+        "metadata": {},
+        "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+    }
     try:
         result = await db.execute(stmt)
     except ProgrammingError as exc:
@@ -53,30 +62,24 @@ async def get_generation_progress(
             await _ensure_progress_table(db)
             result = await db.execute(stmt)
         else:
-            raise
+            logger.exception("ProgrammingError reading generation progress for %s", upload_id)
+            return JSONResponse(status_code=202, content=pending_payload)
     except OperationalError:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+        return JSONResponse(
+            status_code=202,
+            content={
+                **pending_payload,
+                "message": "Database unavailable; retrying soon.",
+            },
+        )
     except Exception as exc:
         logger.exception("Unexpected error reading generation progress for %s", upload_id)
-        raise HTTPException(status_code=500, detail="Failed to read generation progress") from exc
+        return JSONResponse(status_code=202, content=pending_payload)
 
     record = result.scalar_one_or_none()
 
     if not record:
-        return JSONResponse(
-            status_code=202,
-            content={
-                "upload_id": upload_id,
-                "step": "pending",
-                "progress": 0,
-                "status": "in_progress",
-                "message": "Generation progress not found yet.",
-                "metadata": {},
-                "updated_at": datetime.now(timezone.utc)
-                .isoformat()
-                .replace("+00:00", "Z"),
-            },
-        )
+        return JSONResponse(status_code=202, content=pending_payload)
 
     updated_at = record.updated_at
     if updated_at is None:
