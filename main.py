@@ -29,6 +29,7 @@ from routers import (
     shopify_upload,
     generation_progress,
     quick_install,
+    bundle_status,
 )
 
 from database import init_db
@@ -174,6 +175,7 @@ app.include_router(quick_install.router, tags=["quick-install"])
 app.include_router(analytics.router, prefix="/api", tags=["analytics"])
 app.include_router(export.router, prefix="/api", tags=["export"])
 app.include_router(generation_progress.router, prefix="/api", tags=["generation-progress"])
+app.include_router(bundle_status.router)
 app.include_router(shopify_upload.router)
 app.include_router(admin_router, prefix="/api", tags=["admin"])
 

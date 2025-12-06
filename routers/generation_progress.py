@@ -4,17 +4,20 @@ Generation progress polling endpoint.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import logging
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import ProgrammingError, OperationalError
 
 from database import GenerationProgress, get_db
 
 router = APIRouter()
 
 PROGRESS_TTL = timedelta(hours=24)
+logger = logging.getLogger(__name__)
 
 
 @router.get("/generation-progress/{upload_id}")
@@ -23,7 +26,22 @@ async def get_generation_progress(
     db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     stmt = select(GenerationProgress).where(GenerationProgress.upload_id == upload_id)
-    result = await db.execute(stmt)
+    try:
+        result = await db.execute(stmt)
+    except ProgrammingError as exc:
+        if "generation_progress" in str(exc):
+            logger.error("generation_progress table missing while polling %s", upload_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Generation progress storage not initialized; run migrations.",
+            )
+        raise
+    except OperationalError:
+        raise HTTPException(status_code=503, detail="Database unavailable")
+    except Exception as exc:
+        logger.exception("Unexpected error reading generation progress for %s", upload_id)
+        raise HTTPException(status_code=500, detail="Failed to read generation progress") from exc
+
     record = result.scalar_one_or_none()
 
     if not record:
@@ -40,11 +58,12 @@ async def get_generation_progress(
     if datetime.now(timezone.utc) - updated_at > PROGRESS_TTL:
         raise HTTPException(status_code=410, detail="Generation progress expired")
 
-    metadata = record.metadata_json or {}
+    metadata_raw = record.metadata_json
+    metadata = metadata_raw if isinstance(metadata_raw, dict) else {}
     staged_payload = None
     if isinstance(metadata.get("staged_publish"), dict):
         staged_payload = metadata["staged_publish"]
-    elif isinstance(metadata, dict) and metadata.get("staged"):
+    elif metadata.get("staged"):
         staged_payload = metadata
 
     response: Dict[str, Any] = {
