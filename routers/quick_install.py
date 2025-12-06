@@ -153,8 +153,8 @@ async def _process_quick_install_async(
 async def quick_install(
     file: UploadFile = File(...),
     shop_id: str = Form(...),
-    background_tasks: BackgroundTasks = Depends(),
     db: AsyncSession = Depends(get_db),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
 ):
     """
     Upload CSV and start quick bundle generation.

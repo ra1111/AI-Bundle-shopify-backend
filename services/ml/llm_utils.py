@@ -99,11 +99,14 @@ def load_settings() -> LLMSettings:
 
 
 @lru_cache(maxsize=1)
-def get_async_client() -> AsyncOpenAI:
-    """Return a singleton AsyncOpenAI client shared across services."""
+def get_async_client() -> Optional[AsyncOpenAI]:
+    """Return a singleton AsyncOpenAI client shared across services, or None if API key is not configured."""
 
     settings = load_settings()
-    return AsyncOpenAI(api_key=settings.api_key or None)
+    if not settings.api_key:
+        logger.warning("No OPENAI_API_KEY configured; LLM features will be unavailable")
+        return None
+    return AsyncOpenAI(api_key=settings.api_key)
 
 
 def should_use_llm() -> bool:

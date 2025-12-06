@@ -980,5 +980,9 @@ class LLMEmbeddingEngine:
         )
 
 
-# Global instance
-llm_embedding_engine = LLMEmbeddingEngine()
+# Global instance - with graceful fallback when LLM features aren't available
+try:
+    llm_embedding_engine = LLMEmbeddingEngine()
+except Exception as e:
+    logger.warning(f"Failed to initialize LLMEmbeddingEngine: {e}; LLM features will be unavailable")
+    llm_embedding_engine = None
