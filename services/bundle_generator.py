@@ -74,6 +74,7 @@ class BundleGenerator:
 
         self._tracer = trace.get_tracer(__name__) if trace else None
         self._initialize_configuration()
+        self._initialize_caps_and_safeguards()
 
     @contextlib.contextmanager
     def _start_span(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -714,8 +715,9 @@ class BundleGenerator:
         }
 
     def _initialize_configuration(self) -> None:
-        # Bundle configuration
-        self.bundle_types = ['FBT', 'VOLUME_DISCOUNT', 'MIX_MATCH', 'BXGY', 'FIXED']
+        # Bundle configuration - MUST match frontend expected types
+        # Frontend expects exactly: FBT, VOLUME, BOGO
+        self.bundle_types = ['FBT', 'VOLUME', 'BOGO']
 
         # 8 Objective types for enhanced bundle generation (all defined for backward compatibility)
         self.objectives = {
@@ -730,21 +732,21 @@ class BundleGenerator:
         }
 
         # PARETO OPTIMIZATION: Map each objective to best-fit bundle type(s)
-        # This reduces 8 objectives × 5 types (40 tasks) to 3-4 objectives × 1-2 types (3-8 tasks)
+        # Frontend bundle types: FBT (Frequently Bought Together), VOLUME (quantity discounts), BOGO (Buy X Get Y)
         self.objective_to_bundle_types = {
             # Top priority objectives (Pareto 80/20)
-            'margin_guard': ['FBT', 'FIXED'],              # Protect margins: FBT works best
-            'clear_slow_movers': ['VOLUME_DISCOUNT', 'BXGY'],  # Move inventory: Volume discounts
-            'increase_aov': ['MIX_MATCH', 'FBT'],          # Boost AOV: Mix & Match maximizes cart
+            'margin_guard': ['FBT'],                       # Protect margins: FBT works best
+            'clear_slow_movers': ['VOLUME', 'BOGO'],       # Move inventory: Volume discounts & BOGO
+            'increase_aov': ['FBT', 'VOLUME'],             # Boost AOV: FBT & volume bundles
 
             # Secondary objectives (only for large datasets)
-            'new_launch': ['FBT', 'FIXED'],                # Promote new products: FBT exposure
-            'seasonal_promo': ['BXGY', 'FIXED'],           # Seasonal: BXGY promotions
+            'new_launch': ['FBT'],                         # Promote new products: FBT exposure
+            'seasonal_promo': ['BOGO'],                    # Seasonal: BOGO promotions
 
             # Low priority (rarely used)
-            'category_bundle': ['MIX_MATCH'],
-            'gift_box': ['FIXED'],
-            'subscription_push': ['VOLUME_DISCOUNT'],
+            'category_bundle': ['FBT'],                    # Cross-category: FBT bundles
+            'gift_box': ['FBT'],                           # Gift boxes: FBT bundles
+            'subscription_push': ['VOLUME'],               # Subscription: Volume discounts
         }
 
         # Early termination thresholds
@@ -811,6 +813,114 @@ class BundleGenerator:
         self.max_consecutive_failures = 10  # Stop after 10 consecutive failures
         self.circuit_breaker_active = False
 
+    def _enrich_bundle_with_type_structure(
+        self,
+        recommendation: Dict[str, Any],
+        catalog: Dict[str, Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        Enrich a bundle recommendation with type-specific structure.
+
+        Frontend expects:
+        - FBT: products array with product details
+        - VOLUME: volume_tiers array with tier configuration
+        - BOGO: bogo_config, qualifiers, rewards
+
+        This ensures full generation outputs match quick-start structure.
+        """
+        bundle_type = recommendation.get("bundle_type", "FBT")
+        products = recommendation.get("products", [])
+        pricing = recommendation.get("pricing", {})
+
+        # Ensure ai_copy exists
+        if "ai_copy" not in recommendation:
+            recommendation["ai_copy"] = {
+                "title": f"{bundle_type} Bundle",
+                "description": f"AI-generated {bundle_type} bundle recommendation",
+            }
+
+        if bundle_type == "VOLUME":
+            # Add volume_tiers structure for VOLUME bundles
+            volume_tiers = [
+                {"min_qty": 1, "discount_type": "NONE", "discount_value": 0, "label": None, "type": "percentage", "value": 0},
+                {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5, "label": "Starter Pack", "type": "percentage", "value": 5},
+                {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10, "label": "Popular", "type": "percentage", "value": 10},
+                {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15, "label": "Best Value", "type": "percentage", "value": 15},
+            ]
+
+            # Structure products for VOLUME
+            if isinstance(products, list) and products:
+                first_product = products[0] if isinstance(products[0], dict) else {"sku": products[0]}
+                recommendation["products"] = {
+                    "items": [first_product] if isinstance(first_product, dict) else [{"sku": first_product}],
+                    "volume_tiers": volume_tiers,
+                }
+
+            # Add volume_tiers to pricing
+            pricing["discount_type"] = "tiered"
+            pricing["volume_tiers"] = volume_tiers
+            recommendation["pricing"] = pricing
+
+            # Top-level volume_tiers for frontend compatibility
+            recommendation["volume_tiers"] = volume_tiers
+
+        elif bundle_type == "BOGO":
+            # Add BOGO structure
+            bogo_config = {
+                "buy_qty": 2,
+                "get_qty": 1,
+                "discount_type": "free",
+                "discount_percent": 100,
+                "same_product": True,
+                "mode": "free_same_variant",
+            }
+
+            # Structure products for BOGO
+            if isinstance(products, list) and products:
+                first_product = products[0] if isinstance(products[0], dict) else {"sku": products[0]}
+                product_data = first_product if isinstance(first_product, dict) else {"sku": first_product}
+
+                recommendation["products"] = {
+                    "items": [product_data],
+                    "qualifiers": [{"quantity": 2, **product_data}],
+                    "rewards": [{"quantity": 1, "discount_type": "free", "discount_percent": 100, **product_data}],
+                }
+
+            # Add bogo_config to pricing
+            pricing["discount_type"] = "bogo"
+            pricing["bogo_config"] = bogo_config
+            recommendation["pricing"] = pricing
+
+            # Top-level fields for frontend compatibility
+            recommendation["bogo_config"] = bogo_config
+            recommendation["qualifiers"] = recommendation.get("products", {}).get("qualifiers", [])
+            recommendation["rewards"] = recommendation.get("products", {}).get("rewards", [])
+
+        else:  # FBT (default)
+            # FBT keeps products as array of product objects
+            if isinstance(products, list):
+                enriched_products = []
+                for p in products:
+                    if isinstance(p, dict):
+                        enriched_products.append(p)
+                    elif isinstance(p, str):
+                        # SKU string - try to enrich from catalog
+                        product_data = {"sku": p}
+                        if catalog and p in catalog:
+                            snap = catalog[p]
+                            product_data.update({
+                                "title": getattr(snap, "product_title", p),
+                                "price": float(getattr(snap, "price", 0) or 0),
+                                "image_url": getattr(snap, "image_url", None),
+                                "variant_id": getattr(snap, "variant_id", None),
+                            })
+                        enriched_products.append(product_data)
+                recommendation["products"] = enriched_products
+
+        return recommendation
+
+    def _initialize_caps_and_safeguards(self) -> None:
+        """Initialize caps for optimization and diversity safeguards - called from _initialize_configuration"""
         # New caps for optimization and diversity safeguards
         self.min_candidates_for_optimization = 5
         self.max_bundles_per_pair = 2
@@ -3126,7 +3236,10 @@ class BundleGenerator:
                 # ARCHITECT FIX: Mark as seen if not marked above (non-pricing path)
                 if sku_combo_key not in self.seen_sku_combinations:
                     self.seen_sku_combinations.add(sku_combo_key)
-                
+
+                # Enrich with type-specific structure for frontend compatibility
+                recommendation = self._enrich_bundle_with_type_structure(recommendation)
+
                 recommendations.append(recommendation)
                 
                 # Check time budget periodically
@@ -4873,7 +4986,10 @@ class BundleGenerator:
                             "explanation": f"Customers who buy these items together {rule.confidence:.0%} of the time",
                             "v1_fallback": True
                         }
-                        
+
+                        # Enrich with type-specific structure for frontend compatibility
+                        recommendation = self._enrich_bundle_with_type_structure(recommendation)
+
                         recommendations.append(recommendation)
                         
                 except Exception as e:
