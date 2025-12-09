@@ -1878,6 +1878,15 @@ class BundleGenerator:
                 f"  Products Analyzed: {len(top_variants)}"
             )
 
+            # Cleanup intermediate data to save storage costs
+            try:
+                run_id = await storage.get_run_id_for_upload(csv_upload_id)
+                if run_id:
+                    cleanup_result = await storage.cleanup_intermediate_data(run_id)
+                    logger.info(f"[{csv_upload_id}] Post-generation cleanup: {cleanup_result}")
+            except Exception as cleanup_error:
+                logger.warning(f"[{csv_upload_id}] Cleanup failed (non-fatal): {cleanup_error}")
+
             return {
                 "recommendations": recommendations,
                 "metrics": metrics,
@@ -2825,13 +2834,22 @@ class BundleGenerator:
                 details=final_notify_details,
             )
 
+            # Cleanup intermediate data to save storage costs
+            try:
+                run_id = await storage.get_run_id_for_upload(csv_upload_id)
+                if run_id:
+                    cleanup_result = await storage.cleanup_intermediate_data(run_id)
+                    logger.info(f"[{csv_upload_id}] Post-generation cleanup: {cleanup_result}")
+            except Exception as cleanup_error:
+                logger.warning(f"[{csv_upload_id}] Cleanup failed (non-fatal): {cleanup_error}")
+
             return {
                 "recommendations": final_recommendations,
                 "metrics": metrics,
                 "v2_pipeline": True,
                 "csv_upload_id": csv_upload_id
             }
-            
+
         except Exception as e:
             import traceback as tb_module
             # Calculate total time even on failure

@@ -2070,6 +2070,106 @@ class StorageService:
         # This would store in a separate bundle_hashes table in a real implementation
         logger.info(f"Stored {len(hash_records)} bundle hashes")
 
+    async def cleanup_intermediate_data(self, run_id: str) -> Dict[str, int]:
+        """
+        Delete intermediate data after bundle generation completes.
+
+        Removes:
+        - order_lines: Line items from orders (only needed during ML analysis)
+        - catalog_snapshot: Denormalized product catalog (redundant)
+        - variants: Product variants (only needed during generation)
+        - inventory_levels: Stock levels (only needed during generation)
+        - orders: Order records (only needed during generation)
+
+        Keeps:
+        - csv_uploads: Metadata and metrics about the upload
+        - bundle_recommendations: The generated bundles
+        - association_rules: Can be kept for debugging or cleared separately
+
+        Args:
+            run_id: The run_id that groups all uploads from a single sync
+
+        Returns:
+            Dict with counts of deleted rows per table
+        """
+        if not run_id:
+            raise ValueError("run_id is required for cleanup")
+
+        deleted_counts = {
+            "order_lines": 0,
+            "catalog_snapshot": 0,
+            "variants": 0,
+            "inventory_levels": 0,
+            "orders": 0,
+        }
+
+        logger.info(f"[cleanup] Starting intermediate data cleanup for run_id={run_id}")
+
+        async with self.get_session() as session:
+            try:
+                # Get all csv_upload_ids for this run
+                stmt = select(CsvUpload.id).where(
+                    CsvUpload.processing_params["run_id"].astext == run_id
+                )
+                result = await session.execute(stmt)
+                upload_ids = [row[0] for row in result.all()]
+
+                if not upload_ids:
+                    logger.warning(f"[cleanup] No uploads found for run_id={run_id}")
+                    return deleted_counts
+
+                logger.info(f"[cleanup] Found {len(upload_ids)} uploads for run_id={run_id}")
+
+                # Delete order_lines
+                result = await session.execute(
+                    delete(OrderLine).where(OrderLine.csv_upload_id.in_(upload_ids))
+                )
+                deleted_counts["order_lines"] = result.rowcount
+                logger.info(f"[cleanup] Deleted {result.rowcount} order_lines")
+
+                # Delete catalog_snapshot
+                result = await session.execute(
+                    delete(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id.in_(upload_ids))
+                )
+                deleted_counts["catalog_snapshot"] = result.rowcount
+                logger.info(f"[cleanup] Deleted {result.rowcount} catalog_snapshot rows")
+
+                # Delete variants
+                result = await session.execute(
+                    delete(Variant).where(Variant.csv_upload_id.in_(upload_ids))
+                )
+                deleted_counts["variants"] = result.rowcount
+                logger.info(f"[cleanup] Deleted {result.rowcount} variants")
+
+                # Delete inventory_levels
+                result = await session.execute(
+                    delete(InventoryLevel).where(InventoryLevel.csv_upload_id.in_(upload_ids))
+                )
+                deleted_counts["inventory_levels"] = result.rowcount
+                logger.info(f"[cleanup] Deleted {result.rowcount} inventory_levels")
+
+                # Delete orders
+                result = await session.execute(
+                    delete(Order).where(Order.csv_upload_id.in_(upload_ids))
+                )
+                deleted_counts["orders"] = result.rowcount
+                logger.info(f"[cleanup] Deleted {result.rowcount} orders")
+
+                await session.commit()
+
+                total_deleted = sum(deleted_counts.values())
+                logger.info(
+                    f"[cleanup] ✅ Cleanup complete for run_id={run_id}: "
+                    f"total {total_deleted} rows deleted across {len(deleted_counts)} tables"
+                )
+
+                return deleted_counts
+
+            except Exception as e:
+                logger.exception(f"[cleanup] ❌ Cleanup failed for run_id={run_id}: {e}")
+                await session.rollback()
+                raise
+
 # Global storage instance
 storage = StorageService()
 storage.client = storage
