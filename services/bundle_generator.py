@@ -5037,45 +5037,83 @@ def _build_quick_start_fbt_bundles(
         product_quality_score = product_scores.get(variant_id_1, 0.5) + product_scores.get(variant_id_2, 0.5)
         ranking_score = 0.7 * product_quality_score + 0.3 * covis_sim
 
+        # Build product data objects
+        product1_data = {
+            "sku": getattr(p1, 'sku', ''),
+            "name": getattr(p1, 'product_title', 'Product'),
+            "title": getattr(p1, 'product_title', 'Product'),
+            "price": price1,
+            "variant_id": variant_id_1,
+            "product_id": getattr(p1, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(p1, 'product_id', '')}",
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id_1}",
+            "image_url": getattr(p1, 'image_url', None),
+        }
+        product2_data = {
+            "sku": getattr(p2, 'sku', ''),
+            "name": getattr(p2, 'product_title', 'Product'),
+            "title": getattr(p2, 'product_title', 'Product'),
+            "price": price2,
+            "variant_id": variant_id_2,
+            "product_id": getattr(p2, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(p2, 'product_id', '')}",
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id_2}",
+            "image_url": getattr(p2, 'image_url', None),
+        }
+
+        # Generate AI copy
+        p1_name = getattr(p1, 'product_title', 'Product')
+        p2_name = getattr(p2, 'product_title', 'Product')
+        bundle_name = f"{p1_name} + {p2_name}"
+        bundle_description = f"Get both {p1_name} and {p2_name} together and save {discount_pct}%!"
+
         recommendations.append({
             "id": str(uuid.uuid4()),
             "csv_upload_id": csv_upload_id,
             "bundle_type": "FBT",
             "objective": "increase_aov",
-            "products": [
-                {
-                    "sku": getattr(p1, 'sku', ''),  # SKU for display only
-                    "name": getattr(p1, 'product_title', 'Product'),
-                    "price": price1,
-                    "variant_id": variant_id_1,  # Primary key
-                    "product_id": getattr(p1, 'product_id', ''),
-                },
-                {
-                    "sku": getattr(p2, 'sku', ''),  # SKU for display only
-                    "name": getattr(p2, 'product_title', 'Product'),
-                    "price": price2,
-                    "variant_id": variant_id_2,  # Primary key
-                    "product_id": getattr(p2, 'product_id', ''),
-                }
-            ],
+            # ===== PRODUCTS: Enhanced structure with trigger/addon =====
+            "products": {
+                # Legacy flat array for backward compatibility
+                "items": [product1_data, product2_data],
+                # Enhanced FBT structure
+                "trigger_product": product1_data,
+                "addon_products": [product2_data],
+            },
+            # ===== PRICING: Discount configuration =====
             "pricing": {
                 "original_total": total_price,
                 "bundle_price": bundle_price,
                 "discount_amount": total_price - bundle_price,
                 "discount_pct": f"{discount_pct}%",
+                "discount_percentage": float(discount_pct),
+                "discount_type": "percentage",
+            },
+            # ===== AI_COPY: Structured content + bundle settings =====
+            "ai_copy": {
+                "title": bundle_name,
+                "description": bundle_description,
+                "tagline": f"Save {discount_pct}% when bought together",
+                "cta_text": "Add Bundle to Cart",
+                "savings_message": f"Save ${total_price - bundle_price:.2f}!",
+                # Bundle settings (stored in ai_copy since no metadata column)
+                "is_active": True,
+                "show_on": ["product", "cart"],
+                # AI features for explainability
+                "features": {
+                    "covis_similarity": covis_sim,
+                    "co_occurrence_count": count,
+                    "blended_score": blended_score,
+                },
             },
             "confidence": Decimal(str(conf)),
-            "predicted_lift": Decimal(str(1.0 + (covis_sim * 0.5))),  # Higher lift for high similarity
+            "predicted_lift": Decimal(str(1.0 + (covis_sim * 0.5))),
             "ranking_score": Decimal(str(ranking_score)),
+            "support": Decimal(str(min(1.0, count / 50.0))),
+            "lift": Decimal(str(1.0 + covis_sim)),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
-            # MODERN: Add co-visitation features for explainability
-            "features": {
-                "covis_similarity": covis_sim,
-                "co_occurrence_count": count,
-                "blended_score": blended_score,
-            }
         })
 
         # Stop once we have enough high-quality bundles
@@ -5226,36 +5264,88 @@ def _build_quick_start_bogo_bundles(
         effective_bundle_price = price * 2  # Pay for 2, get 3
         effective_discount_pct = (1 - effective_bundle_price / original_total) * 100.0
 
+        # Build product data object
+        product_name = getattr(snap, 'product_title', 'Product')
+        product_id = getattr(snap, 'product_id', '')
+        product_data = {
+            "sku": sku,
+            "name": product_name,
+            "title": product_name,
+            "price": price,
+            "variant_id": variant_id,
+            "product_id": product_id,
+            "product_gid": f"gid://shopify/Product/{product_id}",
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "image_url": getattr(snap, 'image_url', None),
+        }
+
+        # Generate AI copy
+        bundle_name = f"Buy 2 Get 1 Free - {product_name}"
+        bundle_description = f"Buy 2 {product_name} and get 1 FREE! Limited time offer."
+
         bundles.append({
             "id": str(uuid.uuid4()),
             "csv_upload_id": csv_upload_id,
             "bundle_type": "BOGO",
             "objective": "clear_slow_movers",
-            "products": [
-                {
-                    "sku": sku,
-                    "name": getattr(snap, 'product_title', 'Product'),
-                    "price": price,
-                    "variant_id": variant_id,
-                    "product_id": getattr(snap, 'product_id', ''),
-                    "min_quantity": 2,  # Buy 2
-                    "reward_quantity": 1,  # Get 1 free
-                }
-            ],
+            # ===== PRODUCTS: Enhanced structure with qualifiers/rewards =====
+            "products": {
+                # Legacy flat array for backward compatibility
+                "items": [product_data],
+                # Enhanced BOGO structure
+                "qualifiers": [
+                    {
+                        **product_data,
+                        "quantity": 2,
+                    }
+                ],
+                "rewards": [
+                    {
+                        **product_data,
+                        "quantity": 1,
+                        "discount_type": "free",
+                        "discount_percent": 100,
+                    }
+                ],
+            },
+            # ===== PRICING: BOGO discount configuration =====
             "pricing": {
                 "original_total": original_total,
                 "bundle_price": effective_bundle_price,
                 "discount_amount": original_total - effective_bundle_price,
                 "discount_pct": f"{effective_discount_pct:.1f}%",
+                "discount_percentage": round(effective_discount_pct, 1),
+                "discount_type": "bogo",
                 "bogo_config": {
                     "buy_qty": 2,
                     "get_qty": 1,
-                    "discount_percent": round(effective_discount_pct, 1),
+                    "discount_type": "free",
+                    "discount_percent": 100,
+                    "same_product": True,
+                    "mode": "free_same_variant",
                 }
+            },
+            # ===== AI_COPY: Structured content + bundle settings =====
+            "ai_copy": {
+                "title": bundle_name,
+                "description": bundle_description,
+                "tagline": "Buy 2, Get 1 FREE!",
+                "cta_text": "Claim Deal",
+                "savings_message": f"Save ${original_total - effective_bundle_price:.2f}!",
+                # Bundle settings
+                "is_active": True,
+                "show_on": ["product", "cart"],
+                # AI features
+                "features": {
+                    "is_slow_mover": True,
+                    "available_inventory": available,
+                },
             },
             "confidence": Decimal("0.6"),
             "predicted_lift": Decimal("1.0"),
             "ranking_score": Decimal(str(product_scores.get(variant_id, 0.5))),
+            "support": Decimal("0.5"),
+            "lift": Decimal("1.2"),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
@@ -5363,37 +5453,75 @@ def _build_quick_start_volume_bundles(
         if price <= 0:
             continue
 
+        # ===== ENHANCED: Volume tiers with labels =====
         volume_tiers = [
-            {"min_qty": 1, "discount_type": "NONE",       "discount_value": 0},
-            {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5},
-            {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10},
-            {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15},
+            {"min_qty": 1, "discount_type": "NONE",       "discount_value": 0, "label": None, "type": "percentage", "value": 0},
+            {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5, "label": "Starter Pack", "type": "percentage", "value": 5},
+            {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10, "label": "Popular", "type": "percentage", "value": 10},
+            {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15, "label": "Best Value", "type": "percentage", "value": 15},
         ]
+
+        # Build product data object
+        product_name = getattr(snap, 'product_title', 'Product')
+        product_id_str = getattr(snap, 'product_id', '')
+        product_data = {
+            "sku": getattr(snap, 'sku', ''),
+            "name": product_name,
+            "title": product_name,
+            "price": price,
+            "variant_id": variant_id,
+            "product_id": product_id_str,
+            "product_gid": f"gid://shopify/Product/{product_id_str}",
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "image_url": getattr(snap, 'image_url', None),
+        }
+
+        # Generate AI copy
+        bundle_name = f"Buy More, Save More - {product_name}"
+        bundle_description = f"The more {product_name} you buy, the more you save! Up to 15% off."
 
         bundles.append({
             "id": str(uuid.uuid4()),
             "csv_upload_id": csv_upload_id,
             "bundle_type": "VOLUME",
             "objective": "increase_aov",
-            "products": [
-                {
-                    "sku": getattr(snap, 'sku', ''),  # SKU for display only
-                    "name": getattr(snap, 'product_title', 'Product'),
-                    "price": price,
-                    "variant_id": variant_id,  # Primary key
-                    "product_id": getattr(snap, 'product_id', ''),
-                }
-            ],
+            # ===== PRODUCTS: Enhanced structure with volume info =====
+            "products": {
+                # Legacy flat array for backward compatibility
+                "items": [product_data],
+                # Volume tiers also in products for easy access
+                "volume_tiers": volume_tiers,
+            },
+            # ===== PRICING: Volume tier configuration =====
             "pricing": {
                 "original_total": price,
-                "bundle_price": price,  # Base unit price
-                "discount_amount": 0,  # Per-tier in volume_tiers
+                "bundle_price": price,
+                "discount_amount": 0,
                 "discount_pct": "0%",
+                "discount_type": "tiered",
                 "volume_tiers": volume_tiers,
+            },
+            # ===== AI_COPY: Structured content + bundle settings =====
+            "ai_copy": {
+                "title": bundle_name,
+                "description": bundle_description,
+                "tagline": "Buy More, Save More!",
+                "cta_text": "Select Quantity",
+                "savings_message": "Save up to 15%!",
+                # Bundle settings
+                "is_active": True,
+                "show_on": ["product"],
+                # AI features
+                "features": {
+                    "units_sold": units_sold,
+                    "available_inventory": available,
+                },
             },
             "confidence": Decimal("0.6"),
             "predicted_lift": Decimal("1.0"),
             "ranking_score": Decimal(str(product_scores.get(variant_id, 0.5))),
+            "support": Decimal("0.5"),
+            "lift": Decimal("1.15"),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
             "is_approved": True,
             "created_at": datetime.utcnow(),
