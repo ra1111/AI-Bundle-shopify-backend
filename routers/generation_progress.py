@@ -47,10 +47,10 @@ async def get_generation_progress(
     stmt = select(GenerationProgress).where(GenerationProgress.upload_id == upload_id)
     pending_payload = {
         "upload_id": upload_id,
-        "step": "pending",
-        "progress": 0,
+        "step": "queueing",
+        "progress": 5,  # Show minimal progress so UI doesn't look stuck
         "status": "in_progress",
-        "message": "Generation progress not found yet.",
+        "message": "Uploading data and preparing AI analysis...",
         "metadata": {},
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }

@@ -19,6 +19,7 @@ from routers.uploads import _resolve_orders_upload, _ensure_data_ready
 from settings import resolve_shop_id
 from services.storage import storage
 from services.pipeline_scheduler import pipeline_scheduler
+from services.notifications import notify_partial_ready
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
