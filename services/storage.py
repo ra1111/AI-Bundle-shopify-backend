@@ -610,7 +610,28 @@ class StorageService:
                             )
 
             # Handle lines without line_item_id (NULL case)
+            # IMPORTANT: Deduplicate by (order_id, sku) to avoid "cannot affect row a second time" error
+            # Keep the row with highest quantity when duplicates exist
             if lines_without_item_id:
+                original_count = len(lines_without_item_id)
+                deduped_lines: Dict[tuple, Dict[str, Any]] = {}
+                for line in lines_without_item_id:
+                    key = (line.get('order_id'), line.get('sku'))
+                    existing = deduped_lines.get(key)
+                    if existing is None:
+                        deduped_lines[key] = line
+                    else:
+                        # Keep the one with higher quantity, or merge quantities
+                        existing_qty = existing.get('quantity', 0) or 0
+                        new_qty = line.get('quantity', 0) or 0
+                        if new_qty > existing_qty:
+                            deduped_lines[key] = line
+
+                lines_without_item_id = list(deduped_lines.values())
+                duplicates_removed = original_count - len(lines_without_item_id)
+                if duplicates_removed > 0:
+                    logger.info(f"Deduplicated {duplicates_removed} duplicate order lines by (order_id, sku)")
+
                 for i in range(0, len(lines_without_item_id), batch_size):
                     batch = lines_without_item_id[i:i + batch_size]
 
