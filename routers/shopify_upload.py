@@ -184,11 +184,30 @@ async def shopify_upload(
 
 @router.get("/status/{upload_id}", response_model=UploadStatusResponse)
 async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
-    """Check processing status for a CsvUpload created via the Shopify endpoint."""
+    """Check processing status for a CsvUpload created via the Shopify endpoint.
+
+    Accepts either an upload_id (primary key) or a run_id (shared across all 4 CSVs).
+    When run_id is provided, returns status for the orders upload in that run.
+    """
 
     logger.info(f"🔍 STATUS CHECK: upload_id={upload_id}")
 
     upload = await db.get(CsvUpload, upload_id)
+
+    # If not found by upload_id, try looking up by run_id
+    if not upload:
+        run_id_stmt = (
+            select(CsvUpload)
+            .where(CsvUpload.run_id == upload_id)
+            .where(CsvUpload.csv_type == "orders")
+            .order_by(CsvUpload.created_at.desc())
+            .limit(1)
+        )
+        result = await db.execute(run_id_stmt)
+        upload = result.scalar_one_or_none()
+        if upload:
+            logger.info(f"✅ Resolved run_id {upload_id} -> orders upload {upload.id}")
+
     if not upload:
         logger.warning(f"❌ STATUS CHECK: upload {upload_id} NOT FOUND")
         raise HTTPException(status_code=404, detail=f"Upload {upload_id} not found")

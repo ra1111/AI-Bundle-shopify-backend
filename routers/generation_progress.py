@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import ProgrammingError, OperationalError
 
-from database import GenerationProgress, get_db
+from database import GenerationProgress, CsvUpload, get_db
 
 router = APIRouter()
 
@@ -77,6 +77,31 @@ async def get_generation_progress(
         return JSONResponse(status_code=202, content=pending_payload)
 
     record = result.scalar_one_or_none()
+
+    # If not found by upload_id, try looking up by run_id
+    # This allows frontend to poll using the shared run_id across all 4 CSVs
+    if not record:
+        # Check if provided ID is a run_id, and find the orders upload for it
+        run_id_stmt = (
+            select(CsvUpload.id)
+            .where(CsvUpload.run_id == upload_id)
+            .where(CsvUpload.csv_type == "orders")
+            .order_by(CsvUpload.created_at.desc())
+            .limit(1)
+        )
+        try:
+            run_result = await db.execute(run_id_stmt)
+            orders_upload_id = run_result.scalar_one_or_none()
+            if orders_upload_id:
+                logger.info(f"Resolved run_id {upload_id} -> orders upload {orders_upload_id}")
+                # Now lookup progress for the orders upload
+                progress_stmt = select(GenerationProgress).where(
+                    GenerationProgress.upload_id == orders_upload_id
+                )
+                progress_result = await db.execute(progress_stmt)
+                record = progress_result.scalar_one_or_none()
+        except Exception as exc:
+            logger.warning(f"Failed to resolve run_id {upload_id}: {exc}")
 
     if not record:
         return JSONResponse(status_code=202, content=pending_payload)
