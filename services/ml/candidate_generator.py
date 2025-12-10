@@ -203,26 +203,44 @@ class CandidateGenerator:
         valid_skus: Set[str],
     ) -> List[Set[str]]:
         if not transactions:
+            logger.warning("No transactions provided for normalization")
             return []
         normalized: List[Set[str]] = []
+        total_items = 0
+        mapped_items = 0
+        filtered_items = 0
+        retained_items = 0
+
         for raw_items in transactions:
             cast_items: Set[str] = set()
             for raw in raw_items:
+                total_items += 1
                 resolved = varid_to_sku.get(raw, raw)
                 if not resolved:
                     continue
                 sku = str(resolved).strip()
                 if not sku:
                     continue
+                mapped_items += 1
                 if valid_skus and sku not in valid_skus:
+                    filtered_items += 1
                     continue
+                retained_items += 1
                 cast_items.add(sku)
             if len(cast_items) >= 2:
                 normalized.append(cast_items)
-        logger.debug(
-            "Transactions normalized | input=%d retained=%d",
+
+        # Log detailed stats to help debug transaction filtering issues
+        logger.info(
+            "Transactions normalized | input=%d retained=%d | items: total=%d mapped=%d filtered=%d retained=%d | valid_identifiers=%d varid_map=%d",
             len(transactions),
             len(normalized),
+            total_items,
+            mapped_items,
+            filtered_items,
+            retained_items,
+            len(valid_skus) if valid_skus else 0,
+            len(varid_to_sku),
         )
         return normalized
 
@@ -805,7 +823,11 @@ class CandidateGenerator:
             return {"candidates": [], "metrics": metrics}
 
     async def get_variantid_to_sku_map(self, csv_upload_id: str) -> Dict[str, str]:
-        """Build a mapping from variant_id to sku using catalog snapshots (run-aware)."""
+        """Build a mapping from variant_id to sku using catalog snapshots (run-aware).
+
+        IMPORTANT: When SKU is missing, we map variant_id → variant_id as fallback.
+        This ensures products without SKUs can still be used in bundle generation.
+        """
         try:
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
             if run_id:
@@ -813,18 +835,34 @@ class CandidateGenerator:
             else:
                 snapshots = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
             mapping = {}
+            sku_count = 0
+            vid_fallback_count = 0
             for s in snapshots:
                 vid = getattr(s, 'variant_id', None)
                 sku = getattr(s, 'sku', None)
-                if vid and sku:
-                    mapping[str(vid)] = str(sku)
+                if vid:
+                    vid_str = str(vid)
+                    if sku and sku.strip():
+                        # Normal case: map variant_id to SKU
+                        mapping[vid_str] = str(sku).strip()
+                        sku_count += 1
+                    else:
+                        # Fallback: map variant_id to itself when SKU is missing
+                        # This allows SKU-less products to be used in bundles
+                        mapping[vid_str] = vid_str
+                        vid_fallback_count += 1
+            logger.info(f"[{csv_upload_id}] Built variant_id→sku map: {sku_count} with SKU, {vid_fallback_count} using variant_id fallback")
             return mapping
         except Exception as e:
             logger.warning(f"Error building variant_id→sku map: {e}")
             return {}
     
     async def get_valid_skus_for_csv(self, csv_upload_id: str) -> Set[str]:
-        """Get all valid SKUs for the given CSV upload ID"""
+        """Get all valid product identifiers (SKUs or variant_ids as fallback) for the given CSV upload ID.
+
+        IMPORTANT: When SKU is missing, we use variant_id as a valid identifier.
+        This ensures products without SKUs can still be used in bundle generation.
+        """
         try:
             # Resolve run_id to aggregate across all related uploads
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
@@ -832,21 +870,34 @@ class CandidateGenerator:
                 catalog_entries = await storage.get_catalog_snapshots_by_run(run_id)
             else:
                 catalog_entries = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
-            valid_skus = {entry.sku for entry in catalog_entries if entry.sku}
-            
-            # CRITICAL FIX: Remove placeholder and invalid SKUs including gid:// identifiers
-            valid_skus.discard(None)
-            filtered_skus = set()
-            for sku in valid_skus:
-                if (sku and 
-                    not sku.startswith("no-sku-") and 
-                    not sku.startswith("gid://") and
-                    not sku.startswith("null") and
-                    sku.strip() != ""):
-                    filtered_skus.add(sku)
-            
-            logger.info(f"Filtered SKUs for {csv_upload_id}: {len(catalog_entries)} total -> {len(valid_skus)} non-null -> {len(filtered_skus)} valid")
-            return filtered_skus
+
+            valid_identifiers = set()
+            sku_count = 0
+            vid_fallback_count = 0
+
+            for entry in catalog_entries:
+                sku = getattr(entry, 'sku', None)
+                vid = getattr(entry, 'variant_id', None)
+
+                # Prefer SKU if valid
+                if sku and sku.strip():
+                    sku_str = str(sku).strip()
+                    if (not sku_str.startswith("no-sku-") and
+                        not sku_str.startswith("gid://") and
+                        not sku_str.startswith("null")):
+                        valid_identifiers.add(sku_str)
+                        sku_count += 1
+                        continue
+
+                # Fallback to variant_id when SKU is missing/invalid
+                if vid:
+                    vid_str = str(vid).strip()
+                    if vid_str:
+                        valid_identifiers.add(vid_str)
+                        vid_fallback_count += 1
+
+            logger.info(f"[{csv_upload_id}] Valid identifiers: {len(catalog_entries)} total -> {sku_count} SKUs + {vid_fallback_count} variant_id fallbacks = {len(valid_identifiers)} valid")
+            return valid_identifiers
         except Exception as e:
             logger.warning(f"Error getting valid SKUs for {csv_upload_id}: {e}")
             return set()

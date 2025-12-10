@@ -1783,21 +1783,34 @@ class StorageService:
             result = await session.execute(query)
             return list(result.scalars().all())
     
-    async def get_order_lines_by_sku(self, sku: str, csv_upload_id: str) -> List[OrderLine]:
-        """Get order lines for a specific SKU in a CSV upload"""
+    async def get_order_lines_by_sku(self, identifier: str, csv_upload_id: str) -> List[OrderLine]:
+        """Get order lines for a specific SKU or variant_id in a CSV upload.
+
+        IMPORTANT: The identifier may be either a SKU or variant_id (when SKU is missing).
+        We query by both to ensure products without SKUs are found.
+        """
         async with self.get_session() as session:
             query = select(OrderLine).where(
-                and_(OrderLine.sku == sku, OrderLine.csv_upload_id == csv_upload_id)
+                and_(
+                    or_(OrderLine.sku == identifier, OrderLine.variant_id == identifier),
+                    OrderLine.csv_upload_id == csv_upload_id
+                )
             )
             result = await session.execute(query)
             return list(result.scalars().all())
     
-    async def get_variant_sales_data(self, variant_id: str, csv_upload_id: str, days: int = 60) -> List[OrderLine]:
-        """Get sales data for a variant"""
+    async def get_variant_sales_data(self, identifier: str, csv_upload_id: str, days: int = 60) -> List[OrderLine]:
+        """Get sales data for a variant by SKU or variant_id.
+
+        IMPORTANT: The identifier may be either a SKU or variant_id (when SKU is missing).
+        We query by both to ensure products without SKUs are found.
+        """
         async with self.get_session() as session:
-            # For simplicity, return order lines by SKU since variant mapping might not be complete
             query = select(OrderLine).where(
-                and_(OrderLine.sku == variant_id, OrderLine.csv_upload_id == csv_upload_id)
+                and_(
+                    or_(OrderLine.sku == identifier, OrderLine.variant_id == identifier),
+                    OrderLine.csv_upload_id == csv_upload_id
+                )
             )
             result = await session.execute(query)
             return list(result.scalars().all())
@@ -2076,10 +2089,15 @@ class StorageService:
             return list(result.scalars().all())
 
     async def get_variant_sales_data_run(self, variant_id: str, run_id: str, days: int = 60) -> List[OrderLine]:
+        """Get sales data for a variant by variant_id (or fallback to SKU lookup).
+
+        IMPORTANT: Products may not have SKUs. We query by both SKU and variant_id
+        to ensure products without SKUs are found.
+        """
         if not variant_id or not run_id:
             return []
         async with self.get_session() as session:
-            # Find the variant's SKU for this run
+            # Find the variant's SKU for this run (may be None)
             vq = (
                 select(Variant.sku)
                 .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
@@ -2087,14 +2105,22 @@ class StorageService:
             )
             vres = await session.execute(vq)
             sku = vres.scalar_one_or_none()
-            if not sku:
-                return []
+
             cutoff_date = datetime.now() - timedelta(days=days)
+
+            # Build query to match by EITHER SKU or variant_id
+            if sku:
+                # If SKU exists, query by both SKU and variant_id
+                identifier_condition = or_(OrderLine.sku == sku, OrderLine.variant_id == variant_id)
+            else:
+                # If no SKU, query by variant_id only
+                identifier_condition = OrderLine.variant_id == variant_id
+
             query = (
                 select(OrderLine)
                 .join(Order, OrderLine.order_id == Order.order_id)
                 .join(CsvUpload, Order.csv_upload_id == CsvUpload.id)
-                .where(and_(CsvUpload.run_id == run_id, Order.created_at >= cutoff_date, OrderLine.sku == sku))
+                .where(and_(CsvUpload.run_id == run_id, Order.created_at >= cutoff_date, identifier_condition))
             )
             result = await session.execute(query)
             return list(result.scalars().all())

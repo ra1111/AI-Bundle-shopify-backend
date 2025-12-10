@@ -39,6 +39,54 @@ async def _ensure_progress_table(db: AsyncSession) -> None:
         await db.rollback()
 
 
+@router.get("/generation-progress/shop/{shop_domain}/active")
+async def get_active_sync_for_shop(
+    shop_domain: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Get the most recent in-progress sync for a shop.
+    Returns the upload_id if there's an active sync, or null if none.
+    This allows the frontend to resume progress tracking after navigation.
+    """
+    # Look for in-progress syncs for this shop in the last 24 hours
+    cutoff = datetime.now(timezone.utc) - PROGRESS_TTL
+
+    stmt = (
+        select(GenerationProgress)
+        .where(GenerationProgress.shop_domain == shop_domain)
+        .where(GenerationProgress.status == "in_progress")
+        .where(GenerationProgress.updated_at > cutoff)
+        .order_by(GenerationProgress.updated_at.desc())
+        .limit(1)
+    )
+
+    try:
+        result = await db.execute(stmt)
+        record = result.scalar_one_or_none()
+    except Exception as exc:
+        logger.warning(f"Error looking up active sync for {shop_domain}: {exc}")
+        return {"active_sync": None}
+
+    if not record:
+        return {"active_sync": None}
+
+    # Return the active sync info
+    metadata = record.metadata_json if isinstance(record.metadata_json, dict) else {}
+
+    return {
+        "active_sync": {
+            "upload_id": record.upload_id,
+            "step": record.step,
+            "progress": record.progress,
+            "status": record.status,
+            "message": record.message,
+            "updated_at": record.updated_at.isoformat() if record.updated_at else None,
+            "run_id": metadata.get("run_id"),
+        }
+    }
+
+
 @router.get("/generation-progress/{upload_id}")
 async def get_generation_progress(
     upload_id: str,
