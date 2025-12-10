@@ -12,15 +12,27 @@ logger = logging.getLogger(__name__)
 
 async def notify_partial_ready(
     csv_upload_id: str,
-    metrics: Optional[Dict[str, Any]] = None,
+    bundle_count_or_metrics: Optional[Any] = None,
+    details: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Notify merchant that partial/quick-start bundles are ready.
 
     Args:
         csv_upload_id: The upload ID
-        metrics: Generation metrics containing bundle_count and other details
+        bundle_count_or_metrics: Either bundle count (int) or metrics dict
+        details: Optional additional details about the notification
     """
-    bundle_count = metrics.get('total_recommendations', 0) if metrics else 0
+    # Handle both old (metrics dict) and new (bundle count int) call patterns
+    if isinstance(bundle_count_or_metrics, dict):
+        metrics = bundle_count_or_metrics
+        bundle_count = metrics.get('total_recommendations', 0)
+    elif isinstance(bundle_count_or_metrics, int):
+        metrics = None
+        bundle_count = bundle_count_or_metrics
+    else:
+        metrics = None
+        bundle_count = 0
+
     payload = {
         "upload_id": csv_upload_id,
         "bundle_count": bundle_count,
@@ -28,6 +40,8 @@ async def notify_partial_ready(
     }
     if metrics:
         payload["metrics"] = metrics
+    if details:
+        payload["details"] = details
     logger.info("[NOTIFY] Partial bundles ready | payload=%s", payload)
 
 

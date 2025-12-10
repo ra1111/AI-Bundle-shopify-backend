@@ -28,7 +28,6 @@ from routers import (
     export,
     shopify_upload,
     generation_progress,
-    quick_install,
     bundle_status,
 )
 
@@ -271,7 +270,6 @@ app.include_router(uploads.router, prefix="/api", tags=["uploads"])
 app.include_router(association_rules.router, prefix="/api", tags=["association-rules"])
 app.include_router(bundle_recommendations.router, prefix="/api", tags=["bundle-recommendations"])
 app.include_router(bundles.router, prefix="/api", tags=["bundles"])
-app.include_router(quick_install.router, tags=["quick-install"])
 app.include_router(analytics.router, prefix="/api", tags=["analytics"])
 app.include_router(export.router, prefix="/api", tags=["export"])
 app.include_router(generation_progress.router, prefix="/api", tags=["generation-progress"])

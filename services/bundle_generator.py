@@ -1805,6 +1805,8 @@ class BundleGenerator:
                 top_skus=None,  # No additional filtering needed - filtered_lines is already filtered
                 min_co_visits=1,
                 max_neighbors=50,
+                weighting="lift",  # Lift weighting: down-weights ubiquitous products
+                min_lift=0.0,  # No filtering - let downstream ranking decide
             )
 
             logger.info(
@@ -5263,10 +5265,22 @@ def _build_quick_start_fbt_bundles(
             len(recommendations),
             desired_min,
         )
-        existing_pairs = {
-            tuple(sorted([p["products"][0]["variant_id"], p["products"][1]["variant_id"]]))
-            for p in recommendations
-        }
+        # Handle both old format (products is a list) and new format (products is a dict with "items" key)
+        existing_pairs = set()
+        for p in recommendations:
+            products = p.get("products")
+            if not products:
+                continue
+            # New format: products is a dict with "items" list
+            if isinstance(products, dict):
+                items = products.get("items", [])
+            else:
+                # Old format: products is a list directly
+                items = products
+            if len(items) >= 2:
+                existing_pairs.add(
+                    tuple(sorted([items[0]["variant_id"], items[1]["variant_id"]]))
+                )
         fallback_pairs = sorted(variant_pairs.items(), key=lambda x: x[1], reverse=True)
         for (variant_id_1, variant_id_2), count in fallback_pairs:
             if len(recommendations) >= desired_min:

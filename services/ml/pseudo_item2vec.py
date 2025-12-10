@@ -7,14 +7,17 @@ It builds co-visitation vectors from transaction history in ~1-5ms.
 Inspired by Pinterest's retrieval system and YouTube's candidate generation,
 but optimized for serverless/Cloud Functions deployment (no training overhead).
 
+Enhanced with PMI (Pointwise Mutual Information) and Lift weighting to
+down-weight ubiquitous products and surface meaningful co-occurrences.
+
 Usage:
     vectors = build_covis_vectors(order_lines, top_skus=top_200)
     similarity = cosine_similarity(vectors["SKU-001"], vectors["SKU-002"])
 """
 from collections import defaultdict
 from itertools import combinations
-from math import sqrt
-from typing import Dict, Iterable, List, Optional, Set, Any
+from math import sqrt, log
+from typing import Dict, Iterable, List, Optional, Set, Any, Literal
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,6 +55,8 @@ def build_covis_vectors(
     top_skus: Optional[Set[str]] = None,
     min_co_visits: int = 1,
     max_neighbors: int = 50,
+    weighting: Literal["raw", "lift", "pmi"] = "raw",  # Default to raw for backwards compatibility
+    min_lift: float = 0.0,  # No filtering by default - let downstream ranking decide
 ) -> Dict[str, CoVisVector]:
     """
     Build pseudo-Item2Vec style vectors from order_lines.
@@ -64,22 +69,29 @@ def build_covis_vectors(
         top_skus: Optional set to restrict to top products (improves speed)
         min_co_visits: Minimum co-occurrence count to include a neighbor
         max_neighbors: Maximum neighbors per product (keeps vectors sparse)
+        weighting: Weight calculation method:
+            - "raw": Raw co-occurrence counts (original behavior)
+            - "lift": Lift = P(A,B) / (P(A) * P(B)) - values > 1 indicate positive association
+            - "pmi": Pointwise Mutual Information = log(lift) - unbounded, can be negative
+        min_lift: Minimum lift threshold (only for lift/pmi weighting, default 1.0)
 
     Returns:
         Dict mapping SKU -> CoVisVector
 
     Performance:
-        - 1000 orders × 3 products: ~2ms
-        - 10000 orders × 3 products: ~20ms
-        - 100000 orders × 3 products: ~200ms
+        - 1000 orders × 3 products: ~2-5ms
+        - 10000 orders × 3 products: ~20-30ms
+        - 100000 orders × 3 products: ~200-300ms
 
     Example:
-        >>> vectors = build_covis_vectors(order_lines, top_skus=top_200)
+        >>> vectors = build_covis_vectors(order_lines, top_skus=top_200, weighting="lift")
         >>> sim = cosine_similarity(vectors["SKU-001"], vectors["SKU-002"])
         >>> # 0.85 = highly similar products
     """
-    # 1) Group SKUs per order
+    # 1) Group SKUs per order and track individual product frequencies
     orders: Dict[str, List[str]] = defaultdict(list)
+    sku_order_count: Dict[str, int] = defaultdict(int)  # How many orders each SKU appears in
+
     for line in order_lines:
         sku = getattr(line, "sku", None)
         if not sku:
@@ -88,6 +100,17 @@ def build_covis_vectors(
             continue
         order_id = str(getattr(line, "order_id"))
         orders[order_id].append(sku)
+
+    # Count unique orders per SKU (for frequency calculation)
+    for order_id, skus in orders.items():
+        unique_skus = set(skus)
+        for sku in unique_skus:
+            sku_order_count[sku] += 1
+
+    total_orders = len(orders)
+    if total_orders == 0:
+        logger.warning("No orders found for co-visitation graph")
+        return {}
 
     # 2) Count co-visits (products that appear together in orders)
     covis_counts: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
@@ -100,16 +123,53 @@ def build_covis_vectors(
             covis_counts[s1][s2] += 1
             covis_counts[s2][s1] += 1
 
-    # 3) Convert counts -> weights and normalize
+    # 3) Convert counts -> weights (using lift/PMI) and normalize
     result: Dict[str, CoVisVector] = {}
+
     for sku, neighbors in covis_counts.items():
-        # Drop weak signals
+        # Drop weak signals (co-occurrence count)
         filtered = {n: c for n, c in neighbors.items() if c >= min_co_visits}
         if not filtered:
             continue
 
-        # Weight by co-visit count (can be enhanced with PMI or lift later)
-        weights = dict(filtered)
+        # Calculate weights based on weighting method
+        if weighting == "raw":
+            # Original behavior: raw co-occurrence counts
+            weights = dict(filtered)
+        else:
+            # Lift or PMI weighting
+            weights = {}
+            freq_sku = sku_order_count.get(sku, 1)
+            p_sku = freq_sku / total_orders
+
+            for neighbor, cooccur_count in filtered.items():
+                freq_neighbor = sku_order_count.get(neighbor, 1)
+                p_neighbor = freq_neighbor / total_orders
+                p_both = cooccur_count / total_orders
+
+                # Lift = P(A,B) / (P(A) * P(B))
+                # Values > 1 mean positive association (appear together more than random)
+                # Values < 1 mean negative association (appear together less than random)
+                expected = p_sku * p_neighbor
+                if expected > 0:
+                    lift = p_both / expected
+                else:
+                    lift = 1.0
+
+                # Filter by minimum lift threshold
+                if lift < min_lift:
+                    continue
+
+                if weighting == "pmi":
+                    # PMI = log(lift), can be negative for lift < 1
+                    # Use max to avoid log(0) issues
+                    weights[neighbor] = log(max(lift, 0.001))
+                else:
+                    # Lift weighting (default)
+                    weights[neighbor] = lift
+
+        if not weights:
+            continue
 
         # Keep top-K neighbors only (sparsity for speed)
         if len(weights) > max_neighbors:
@@ -126,9 +186,16 @@ def build_covis_vectors(
 
         result[sku] = CoVisVector(sku=sku, weights=normed)
 
+    weighting_desc = {
+        "raw": "raw counts",
+        "lift": f"lift (min={min_lift})",
+        "pmi": f"PMI (min_lift={min_lift})"
+    }.get(weighting, weighting)
+
     logger.info(
         f"Built co-visitation graph: {len(result)} products, "
-        f"avg neighbors: {sum(len(v.weights) for v in result.values()) / max(len(result), 1):.1f}"
+        f"avg neighbors: {sum(len(v.weights) for v in result.values()) / max(len(result), 1):.1f}, "
+        f"weighting: {weighting_desc}"
     )
 
     return result

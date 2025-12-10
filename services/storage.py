@@ -592,10 +592,10 @@ class StorageService:
                     batch = lines_with_item_id[i:i + batch_size]
 
                     stmt = pg_insert(OrderLine).values(batch)
-                    # CockroachDB doesn't support partial WHERE in ON CONFLICT
-                    # Use simple ON CONFLICT DO UPDATE without the index_where clause
+                    # Use partial index with WHERE predicate for ON CONFLICT
                     upsert = stmt.on_conflict_do_update(
                         index_elements=[OrderLine.order_id, OrderLine.line_item_id],
+                        index_where=OrderLine.line_item_id.is_not(None),
                         set_=self._overwrite_all_columns(OrderLine.__table__, stmt)
                     )
                     await session.execute(upsert)
@@ -615,10 +615,10 @@ class StorageService:
                     batch = lines_without_item_id[i:i + batch_size]
 
                     stmt = pg_insert(OrderLine).values(batch)
-                    # CockroachDB doesn't support partial WHERE in ON CONFLICT
-                    # Use simple ON CONFLICT DO UPDATE without the index_where clause
+                    # Use partial index with WHERE predicate for ON CONFLICT
                     upsert = stmt.on_conflict_do_update(
                         index_elements=[OrderLine.order_id, OrderLine.sku],
+                        index_where=OrderLine.line_item_id.is_(None),
                         set_=self._overwrite_all_columns(OrderLine.__table__, stmt)
                     )
                     await session.execute(upsert)
