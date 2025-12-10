@@ -18,7 +18,7 @@ import json
 import sys
 import time
 import uuid as _uuid
-from typing import Callable
+from typing import Callable, Dict
 from routers import (
     uploads,
     association_rules,
@@ -32,7 +32,9 @@ from routers import (
     bundle_status,
 )
 
-from database import init_db
+from database import init_db, check_db_health, get_pool_status
+from collections import defaultdict
+from asyncio import Lock
 
 # Load environment variables
 load_dotenv()
@@ -136,17 +138,115 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestIDMiddleware)
 
 
+# ---- Rate Limiting Middleware ----
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """
+    Simple in-memory rate limiter.
+    Limits requests per IP per time window.
+    """
+    def __init__(self, app, requests_per_minute: int = 60, burst_size: int = 100):
+        super().__init__(app)
+        self.requests_per_minute = requests_per_minute
+        self.burst_size = burst_size
+        self.window_seconds = 60
+        self._requests: Dict[str, list] = defaultdict(list)
+        self._lock = Lock()
+        # Endpoints exempt from rate limiting
+        self._exempt_paths = {"/healthz", "/api/health", "/", "/api/docs", "/api/redoc", "/api/openapi.json"}
+
+    async def dispatch(self, request: Request, call_next: Callable):
+        # Skip rate limiting for health checks and docs
+        if request.url.path in self._exempt_paths:
+            return await call_next(request)
+
+        client_ip = request.client.host if request.client else "unknown"
+        current_time = time.time()
+
+        async with self._lock:
+            # Clean old requests outside window
+            self._requests[client_ip] = [
+                t for t in self._requests[client_ip]
+                if current_time - t < self.window_seconds
+            ]
+
+            # Check if over limit
+            if len(self._requests[client_ip]) >= self.requests_per_minute:
+                logger.warning(f"Rate limit exceeded for IP: {client_ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": "Rate limit exceeded",
+                        "retry_after_seconds": self.window_seconds,
+                    },
+                    headers={"Retry-After": str(self.window_seconds)},
+                )
+
+            # Check burst limit (too many in very short time)
+            recent_requests = [t for t in self._requests[client_ip] if current_time - t < 1]
+            if len(recent_requests) >= self.burst_size // 10:  # 10 requests per second max
+                logger.warning(f"Burst limit exceeded for IP: {client_ip}")
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": "Too many requests in short time",
+                        "retry_after_seconds": 1,
+                    },
+                    headers={"Retry-After": "1"},
+                )
+
+            # Record this request
+            self._requests[client_ip].append(current_time)
+
+        response = await call_next(request)
+
+        # Add rate limit headers
+        remaining = self.requests_per_minute - len(self._requests.get(client_ip, []))
+        response.headers["X-RateLimit-Limit"] = str(self.requests_per_minute)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, remaining))
+        response.headers["X-RateLimit-Reset"] = str(int(current_time + self.window_seconds))
+
+        return response
+
+
+# Add rate limiting (configurable via env)
+RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
+RATE_LIMIT_RPM = int(os.getenv("RATE_LIMIT_RPM", "120"))  # 120 requests per minute default
+
+if RATE_LIMIT_ENABLED:
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=RATE_LIMIT_RPM)
+    logger.info(f"Rate limiting enabled: {RATE_LIMIT_RPM} requests/minute")
+
+
 @app.get("/")
 async def root():
     return {"ok": True, "service": "ai-bundle-creator"}
 
 @app.get("/healthz")
 async def healthz():
+    """Basic health check for load balancers."""
     return {"ok": True}
+
 
 @app.get("/api/health")
 async def api_health():
-    return {"status": "healthy"}
+    """Comprehensive health check including database status."""
+    db_health = await check_db_health()
+    overall_status = "healthy" if db_health["status"] == "healthy" else "degraded"
+    return {
+        "status": overall_status,
+        "database": db_health,
+        "timestamp": time.time(),
+    }
+
+
+@app.get("/api/health/pool")
+async def api_health_pool():
+    """Get database connection pool status."""
+    pool_status = await get_pool_status()
+    return {
+        "pool": pool_status,
+        "timestamp": time.time(),
+    }
 
 
 

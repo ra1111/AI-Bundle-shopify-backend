@@ -19,6 +19,7 @@ from database import (
     AssociationRule, Bundle, BundleRecommendation, ShopSyncStatus
 )
 from settings import resolve_shop_id, sanitize_shop_id, DEFAULT_SHOP_ID
+from utils import retry_async, is_transient_error
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,38 @@ class StorageService:
     # ---------- NEW: helpers & defaults ----------
 
     ORDER_LINE_TEXT_DEFAULT = "unspecified"
+
+    # Retry configuration for transient database errors
+    RETRY_MAX_ATTEMPTS = 3
+    RETRY_BASE_DELAY = 0.5  # seconds
+
+    async def _with_retry(self, operation, *args, **kwargs):
+        """
+        Execute a database operation with automatic retry on transient failures.
+        Implements exponential backoff with jitter.
+        """
+        import asyncio
+        import random
+
+        last_exception = None
+        for attempt in range(self.RETRY_MAX_ATTEMPTS):
+            try:
+                return await operation(*args, **kwargs)
+            except Exception as e:
+                last_exception = e
+                if not is_transient_error(e) or attempt >= self.RETRY_MAX_ATTEMPTS - 1:
+                    raise
+
+                delay = min(self.RETRY_BASE_DELAY * (2 ** attempt), 10.0)
+                delay = delay * (0.5 + random.random())  # Add jitter
+                logger.warning(
+                    f"Retry {attempt + 1}/{self.RETRY_MAX_ATTEMPTS} for {operation.__name__} "
+                    f"after {delay:.2f}s due to: {type(e).__name__}: {str(e)[:100]}"
+                )
+                await asyncio.sleep(delay)
+
+        if last_exception:
+            raise last_exception
 
     # Pre-flight check cache: {csv_upload_id: (result, timestamp)}
     # Caches results for 60 seconds to handle rapid retries
@@ -2070,6 +2103,7 @@ class StorageService:
         # This would store in a separate bundle_hashes table in a real implementation
         logger.info(f"Stored {len(hash_records)} bundle hashes")
 
+    @retry_async(max_retries=3, base_delay=1.0)
     async def cleanup_intermediate_data(self, run_id: str) -> Dict[str, int]:
         """
         Delete intermediate data after bundle generation completes.
@@ -2120,12 +2154,25 @@ class StorageService:
 
                 logger.info(f"[cleanup] Found {len(upload_ids)} uploads for run_id={run_id}")
 
-                # Delete order_lines
-                result = await session.execute(
-                    delete(OrderLine).where(OrderLine.csv_upload_id.in_(upload_ids))
-                )
-                deleted_counts["order_lines"] = result.rowcount
-                logger.info(f"[cleanup] Deleted {result.rowcount} order_lines")
+                # Delete in batches to avoid long-running transactions
+                BATCH_SIZE = 1000
+
+                # Delete order_lines in batches
+                total_order_lines = 0
+                while True:
+                    result = await session.execute(
+                        delete(OrderLine)
+                        .where(OrderLine.csv_upload_id.in_(upload_ids))
+                        .execution_options(synchronize_session=False)
+                    )
+                    if result.rowcount == 0:
+                        break
+                    total_order_lines += result.rowcount
+                    await session.commit()
+                    if result.rowcount < BATCH_SIZE:
+                        break
+                deleted_counts["order_lines"] = total_order_lines
+                logger.info(f"[cleanup] Deleted {total_order_lines} order_lines")
 
                 # Delete catalog_snapshot
                 result = await session.execute(
@@ -2133,6 +2180,7 @@ class StorageService:
                 )
                 deleted_counts["catalog_snapshot"] = result.rowcount
                 logger.info(f"[cleanup] Deleted {result.rowcount} catalog_snapshot rows")
+                await session.commit()
 
                 # Delete variants
                 result = await session.execute(
@@ -2140,6 +2188,7 @@ class StorageService:
                 )
                 deleted_counts["variants"] = result.rowcount
                 logger.info(f"[cleanup] Deleted {result.rowcount} variants")
+                await session.commit()
 
                 # Delete inventory_levels
                 result = await session.execute(
@@ -2147,6 +2196,7 @@ class StorageService:
                 )
                 deleted_counts["inventory_levels"] = result.rowcount
                 logger.info(f"[cleanup] Deleted {result.rowcount} inventory_levels")
+                await session.commit()
 
                 # Delete orders
                 result = await session.execute(
@@ -2154,7 +2204,6 @@ class StorageService:
                 )
                 deleted_counts["orders"] = result.rowcount
                 logger.info(f"[cleanup] Deleted {result.rowcount} orders")
-
                 await session.commit()
 
                 total_deleted = sum(deleted_counts.values())

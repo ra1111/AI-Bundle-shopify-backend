@@ -32,13 +32,23 @@ router = APIRouter(prefix="/api/shopify", tags=["Shopify Integration"])
 class ShopifyUploadRequest(BaseModel):
     """Payload posted by the Remix frontend."""
 
-    shop_id: str = Field(..., alias="shopId")
-    csv_type: str = Field(..., alias="csvType")
-    csv_data: str = Field(..., alias="csvData")
-    run_id: Optional[str] = Field(None, alias="runId")
+    shop_id: str = Field(..., alias="shopId", min_length=1, max_length=255)
+    csv_type: str = Field(..., alias="csvType", min_length=1, max_length=50)
+    csv_data: str = Field(..., alias="csvData", min_length=1)
+    run_id: Optional[str] = Field(None, alias="runId", max_length=255)
     trigger_pipeline: bool = Field(False, alias="triggerPipeline")
 
     model_config = ConfigDict(populate_by_name=True)
+
+    @property
+    def csv_size_mb(self) -> float:
+        """Calculate CSV data size in megabytes."""
+        return len(self.csv_data.encode('utf-8')) / (1024 * 1024)
+
+
+# Maximum CSV size in MB (configurable via environment)
+import os
+MAX_CSV_SIZE_MB = float(os.getenv("MAX_CSV_SIZE_MB", "100"))
 
 
 class UploadStatusResponse(BaseModel):
@@ -82,12 +92,26 @@ async def shopify_upload(
     We write a CsvUpload record and reuse the existing CSV processor in the background.
     """
 
+    # Validate CSV size
+    csv_size = request.csv_size_mb
     logger.info(
-        "[shopify_upload] Received upload shop_id=%s type=%s trigger_pipeline=%s",
+        "[shopify_upload] Received upload shop_id=%s type=%s trigger_pipeline=%s size=%.2fMB",
         request.shop_id,
         request.csv_type,
         request.trigger_pipeline,
+        csv_size,
     )
+
+    if csv_size > MAX_CSV_SIZE_MB:
+        logger.warning(
+            "[shopify_upload] CSV too large: %.2fMB > %.2fMB limit",
+            csv_size,
+            MAX_CSV_SIZE_MB,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"CSV data too large: {csv_size:.2f}MB exceeds {MAX_CSV_SIZE_MB}MB limit",
+        )
 
     alias_map = {
         "products": "catalog_joined",

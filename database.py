@@ -279,7 +279,7 @@ class Order(Base):
     # Always present in your CSVs
     order_id: Mapped[str] = mapped_column(String, primary_key=True)
 
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
     customer_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     customer_email: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     customer_country: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -314,10 +314,10 @@ class OrderLine(Base):
     __tablename__ = "order_lines"
 
     id: Mapped[str] = mapped_column(String, primary_key=True)
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
 
     # required: must point to an existing order
-    order_id: Mapped[str] = mapped_column(String, ForeignKey("orders.order_id"), nullable=False)
+    order_id: Mapped[str] = mapped_column(String, ForeignKey("orders.order_id", ondelete="CASCADE"), nullable=False)
 
     sku: Mapped[Optional[str]] = mapped_column(Text, nullable=True)        # can be blank in Shopify
     name: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -374,7 +374,7 @@ class Variant(Base):
     compare_at_price: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 2), nullable=True)
     inventory_item_id: Mapped[str] = mapped_column(String, nullable=False)
     inventory_item_created_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -387,7 +387,7 @@ class InventoryLevel(Base):
     location_id: Mapped[str] = mapped_column(String, nullable=False)
     available: Mapped[int] = mapped_column(Integer, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -421,7 +421,7 @@ class CatalogSnapshot(Base):
     is_seasonal: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_high_margin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
 
     csv_upload = relationship("CsvUpload")
 
@@ -440,7 +440,7 @@ class AssociationRule(Base):
     __tablename__ = "association_rules"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
 
     antecedent: Mapped[dict] = mapped_column(JSONB, nullable=False)
     consequent: Mapped[dict] = mapped_column(JSONB, nullable=False)
@@ -472,7 +472,7 @@ class BundleRecommendation(Base):
     __tablename__ = "bundle_recommendations"
 
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id"), nullable=True)
+    csv_upload_id: Mapped[Optional[str]] = mapped_column(String, ForeignKey("csv_uploads.id", ondelete="CASCADE"), nullable=True)
     shop_id: Mapped[Optional[str]] = mapped_column(String, index=True, nullable=True)
 
     bundle_type: Mapped[str] = mapped_column(Text, nullable=False)
@@ -534,6 +534,18 @@ Index('ix_bundles_created_at', Bundle.created_at)
 Index('ix_bundles_type', Bundle.bundle_type)
 Index('ix_bundle_recommendations_upload', BundleRecommendation.csv_upload_id)
 Index('ix_association_rules_upload', AssociationRule.csv_upload_id)
+
+# Additional performance indexes for common query patterns
+Index('ix_orders_customer_id', Order.customer_id)
+Index('ix_orders_created_at', Order.created_at)
+Index('ix_order_lines_order_id', OrderLine.order_id)
+Index('ix_order_lines_sku', OrderLine.sku)
+Index('ix_order_lines_variant_id', OrderLine.variant_id)
+Index('ix_csv_uploads_status', CsvUpload.status)
+Index('ix_csv_uploads_csv_type', CsvUpload.csv_type)
+Index('ix_variants_product_id', Variant.product_id)
+Index('ix_catalog_snapshot_product_id', CatalogSnapshot.product_id)
+Index('ix_inventory_levels_item_id', InventoryLevel.inventory_item_id)
 # -------------------------------------------------------------------
 # DI + init helpers
 # -------------------------------------------------------------------
@@ -550,3 +562,50 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     logger.info("DB init complete (tables ensured).")
+
+
+async def check_db_health() -> dict:
+    """
+    Comprehensive database health check.
+    Returns dict with status, latency, pool info, and any errors.
+    """
+    result = {
+        "status": "unhealthy",
+        "latency_ms": None,
+        "pool": {
+            "size": engine.pool.size() if hasattr(engine.pool, 'size') else None,
+            "checked_in": engine.pool.checkedin() if hasattr(engine.pool, 'checkedin') else None,
+            "checked_out": engine.pool.checkedout() if hasattr(engine.pool, 'checkedout') else None,
+            "overflow": engine.pool.overflow() if hasattr(engine.pool, 'overflow') else None,
+        },
+        "error": None,
+    }
+
+    import time
+    start = time.time()
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("SELECT 1"))
+        result["latency_ms"] = round((time.time() - start) * 1000, 2)
+        result["status"] = "healthy"
+    except Exception as e:
+        result["latency_ms"] = round((time.time() - start) * 1000, 2)
+        result["error"] = str(e)
+        logger.error(f"Database health check failed: {e}")
+
+    return result
+
+
+async def get_pool_status() -> dict:
+    """Get current connection pool status for monitoring."""
+    try:
+        return {
+            "pool_size": engine.pool.size() if hasattr(engine.pool, 'size') else None,
+            "checked_in": engine.pool.checkedin() if hasattr(engine.pool, 'checkedin') else None,
+            "checked_out": engine.pool.checkedout() if hasattr(engine.pool, 'checkedout') else None,
+            "overflow": engine.pool.overflow() if hasattr(engine.pool, 'overflow') else None,
+            "invalid": engine.pool.invalidatedcount() if hasattr(engine.pool, 'invalidatedcount') else None,
+        }
+    except Exception as e:
+        logger.warning(f"Failed to get pool status: {e}")
+        return {"error": str(e)}
