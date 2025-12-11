@@ -857,12 +857,14 @@ class CandidateGenerator:
                 sku = getattr(s, 'sku', None)
                 if vid:
                     vid_str = str(vid)
-                    if sku and sku.strip():
-                        # Normal case: map variant_id to SKU
-                        mapping[vid_str] = str(sku).strip()
+                    sku_clean = str(sku).strip() if sku else ""
+                    # Skip synthetic no-sku-* values - treat them as missing
+                    if sku_clean and not sku_clean.startswith('no-sku-'):
+                        # Normal case: map variant_id to real SKU
+                        mapping[vid_str] = sku_clean
                         sku_count += 1
                     else:
-                        # Fallback: map variant_id to itself when SKU is missing
+                        # Fallback: map variant_id to itself when SKU is missing or synthetic
                         # This allows SKU-less products to be used in bundles
                         mapping[vid_str] = vid_str
                         vid_fallback_count += 1
