@@ -1474,13 +1474,21 @@ class CandidateGenerator:
                 order_items = set()
                 for line in order.order_lines:
                     key = None
-                    if getattr(line, 'sku', None):
-                        key = line.sku
-                    elif getattr(line, 'variant_id', None):
-                        key = line.variant_id
+                    sku = getattr(line, 'sku', None)
+                    variant_id = getattr(line, 'variant_id', None)
+
+                    # Prefer variant_id if SKU is synthetic (no-sku-*) or missing
+                    # This matches how valid_skus is built from catalog
+                    if sku and not sku.startswith('no-sku-'):
+                        key = sku
+                    elif variant_id:
+                        key = variant_id
+                    elif sku:  # Fallback to synthetic SKU only if no variant_id
+                        key = sku
+
                     if key:
                         order_items.add(key)
-                
+
                 if len(order_items) >= 2:  # Only multi-item orders
                     transactions.append(order_items)
             
@@ -1504,13 +1512,21 @@ class CandidateGenerator:
                 sequence = []
                 for line in order.order_lines:
                     key = None
-                    if getattr(line, 'sku', None):
-                        key = line.sku
-                    elif getattr(line, 'variant_id', None):
-                        key = line.variant_id
+                    sku = getattr(line, 'sku', None)
+                    variant_id = getattr(line, 'variant_id', None)
+
+                    # Prefer variant_id if SKU is synthetic (no-sku-*) or missing
+                    # This matches how valid_skus is built from catalog
+                    if sku and not sku.startswith('no-sku-'):
+                        key = sku
+                    elif variant_id:
+                        key = variant_id
+                    elif sku:  # Fallback to synthetic SKU only if no variant_id
+                        key = sku
+
                     if key:
                         sequence.append(key)
-                
+
                 if len(sequence) >= 2:
                     sequences.append(sequence)
             
