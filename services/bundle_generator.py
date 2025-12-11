@@ -5087,13 +5087,16 @@ def _build_quick_start_fbt_bundles(
     filtered_out_count = 0
     for (variant_id_1, variant_id_2), count in variant_pairs.items():
         # Get co-visitation similarity (0-1 range)
-        # NOTE: covis_vectors is keyed by SKU, so we need to map variant_id -> SKU
+        # NOTE: covis_vectors may be keyed by SKU or variant_id (for products without SKUs)
         covis_sim = 0.0
         sku1 = variant_to_sku.get(variant_id_1)
         sku2 = variant_to_sku.get(variant_id_2)
-        if covis_vectors and sku1 and sku2 and sku1 in covis_vectors and sku2 in covis_vectors:
-            v1 = covis_vectors[sku1]
-            v2 = covis_vectors[sku2]
+        # Try SKU first, then fall back to variant_id (for products without SKUs)
+        key1 = sku1 if sku1 and sku1 in (covis_vectors or {}) else variant_id_1
+        key2 = sku2 if sku2 and sku2 in (covis_vectors or {}) else variant_id_2
+        if covis_vectors and key1 in covis_vectors and key2 in covis_vectors:
+            v1 = covis_vectors[key1]
+            v2 = covis_vectors[key2]
             covis_sim = cosine_similarity(v1, v2)
 
         # Blended score: 60% similarity + 40% co-occurrence frequency

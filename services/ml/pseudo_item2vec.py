@@ -94,12 +94,16 @@ def build_covis_vectors(
 
     for line in order_lines:
         sku = getattr(line, "sku", None)
-        if not sku:
+        variant_id = getattr(line, "variant_id", None)
+        # Use variant_id as fallback when sku is empty (products without SKUs)
+        identifier = sku if sku and str(sku).strip() else variant_id
+        if not identifier:
             continue
-        if top_skus is not None and sku not in top_skus:
+        identifier = str(identifier).strip()
+        if top_skus is not None and identifier not in top_skus:
             continue
         order_id = str(getattr(line, "order_id"))
-        orders[order_id].append(sku)
+        orders[order_id].append(identifier)
 
     # Count unique orders per SKU (for frequency calculation)
     for order_id, skus in orders.items():
