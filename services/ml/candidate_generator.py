@@ -295,9 +295,12 @@ class CandidateGenerator:
             return products
         for entry in catalog_entries:
             sku = getattr(entry, "sku", None)
-            if not sku:
+            variant_id = getattr(entry, "variant_id", None)
+            # Use variant_id as fallback when sku is empty (products without SKUs)
+            identifier = sku if sku and str(sku).strip() else variant_id
+            if not identifier:
                 continue
-            sku_str = str(sku).strip()
+            sku_str = str(identifier).strip()
             if not sku_str:
                 continue
             product: Dict[str, Any] = {
