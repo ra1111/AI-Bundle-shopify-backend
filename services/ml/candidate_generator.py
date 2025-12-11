@@ -211,6 +211,15 @@ class CandidateGenerator:
         filtered_items = 0
         retained_items = 0
 
+        # DEBUG: Log sample raw items and valid_skus to understand mismatch
+        if transactions:
+            sample_raw = list(transactions[0])[:3] if transactions[0] else []
+            logger.warning(f"DEBUG _normalize_transactions | sample_raw_items={sample_raw} | valid_skus_count={len(valid_skus) if valid_skus else 0} | varid_map_count={len(varid_to_sku)}")
+            sample_valid = list(valid_skus)[:5] if valid_skus else []
+            logger.warning(f"DEBUG _normalize_transactions | sample_valid_skus={sample_valid}")
+            sample_varid = list(varid_to_sku.items())[:3] if varid_to_sku else []
+            logger.warning(f"DEBUG _normalize_transactions | sample_varid_to_sku={sample_varid}")
+
         for raw_items in transactions:
             cast_items: Set[str] = set()
             for raw in raw_items:
@@ -224,6 +233,9 @@ class CandidateGenerator:
                 mapped_items += 1
                 if valid_skus and sku not in valid_skus:
                     filtered_items += 1
+                    # DEBUG: Log first few filtered items to understand mismatch
+                    if filtered_items <= 3:
+                        logger.warning(f"DEBUG filtered | raw={raw} resolved={resolved} sku={sku} type={type(sku)}")
                     continue
                 retained_items += 1
                 cast_items.add(sku)
