@@ -925,12 +925,16 @@ class CandidateGenerator:
             for line in order_lines:
                 order_id = getattr(line, "order_id", None)
                 sku = getattr(line, "sku", None)
-                if not order_id or not sku:
+                variant_id = getattr(line, "variant_id", None)
+
+                # Use variant_id as fallback when sku is empty (products without SKUs)
+                identifier = sku if sku and str(sku).strip() else variant_id
+                if not order_id or not identifier:
                     continue
-                sku = str(sku).strip()
-                if not sku or sku.startswith("gid://") or sku.startswith("no-sku-"):
+                identifier = str(identifier).strip()
+                if not identifier or identifier.startswith("gid://") or identifier.startswith("no-sku-"):
                     continue
-                order_sku_map[order_id].add(sku)
+                order_sku_map[order_id].add(identifier)
 
             transactions = [skus for skus in order_sku_map.values() if len(skus) >= 2]
 
