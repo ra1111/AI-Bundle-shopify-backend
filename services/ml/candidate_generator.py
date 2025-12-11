@@ -48,6 +48,47 @@ class CandidateGenerator:
         self.max_embedding_targets = int(os.getenv("MAX_EMBED_TARGETS", "400"))
         self.min_embedding_targets = int(os.getenv("MIN_EMBED_TARGETS", "75"))
         self.anchor_prefetch_extra = int(os.getenv("EMBED_ANCHOR_EXTRA", "50"))
+
+        # Adaptive thresholds for different store sizes
+        # Small: <50 orders, Medium: 50-500, Large: 500+
+        self.store_size_thresholds = {
+            "small": {"max_orders": 50, "min_support": 0.01, "min_transactions": 3, "min_frequency": 1},
+            "medium": {"max_orders": 500, "min_support": 0.02, "min_transactions": 5, "min_frequency": 2},
+            "large": {"max_orders": float("inf"), "min_support": 0.05, "min_transactions": 10, "min_frequency": 2},
+        }
+
+    def _get_store_tier(self, order_count: int) -> str:
+        """Determine store tier based on order count"""
+        if order_count < self.store_size_thresholds["small"]["max_orders"]:
+            return "small"
+        elif order_count < self.store_size_thresholds["medium"]["max_orders"]:
+            return "medium"
+        else:
+            return "large"
+
+    def _get_adaptive_min_support(self, transaction_count: int) -> float:
+        """Calculate adaptive min_support based on transaction count"""
+        tier = self._get_store_tier(transaction_count)
+        base_support = self.store_size_thresholds[tier]["min_support"]
+
+        # For very small stores, ensure at least 1 co-occurrence is enough
+        # min_support * transaction_count >= 1
+        min_viable_support = 1.0 / max(transaction_count, 1)
+
+        # Use the higher of base_support or min_viable_support
+        # This ensures we don't require more co-occurrences than possible
+        adaptive_support = max(base_support, min_viable_support)
+
+        logger.info(
+            f"Adaptive min_support | tier={tier} orders={transaction_count} "
+            f"base={base_support:.3f} min_viable={min_viable_support:.3f} final={adaptive_support:.3f}"
+        )
+        return adaptive_support
+
+    def _get_adaptive_min_transactions(self, transaction_count: int) -> int:
+        """Get minimum transaction threshold based on store size"""
+        tier = self._get_store_tier(transaction_count)
+        return self.store_size_thresholds[tier]["min_transactions"]
     
     async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
         """Prefetch expensive data needed by candidate generation."""
@@ -577,11 +618,26 @@ class CandidateGenerator:
             "top_pair_candidates": 0,
             "total_unique_candidates": 0,
             "generation_method": "hybrid",
-            "invalid_sku_candidates_filtered": 0
+            "invalid_sku_candidates_filtered": 0,
+            "store_tier": "unknown",
+            "order_count": 0,
         }
         
         try:
             run_id = context.run_id if context else await storage.get_run_id_for_upload(csv_upload_id)
+
+            # Determine store tier for adaptive thresholds
+            transaction_count = len(context.transactions) if context and context.transactions else 0
+            store_tier = self._get_store_tier(transaction_count)
+            tier_config = self.store_size_thresholds[store_tier]
+            metrics["store_tier"] = store_tier
+            metrics["order_count"] = transaction_count
+            logger.info(
+                f"[{csv_upload_id}] Store tier detection | orders={transaction_count} "
+                f"tier={store_tier} min_support={tier_config['min_support']} "
+                f"min_transactions={tier_config['min_transactions']} min_frequency={tier_config['min_frequency']}"
+            )
+
             # CRITICAL FIX: Preload valid SKUs to prevent infinite loop
             logger.info(f"Preloading valid SKUs for scope: run_id={run_id} csv_upload_id={csv_upload_id}")
             valid_skus = context.valid_skus if context else await self.get_valid_skus_for_csv(csv_upload_id)
@@ -1164,12 +1220,23 @@ class CandidateGenerator:
             # Get transaction data (order baskets)
             if transactions is None:
                 transactions = await self.get_transactions_for_mining(csv_upload_id)
-            if len(transactions) < 10:
-                logger.info("Insufficient transactions for FPGrowth, falling back to Apriori")
+
+            transaction_count = len(transactions)
+            min_transactions = self._get_adaptive_min_transactions(transaction_count)
+
+            if transaction_count < min_transactions:
+                tier = self._get_store_tier(transaction_count)
+                logger.info(
+                    f"Insufficient transactions for FPGrowth | count={transaction_count} "
+                    f"min_required={min_transactions} tier={tier}"
+                )
                 return []
-            
+
+            # Use adaptive min_support based on store size
+            adaptive_min_support = self._get_adaptive_min_support(transaction_count)
+
             # Build FP-tree and mine frequent itemsets
-            frequent_itemsets = self.fpgrowth_mining(transactions, min_support=0.05)
+            frequent_itemsets = self.fpgrowth_mining(transactions, min_support=adaptive_min_support)
             
             # Convert frequent itemsets to bundle candidates
             candidates = []
@@ -1426,21 +1493,28 @@ class CandidateGenerator:
         
         return embeddings
     
-    def build_vocabulary(self, sequences: List[List[str]]) -> Dict[str, int]:
-        """Build vocabulary from sequences"""
+    def build_vocabulary(self, sequences: List[List[str]], order_count: Optional[int] = None) -> Dict[str, int]:
+        """Build vocabulary from sequences with adaptive frequency threshold"""
         item_counts = defaultdict(int)
         for sequence in sequences:
             for item in sequence:
                 item_counts[item] += 1
-        
+
+        # Use adaptive min_frequency based on store size
+        if order_count is not None:
+            tier = self._get_store_tier(order_count)
+            min_freq = self.store_size_thresholds[tier]["min_frequency"]
+        else:
+            min_freq = self.min_frequency
+
         # Filter by minimum frequency
         vocab = {}
         idx = 0
         for item, count in item_counts.items():
-            if count >= self.min_frequency:
+            if count >= min_freq:
                 vocab[item] = idx
                 idx += 1
-        
+
         return vocab
     
     def find_similar_products(self, anchor: str, embeddings: Dict[str, np.ndarray], top_k: int = 10) -> List[Tuple[str, float]]:
