@@ -924,10 +924,14 @@ class DataMapper:
                         line["variant_id"], csv_upload_id
                     )
                     
+                    # Use actual SKU only, not synthetic no-sku-* placeholders
+                    raw_sku = line.get("sku", "")
+                    actual_sku = raw_sku if raw_sku and not str(raw_sku).startswith("no-sku-") else ""
+
                     catalog_entry = {
                         "variant_id": line["variant_id"],
                         "csv_upload_id": csv_upload_id,
-                        "sku": line["sku"],
+                        "sku": actual_sku,
                         "product_id": product_data["product_id"],
                         "product_title": product_data["product_title"],
                         "product_type": product_data["product_type"],
