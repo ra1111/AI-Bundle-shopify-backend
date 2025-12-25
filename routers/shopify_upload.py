@@ -9,7 +9,11 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import uuid4
 
+import asyncio
+import json as json_lib
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,6 +48,30 @@ class ShopifyUploadRequest(BaseModel):
     def csv_size_mb(self) -> float:
         """Calculate CSV data size in megabytes."""
         return len(self.csv_data.encode('utf-8')) / (1024 * 1024)
+
+
+class BatchUploadRequest(BaseModel):
+    """Batch upload of all 4 CSV types in a single request."""
+
+    shop_id: str = Field(..., alias="shopId", min_length=1, max_length=255)
+    run_id: Optional[str] = Field(None, alias="runId", max_length=255)
+    catalog_csv: str = Field(..., alias="catalogCsv", min_length=1)
+    variants_csv: str = Field(..., alias="variantsCsv", min_length=1)
+    inventory_csv: str = Field(..., alias="inventoryCsv", min_length=1)
+    orders_csv: str = Field(..., alias="ordersCsv", min_length=1)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    @property
+    def total_size_mb(self) -> float:
+        """Calculate total CSV data size in megabytes."""
+        total_bytes = (
+            len(self.catalog_csv.encode('utf-8')) +
+            len(self.variants_csv.encode('utf-8')) +
+            len(self.inventory_csv.encode('utf-8')) +
+            len(self.orders_csv.encode('utf-8'))
+        )
+        return total_bytes / (1024 * 1024)
 
 
 # Maximum CSV size in MB (configurable via environment)
@@ -182,6 +210,151 @@ async def shopify_upload(
     }
 
 
+@router.post("/upload-batch")
+async def shopify_upload_batch(
+    request: BatchUploadRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Batch upload all 4 CSV types in a single request.
+    More efficient than 4 separate uploads - single roundtrip, auto-triggers pipeline.
+    """
+    total_size = request.total_size_mb
+    logger.info(
+        "[shopify_upload_batch] Received batch upload shop_id=%s size=%.2fMB",
+        request.shop_id,
+        total_size,
+    )
+
+    # Validate total size (allow 4x single limit since we have 4 CSVs)
+    max_batch_size = MAX_CSV_SIZE_MB * 4
+    if total_size > max_batch_size:
+        logger.warning(
+            "[shopify_upload_batch] Batch too large: %.2fMB > %.2fMB limit",
+            total_size,
+            max_batch_size,
+        )
+        raise HTTPException(
+            status_code=413,
+            detail=f"Batch data too large: {total_size:.2f}MB exceeds {max_batch_size}MB limit",
+        )
+
+    effective_run_id = (request.run_id or str(uuid4())).strip()
+    resolved_shop_id = resolve_shop_id(request.shop_id)
+
+    # Create a single "primary" upload record for orders (used for status tracking)
+    # All 4 CSVs share the same run_id
+    orders_upload_id = str(uuid4())
+    catalog_upload_id = str(uuid4())
+    variants_upload_id = str(uuid4())
+    inventory_upload_id = str(uuid4())
+
+    timestamp = datetime.utcnow()
+    timestamp_str = timestamp.strftime('%Y%m%dT%H%M%SZ')
+
+    # Create all 4 upload records
+    uploads = [
+        CsvUpload(
+            id=orders_upload_id,
+            filename=f"shopify_sync_orders_{timestamp_str}.csv",
+            csv_type="orders",
+            run_id=effective_run_id,
+            shop_id=resolved_shop_id,
+            total_rows=0,
+            processed_rows=0,
+            status="processing",
+            error_message=None,
+            code_version="1.0.0",
+            schema_version="1.0",
+            created_at=timestamp,
+            updated_at=timestamp,
+        ),
+        CsvUpload(
+            id=catalog_upload_id,
+            filename=f"shopify_sync_catalog_joined_{timestamp_str}.csv",
+            csv_type="catalog_joined",
+            run_id=effective_run_id,
+            shop_id=resolved_shop_id,
+            total_rows=0,
+            processed_rows=0,
+            status="processing",
+            error_message=None,
+            code_version="1.0.0",
+            schema_version="1.0",
+            created_at=timestamp,
+            updated_at=timestamp,
+        ),
+        CsvUpload(
+            id=variants_upload_id,
+            filename=f"shopify_sync_variants_{timestamp_str}.csv",
+            csv_type="variants",
+            run_id=effective_run_id,
+            shop_id=resolved_shop_id,
+            total_rows=0,
+            processed_rows=0,
+            status="processing",
+            error_message=None,
+            code_version="1.0.0",
+            schema_version="1.0",
+            created_at=timestamp,
+            updated_at=timestamp,
+        ),
+        CsvUpload(
+            id=inventory_upload_id,
+            filename=f"shopify_sync_inventory_levels_{timestamp_str}.csv",
+            csv_type="inventory_levels",
+            run_id=effective_run_id,
+            shop_id=resolved_shop_id,
+            total_rows=0,
+            processed_rows=0,
+            status="processing",
+            error_message=None,
+            code_version="1.0.0",
+            schema_version="1.0",
+            created_at=timestamp,
+            updated_at=timestamp,
+        ),
+    ]
+
+    for upload in uploads:
+        db.add(upload)
+    await db.commit()
+
+    logger.info(
+        "[shopify_upload_batch] Created 4 CsvUpload records run_id=%s shop_id=%s orders_id=%s",
+        effective_run_id,
+        resolved_shop_id,
+        orders_upload_id,
+    )
+
+    # Queue single background task to process all CSVs and trigger pipeline
+    background_tasks.add_task(
+        process_batch_upload_background,
+        request.catalog_csv,
+        request.variants_csv,
+        request.inventory_csv,
+        request.orders_csv,
+        catalog_upload_id,
+        variants_upload_id,
+        inventory_upload_id,
+        orders_upload_id,
+        effective_run_id,
+    )
+
+    return {
+        "uploadId": orders_upload_id,  # Primary ID for status tracking
+        "runId": effective_run_id,
+        "status": "processing",
+        "shopId": resolved_shop_id,
+        "catalogUploadId": catalog_upload_id,
+        "variantsUploadId": variants_upload_id,
+        "inventoryUploadId": inventory_upload_id,
+        "ordersUploadId": orders_upload_id,
+        "message": "Batch upload accepted. Poll /api/shopify/status/{uploadId} for progress.",
+    }
+
+
 @router.get("/status/{upload_id}", response_model=UploadStatusResponse)
 async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
     """Check processing status for a CsvUpload created via the Shopify endpoint.
@@ -260,6 +433,134 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
         processed_rows=upload.processed_rows,
         error_message=upload.error_message,
         bundle_count=bundle_count,
+    )
+
+
+@router.get("/progress/{upload_id}/stream")
+async def stream_progress(upload_id: str):
+    """
+    Server-Sent Events (SSE) endpoint for real-time progress updates.
+    More efficient than polling - pushes updates as they happen.
+
+    Returns SSE stream with progress events:
+    - event: progress
+    - data: JSON with status, progress, step, bundle_count, etc.
+    """
+    async def event_generator():
+        last_status = None
+        last_progress = -1
+        retry_count = 0
+        max_retries = 3
+
+        while True:
+            try:
+                async with AsyncSessionLocal() as db:
+                    # Try to find upload by ID or run_id
+                    upload = await db.get(CsvUpload, upload_id)
+
+                    if not upload:
+                        run_id_stmt = (
+                            select(CsvUpload)
+                            .where(CsvUpload.run_id == upload_id)
+                            .where(CsvUpload.csv_type == "orders")
+                            .order_by(CsvUpload.created_at.desc())
+                            .limit(1)
+                        )
+                        result = await db.execute(run_id_stmt)
+                        upload = result.scalar_one_or_none()
+
+                    if not upload:
+                        # Upload not found yet - send waiting event
+                        event_data = {
+                            "status": "waiting",
+                            "message": "Waiting for upload to be created...",
+                            "upload_id": upload_id,
+                        }
+                        yield f"event: progress\ndata: {json_lib.dumps(event_data)}\n\n"
+                        retry_count += 1
+                        if retry_count > max_retries * 10:  # Wait up to 30 seconds
+                            event_data = {
+                                "status": "error",
+                                "message": f"Upload {upload_id} not found",
+                            }
+                            yield f"event: error\ndata: {json_lib.dumps(event_data)}\n\n"
+                            break
+                        await asyncio.sleep(1)
+                        continue
+
+                    retry_count = 0  # Reset retry count on success
+
+                    # Check for bundles
+                    bundle_count = None
+                    stmt = select(func.count(BundleRecommendation.id)).where(
+                        BundleRecommendation.csv_upload_id == upload.id
+                    )
+                    result = await db.execute(stmt)
+                    count = result.scalar() or 0
+                    bundle_count = count if count > 0 else None
+
+                    # Calculate progress percentage
+                    progress = 0
+                    if upload.total_rows > 0:
+                        progress = int((upload.processed_rows / upload.total_rows) * 100)
+
+                    # Normalize status for frontend
+                    frontend_status = upload.status
+                    if upload.status in {"bundle_generation_completed"}:
+                        frontend_status = "completed"
+                    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+                        frontend_status = "processing"
+                    elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
+                        frontend_status = "failed"
+
+                    # Only send event if something changed
+                    if frontend_status != last_status or progress != last_progress:
+                        last_status = frontend_status
+                        last_progress = progress
+
+                        event_data = {
+                            "upload_id": upload.id,
+                            "status": frontend_status,
+                            "internal_status": upload.status,
+                            "progress": progress,
+                            "total_rows": upload.total_rows,
+                            "processed_rows": upload.processed_rows,
+                            "bundle_count": bundle_count,
+                            "error_message": upload.error_message,
+                        }
+                        yield f"event: progress\ndata: {json_lib.dumps(event_data)}\n\n"
+
+                    # Check for terminal states
+                    if frontend_status in {"completed", "failed"}:
+                        # Send final event and close
+                        event_data = {
+                            "upload_id": upload.id,
+                            "status": frontend_status,
+                            "bundle_count": bundle_count,
+                            "final": True,
+                        }
+                        yield f"event: complete\ndata: {json_lib.dumps(event_data)}\n\n"
+                        break
+
+                await asyncio.sleep(1)  # Check every 1 second (more responsive than polling)
+
+            except Exception as e:
+                logger.exception(f"[SSE] Error streaming progress for {upload_id}")
+                event_data = {
+                    "status": "error",
+                    "message": str(e),
+                }
+                yield f"event: error\ndata: {json_lib.dumps(event_data)}\n\n"
+                break
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
     )
 
 
@@ -438,4 +739,115 @@ async def process_shopify_upload_background(
     except Exception:
         logger.exception(
             "[process_shopify_upload] Pipeline execution failed upload_id=%s", upload_id
+        )
+
+
+async def process_batch_upload_background(
+    catalog_csv: str,
+    variants_csv: str,
+    inventory_csv: str,
+    orders_csv: str,
+    catalog_upload_id: str,
+    variants_upload_id: str,
+    inventory_upload_id: str,
+    orders_upload_id: str,
+    run_id: str,
+) -> None:
+    """
+    Background task for batch upload processing.
+    Processes all 4 CSVs sequentially, then auto-triggers bundle generation pipeline.
+    """
+    logger.info(
+        "[process_batch_upload] Starting batch ingestion run_id=%s orders_id=%s",
+        run_id,
+        orders_upload_id,
+    )
+
+    # Process CSVs in dependency order: catalog/variants first, then orders
+    csv_tasks = [
+        ("catalog_joined", catalog_csv, catalog_upload_id),
+        ("variants", variants_csv, variants_upload_id),
+        ("inventory_levels", inventory_csv, inventory_upload_id),
+        ("orders", orders_csv, orders_upload_id),
+    ]
+
+    for csv_type, csv_content, upload_id in csv_tasks:
+        try:
+            logger.info(
+                "[process_batch_upload] Processing %s upload_id=%s",
+                csv_type,
+                upload_id,
+            )
+            await process_csv_background(csv_content, upload_id, csv_type)
+            logger.info(
+                "[process_batch_upload] Completed %s upload_id=%s",
+                csv_type,
+                upload_id,
+            )
+        except Exception:
+            logger.exception(
+                "[process_batch_upload] Failed to process %s upload_id=%s",
+                csv_type,
+                upload_id,
+            )
+            # Update all uploads with error status
+            await storage.update_csv_upload(
+                orders_upload_id,
+                {
+                    "status": "failed",
+                    "error_message": f"Batch processing failed at {csv_type}",
+                    "updated_at": datetime.utcnow(),
+                },
+            )
+            return
+
+    logger.info(
+        "[process_batch_upload] All CSVs processed. Checking data readiness for run_id=%s",
+        run_id,
+    )
+
+    # Auto-trigger bundle generation pipeline
+    async with AsyncSessionLocal() as session:
+        try:
+            await _ensure_data_ready(orders_upload_id, run_id, session)
+        except HTTPException as exc:
+            logger.warning(
+                "[process_batch_upload] Pipeline aborted run_id=%s reason=%s",
+                run_id,
+                exc.detail,
+            )
+            await storage.update_csv_upload(
+                orders_upload_id,
+                {
+                    "error_message": f"Pipeline skipped: {exc.detail}",
+                    "updated_at": datetime.utcnow(),
+                },
+            )
+            return
+        except Exception:
+            logger.exception(
+                "[process_batch_upload] Failed readiness checks run_id=%s", run_id
+            )
+            await storage.update_csv_upload(
+                orders_upload_id,
+                {
+                    "error_message": "Pipeline skipped due to unexpected readiness failure.",
+                    "updated_at": datetime.utcnow(),
+                },
+            )
+            return
+
+    try:
+        logger.info(
+            "[process_batch_upload] Launching bundle generation for orders_upload_id=%s",
+            orders_upload_id,
+        )
+        await generate_bundles_background(orders_upload_id)
+        logger.info(
+            "[process_batch_upload] Pipeline completed for run_id=%s",
+            run_id,
+        )
+    except Exception:
+        logger.exception(
+            "[process_batch_upload] Pipeline execution failed run_id=%s", run_id
         )
