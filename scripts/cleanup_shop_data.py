@@ -27,10 +27,11 @@ RAW_DB_URL = os.getenv("DATABASE_URL")
 if RAW_DB_URL and RAW_DB_URL.startswith("postgresql://") and "+asyncpg" not in RAW_DB_URL:
     os.environ["DATABASE_URL"] = RAW_DB_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
 
-from sqlalchemy import delete, select, func, text
+from sqlalchemy import delete, select, func, text, update
 from database import (
     AsyncSessionLocal, BundleRecommendation, CsvUpload, GenerationProgress,
-    Order, OrderLine, Variant, InventoryLevel, CatalogSnapshot, AssociationRule
+    Order, OrderLine, Variant, InventoryLevel, CatalogSnapshot, AssociationRule,
+    ShopSyncStatus
 )
 
 
@@ -106,6 +107,24 @@ async def cleanup_shop(shop_id: str, dry_run: bool = False):
         del_uploads = delete(CsvUpload).where(CsvUpload.id.in_(upload_ids))
         result = await db.execute(del_uploads)
         print(f"   ✓ Deleted {result.rowcount} csv_uploads")
+
+        # Reset shop_sync_status to allow quick-start mode on next sync
+        # This is CRITICAL - without this, the system thinks bundles already exist
+        # and will skip quick-start generation (which uses LLM to generate bundles)
+        reset_sync_status = (
+            update(ShopSyncStatus)
+            .where(ShopSyncStatus.shop_id == normalized)
+            .values(
+                initial_sync_completed=False,
+                last_sync_started_at=None,
+                last_sync_completed_at=None,
+            )
+        )
+        result = await db.execute(reset_sync_status)
+        if result.rowcount > 0:
+            print(f"   ✓ Reset shop_sync_status (will enable quick-start mode)")
+        else:
+            print(f"   ℹ No shop_sync_status record to reset")
 
         await db.commit()
         print(f"\n✅ Cleanup complete! Shop {shop_id} is ready for fresh sync.")

@@ -569,14 +569,35 @@ class BundleGenerator:
             stage="soft_timeout",
         )
 
+        # Create user-friendly timeout message based on phase
+        phase_messages = {
+            "enrichment": "We couldn't complete data analysis in time. Your store may have a large catalog.",
+            "scoring": "Product scoring took longer than expected due to catalog size.",
+            "ml_generation": "ML analysis timed out. This can happen with large transaction histories.",
+            "optimization": "Bundle optimization took too long. Try again or reduce catalog size.",
+            "ai_descriptions": "AI description generation timed out.",
+            "staged_publish": "Publishing bundles took longer than expected.",
+            "finalization": "Final processing timed out.",
+        }
+        user_message = phase_messages.get(
+            phase_name,
+            f"Bundle generation stopped during {phase_name}. Please try again."
+        )
+        if metrics["total_recommendations"] > 0:
+            user_message += f" However, we managed to generate {metrics['total_recommendations']} bundle(s) before timeout."
+
         await update_generation_progress(
             csv_upload_id,
             step="finalization",
             progress=100,
             status="failed",
-            message=f"Bundle generation stopped during {phase_name} due to time budget.",
+            message=user_message,
             bundle_count=metrics["total_recommendations"] or None,
-            metadata={"checkpoint": {"phase": phase_name, "timestamp": datetime.utcnow().isoformat()}},
+            metadata={
+                "checkpoint": {"phase": phase_name, "timestamp": datetime.utcnow().isoformat()},
+                "timeout_error": True,
+                "timeout_phase": phase_name,
+            },
         )
 
         # Persist the latest checkpoint details on the upload record for resumability.
@@ -1459,6 +1480,13 @@ class BundleGenerator:
         # Set aggressive deadline
         self._current_deadline = Deadline(timeout_seconds)
 
+        # Clean up any orphaned partial recommendations from previous failed runs
+        try:
+            await storage.delete_partial_bundle_recommendations(csv_upload_id)
+            logger.debug(f"[{csv_upload_id}] Cleaned up any orphaned partial recommendations")
+        except Exception as cleanup_err:
+            logger.warning(f"[{csv_upload_id}] Failed to cleanup orphaned partials: {cleanup_err}")
+
         await update_generation_progress(
             csv_upload_id,
             step="enrichment",
@@ -1541,7 +1569,13 @@ class BundleGenerator:
                     step="finalization",
                     progress=100,
                     status="completed",
-                    message=f"Quick-start complete: 0 bundles (insufficient data: {len(order_lines)} orders)",
+                    message=f"Insufficient order data to generate bundles. Found {len(order_lines)} order lines, need at least 10.",
+                    metadata={
+                        "exit_reason": "insufficient_order_lines",
+                        "order_lines_count": len(order_lines),
+                        "min_required": 10,
+                        "data_issue": True,
+                    },
                 )
                 return {
                     "recommendations": [],
@@ -1550,6 +1584,7 @@ class BundleGenerator:
                         "total_recommendations": 0,
                         "exit_reason": "insufficient_order_lines",
                         "order_lines_count": len(order_lines),
+                        "data_issue": True,
                     },
                     "quick_start": True,
                     "csv_upload_id": csv_upload_id,
@@ -1585,7 +1620,13 @@ class BundleGenerator:
                     step="finalization",
                     progress=100,
                     status="completed",
-                    message=f"Quick-start complete: 0 bundles (insufficient variety: {len(unique_variants)} products)",
+                    message=f"Insufficient product variety for bundles. Found {len(unique_variants)} unique product(s), need at least 2.",
+                    metadata={
+                        "exit_reason": "insufficient_product_variety",
+                        "unique_products": len(unique_variants),
+                        "min_required": 2,
+                        "data_issue": True,
+                    },
                 )
                 return {
                     "recommendations": [],
@@ -1594,6 +1635,7 @@ class BundleGenerator:
                         "total_recommendations": 0,
                         "exit_reason": "insufficient_product_variety",
                         "unique_variants": len(unique_variants),
+                        "data_issue": True,
                     },
                     "quick_start": True,
                     "csv_upload_id": csv_upload_id,
@@ -5251,7 +5293,7 @@ def _build_quick_start_fbt_bundles(
             "support": Decimal(str(min(1.0, count / 50.0))),
             "lift": Decimal(str(1.0 + covis_sim)),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
-            "is_approved": True,
+            "is_approved": False,  # Merchant must approve bundles
             "created_at": datetime.utcnow(),
         })
 
@@ -5337,7 +5379,7 @@ def _build_quick_start_fbt_bundles(
                     "predicted_lift": Decimal(str(1.0 + 0.1 * conf)),
                     "ranking_score": Decimal(str(ranking_score)),
                     "discount_reference": f"__quick_start_{csv_upload_id}__",
-                    "is_approved": True,
+                    "is_approved": False,  # Merchant must approve bundles
                     "created_at": datetime.utcnow(),
                     "features": {
                         "fallback": True,
@@ -5498,7 +5540,7 @@ def _build_quick_start_bogo_bundles(
             "support": Decimal("0.5"),
             "lift": Decimal("1.2"),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
-            "is_approved": True,
+            "is_approved": False,  # Merchant must approve bundles
             "created_at": datetime.utcnow(),
         })
 
@@ -5674,7 +5716,7 @@ def _build_quick_start_volume_bundles(
             "support": Decimal("0.5"),
             "lift": Decimal("1.15"),
             "discount_reference": f"__quick_start_{csv_upload_id}__",
-            "is_approved": True,
+            "is_approved": False,  # Merchant must approve bundles
             "created_at": datetime.utcnow(),
         })
 
