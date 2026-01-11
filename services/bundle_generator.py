@@ -1983,12 +1983,22 @@ class BundleGenerator:
 
             total_duration = (time.time() - pipeline_start) * 1000
 
+            # Safety check: Mark as failed if no bundles were generated
+            bundle_count = len(recommendations)
+            if bundle_count == 0:
+                status = "failed"
+                message = "No bundle patterns detected"
+                logger.warning(f"[{csv_upload_id}] Quick-start completed with 0 bundles - marking as failed")
+            else:
+                status = "completed"
+                message = f"Quick-start complete: {bundle_count} bundles in {total_duration/1000:.1f}s"
+
             await update_generation_progress(
                 csv_upload_id,
                 step="finalization",
                 progress=100,
-                status="completed",
-                message=f"Quick-start complete: {len(recommendations)} bundles in {total_duration/1000:.1f}s",
+                status=status,
+                message=message,
             )
 
             # Build metrics
@@ -2913,6 +2923,12 @@ class BundleGenerator:
                 run_id=pipeline_run_id,
             )
 
+            # Calculate counts for final notification (these were previously undefined)
+            initial_bundle_count = len(all_recommendations)
+            final_bundle_count = len(final_recommendations)
+            drop_count = initial_bundle_count - final_bundle_count
+            ai_metadata = {}  # Populated inside finalize_recommendations but not returned
+
             finalization_duration = int((time.time() - pricing_start) * 1000)
             logger.info(f"[{csv_upload_id}] Phase 7-9: Pricing, AI Copy & Storage - COMPLETED in {finalization_duration}ms")
             metrics["phase_timings"]["phase_7_9_finalization"] = finalization_duration
@@ -3614,12 +3630,21 @@ class BundleGenerator:
             elif final_bundle_count == 0:
                 metrics["phase_timings"]["phase_9_storage"] = 0
 
+            # Safety check: Mark as failed if no bundles were generated
+            if final_bundle_count == 0:
+                status = "failed"
+                message = "No bundle patterns detected"
+                logger.warning(f"[{csv_upload_id}] Bundle generation completed with 0 bundles - marking as failed")
+            else:
+                status = "completed"
+                message = "Bundle generation complete."
+
             await update_generation_progress(
                 csv_upload_id,
                 step="finalization",
                 progress=100,
-                status="completed",
-                message="Bundle generation complete.",
+                status=status,
+                message=message,
                 bundle_count=final_bundle_count if final_bundle_count else None,
                 time_remaining=0,
             )
