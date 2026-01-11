@@ -2167,6 +2167,13 @@ class BundleGenerator:
             self._current_deadline = None
 
         try:
+            # Initialize variables used in finally/except blocks to avoid NameError
+            initial_bundle_count = 0
+            final_bundle_count = 0
+            drop_count = 0
+            ai_metadata: Dict[str, Any] = {}
+            final_recommendations = []
+
             # Phase 1: Data Mapping and Enrichment
             if self.enable_data_mapping and csv_upload_id:
                 phase_start = time.time()
