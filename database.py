@@ -22,6 +22,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # -------------------------------------------------------------------
+# Suppress SQLAlchemy log noise (BEGIN/ROLLBACK spam)
+# Only show warnings and errors (connection failures, slow queries, deadlocks)
+# -------------------------------------------------------------------
+logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+logging.getLogger("sqlalchemy.pool").setLevel(logging.WARNING)
+
+# -------------------------------------------------------------------
 # Engine / Session (CockroachDB compatible)
 # -------------------------------------------------------------------
 DATABASE_URL = os.getenv("DATABASE_URL", "")
@@ -55,7 +62,7 @@ if DATABASE_URL:
     # Supports parallel candidate generation, embedding batches, and optimization engine
     engine = create_async_engine(
         DATABASE_URL,
-        echo=os.getenv("NODE_ENV") == "development",
+        echo=False,  # Suppress BEGIN/ROLLBACK noise - warnings/errors still logged
         pool_size=50,  # Increased to support 40+ parallel Phase 3 tasks
         max_overflow=20,  # Increased from 10 to 20 (Total max: 70 connections)
         pool_pre_ping=True,  # Verify connections before use
@@ -138,7 +145,7 @@ else:
         DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:@/{DB_NAME}?host={SOCKET}"
         engine = create_async_engine(
             DATABASE_URL,
-            echo=os.getenv("NODE_ENV") == "development",
+            echo=False,  # Suppress BEGIN/ROLLBACK noise - warnings/errors still logged
             pool_size=10,
             max_overflow=20,
             pool_pre_ping=True,
@@ -149,7 +156,7 @@ else:
         DATABASE_URL = "sqlite+aiosqlite:///:memory:"
         engine = create_async_engine(
             DATABASE_URL,
-            echo=os.getenv("NODE_ENV") == "development",
+            echo=False,  # Suppress BEGIN/ROLLBACK noise - warnings/errors still logged
             poolclass=StaticPool,
             connect_args={"check_same_thread": False},
         )
