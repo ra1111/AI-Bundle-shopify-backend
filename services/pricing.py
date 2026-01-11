@@ -33,13 +33,13 @@ class BayesianPricingEngine:
         self.category_prior_weight = 0.3
         self.global_prior_weight = 0.1
     
-    async def compute_bundle_pricing(self, bundle_products: List[str], objective: str, 
+    async def compute_bundle_pricing(self, bundle_products: List[str], objective: str,
                                    csv_upload_id: str, bundle_type: str) -> Dict[str, Any]:
         """Compute bundle pricing with Bayesian discount shrinkage"""
         try:
             # ARCHITECT FIX: Preload catalog_map once for in-memory lookups
             catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
-            
+
             # Check if all SKUs exist in catalog - return success=False if missing
             missing_skus = [sku for sku in bundle_products if sku not in catalog_map]
             if missing_skus:
@@ -49,15 +49,19 @@ class BayesianPricingEngine:
                     "error": f"Missing catalog data for SKUs: {missing_skus}",
                     "pricing": {"original_total": Decimal('0'), "bundle_price": Decimal('0'), "discount_amount": Decimal('0')}
                 }
-            
+
+            # PERFORMANCE FIX: Preload ALL order_lines once and build in-memory index
+            # This prevents N+1 queries when falling back to order_lines for pricing
+            order_lines_by_sku = await self._build_order_lines_index(csv_upload_id)
+
             # Get historical data for all products in bundle
             product_data = await self.get_product_pricing_data(bundle_products, csv_upload_id, catalog_map)
-            
+
             # Compute shrunk discount baselines for each product
             shrunk_discounts = {}
             category_priors = await self.compute_category_priors(csv_upload_id)
             global_prior = await self.compute_global_prior(csv_upload_id)
-            
+
             for product_sku in bundle_products:
                 if product_sku in product_data:
                     shrunk_discount = await self.compute_shrunk_discount(
@@ -67,13 +71,13 @@ class BayesianPricingEngine:
                 else:
                     # Fallback for products without historical data
                     shrunk_discounts[product_sku] = self.get_default_discount(objective)
-            
+
             # Apply objective-based caps
             capped_discounts = self.apply_objective_caps(shrunk_discounts, objective)
-            
-            # Compute bundle pricing using preloaded catalog_map
+
+            # Compute bundle pricing using preloaded catalog_map and order_lines index
             bundle_pricing = await self.compute_bundle_totals(
-                bundle_products, capped_discounts, csv_upload_id, bundle_type, catalog_map
+                bundle_products, capped_discounts, csv_upload_id, bundle_type, catalog_map, order_lines_by_sku
             )
             
             return {
@@ -279,9 +283,47 @@ class BayesianPricingEngine:
         caps = self.objective_caps.get(objective, {"min_discount": Decimal('5'), "max_discount": Decimal('20')})
         # Use middle of the range as default
         return (caps["min_discount"] + caps["max_discount"]) / Decimal('2')
-    
-    async def compute_bundle_totals(self, product_skus: List[str], capped_discounts: Dict[str, Decimal], 
-                                  csv_upload_id: str, bundle_type: str, catalog_map: Dict[str, Any]) -> Dict[str, Any]:
+
+    async def _build_order_lines_index(self, csv_upload_id: str) -> Dict[str, List[Any]]:
+        """Build in-memory index of order_lines grouped by SKU/variant_id.
+
+        This prevents N+1 queries when looking up order_lines for pricing fallback.
+        Fetches ALL order_lines once and groups them by both SKU and variant_id.
+        """
+        try:
+            # Fetch ALL order lines in one query
+            order_lines = await storage.get_order_lines(csv_upload_id)
+
+            # Build index: both sku -> lines and variant_id -> lines
+            by_sku = defaultdict(list)
+            for line in order_lines:
+                sku = getattr(line, 'sku', None)
+                variant_id = getattr(line, 'variant_id', None)
+
+                # Index by SKU if present
+                if sku:
+                    sku_str = str(sku).strip()
+                    if sku_str:
+                        by_sku[sku_str].append(line)
+
+                # Also index by variant_id (for products without SKUs)
+                if variant_id:
+                    variant_id_str = str(variant_id).strip()
+                    if variant_id_str:
+                        by_sku[variant_id_str].append(line)
+
+            logger.info(
+                f"[{csv_upload_id}] Built order_lines index: {len(order_lines)} lines -> {len(by_sku)} unique identifiers"
+            )
+            return dict(by_sku)
+
+        except Exception as e:
+            logger.warning(f"Failed to build order_lines index: {e}. Returning empty index.")
+            return {}
+
+    async def compute_bundle_totals(self, product_skus: List[str], capped_discounts: Dict[str, Decimal],
+                                  csv_upload_id: str, bundle_type: str, catalog_map: Dict[str, Any],
+                                  order_lines_by_sku: Optional[Dict[str, List[Any]]] = None) -> Dict[str, Any]:
         """Compute final bundle pricing totals using preloaded catalog_map"""
         try:
             original_total = Decimal('0')
@@ -312,9 +354,10 @@ class BayesianPricingEngine:
                 else:
                     # Architect's fix: Fallback to order_lines pricing when catalog missing
                     logger.info(f"Catalog missing for SKU: {sku}, trying order_lines fallback")
-                    
-                    # Get order lines data for pricing fallback
-                    order_lines = await storage.get_order_lines_by_sku(sku, csv_upload_id)
+
+                    # PERFORMANCE FIX: Use preloaded index instead of N+1 queries
+                    # Old: order_lines = await storage.get_order_lines_by_sku(sku, csv_upload_id)
+                    order_lines = order_lines_by_sku.get(sku, []) if order_lines_by_sku else []
                     if order_lines:
                         # Use average unit_price from order_lines as fallback
                         avg_price = sum(line.unit_price for line in order_lines if line.unit_price) / len(order_lines)
