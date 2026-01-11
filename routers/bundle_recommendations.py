@@ -355,22 +355,20 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         bundle_count = generation_result.get('metrics', {}).get('total_recommendations', 0)
 
                         logger.info(
-                            f"[{csv_upload_id}] ✅ Quick-start completed successfully in {quick_start_overall_duration:.0f}ms\n"
+                            f"[{csv_upload_id}] ✅ Quick-start completed in {quick_start_overall_duration:.0f}ms\n"
                             f"  Bundles: {bundle_count}\n"
                             f"  Duration: {generation_result.get('metrics', {}).get('processing_time_ms', 0) / 1000:.2f}s"
                         )
 
-                        # If quick-start generated 0 bundles, fall through to full pipeline
-                        if bundle_count == 0:
-                            logger.warning(
-                                f"[{csv_upload_id}] ⚠️ Quick-start generated 0 bundles - falling back to full pipeline\n"
-                                f"  This will run the comprehensive generation with all products and ML features\n"
-                                f"  Status will remain 'failed' until full pipeline completes"
-                            )
-                            # Don't return early - fall through to full generation below
-                        else:
-                            # Only mark as completed and return if bundles were actually generated
-                            # Update upload status to completed for quick-start
+                        # Always return early after quick-start (whether 0 or 10 bundles)
+                        # Status is already set correctly by bundle_generator:
+                        #   - bundleCount > 0 → status="completed"
+                        #   - bundleCount = 0 → status="failed"
+                        # If 0 bundles: User can click sync again → quick mode retries
+                        # If >0 bundles: Quick mode succeeded → stop here
+
+                        if bundle_count > 0:
+                            # Update upload status to completed for successful quick-start
                             quick_complete = await storage.safe_mark_upload_completed(csv_upload_id)
                             if quick_complete:
                                 logger.info(f"[{csv_upload_id}] Marked quick-start upload as completed")
@@ -381,16 +379,21 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                             except Exception as notify_exc:
                                 logger.warning(f"Failed to send quick-start notification: {notify_exc}")
 
-                            # DISABLED: Auto-scheduling of full generation after quick-start
-                            # User can manually trigger full generation if needed
                             logger.info(
-                                f"[{csv_upload_id}] ✅ Quick-start complete - NOT scheduling full generation\n"
+                                f"[{csv_upload_id}] ✅ Quick-start SUCCESS - generated {bundle_count} bundles\n"
                                 f"  Quick bundles are ready for immediate use\n"
-                                f"  Full generation can be triggered manually if needed"
+                                f"  NOT running full pipeline (quick mode succeeded)"
+                            )
+                        else:
+                            logger.warning(
+                                f"[{csv_upload_id}] ⚠️ Quick-start generated 0 bundles\n"
+                                f"  Status is marked as 'failed' by bundle_generator\n"
+                                f"  User can click 'Sync Data' again to retry quick mode\n"
+                                f"  NOT falling back to full pipeline automatically"
                             )
 
-                            # Return early - quick-start is complete with bundles
-                            return
+                        # Return early - quick-start is complete (success or failure)
+                        return
 
                     except asyncio.TimeoutError:
                         quick_start_overall_duration = (time.time() - quick_start_overall_start) * 1000
