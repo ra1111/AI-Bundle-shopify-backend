@@ -320,7 +320,8 @@ class StorageService:
                 select(CsvUpload.shop_id).where(CsvUpload.id == csv_upload_id)
             )
             value = result.scalar()
-            return resolve_shop_id(value)
+            # Return sanitized shop_id or None - don't fallback to DEFAULT
+            return sanitize_shop_id(value)
     
     def _overwrite_all_columns(self, table, stmt):
         """Helper to update all columns except primary key(s) in UPSERT operations"""
@@ -336,7 +337,11 @@ class StorageService:
         """Create new CSV upload record"""
         async with self.get_session() as session:
             payload = dict(upload_data)
-            payload["shop_id"] = resolve_shop_id(payload.get("shop_id"))
+            # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+            shop_id = sanitize_shop_id(payload.get("shop_id"))
+            if not shop_id:
+                raise ValueError("shop_id is required for CSV upload")
+            payload["shop_id"] = shop_id
             upload = CsvUpload(**payload)
             session.add(upload)
             await session.commit()
@@ -392,10 +397,13 @@ class StorageService:
             if upload:
                 change_set = dict(updates)
                 if "shop_id" in change_set:
-                    change_set["shop_id"] = resolve_shop_id(
-                        change_set.get("shop_id"),
-                        upload.shop_id
-                    )
+                    # Use new shop_id if valid, else keep existing - NEVER fallback to DEFAULT
+                    new_shop_id = sanitize_shop_id(change_set.get("shop_id"))
+                    existing_shop_id = sanitize_shop_id(upload.shop_id)
+                    final_shop_id = new_shop_id or existing_shop_id
+                    if not final_shop_id:
+                        raise ValueError("Cannot update to empty shop_id")
+                    change_set["shop_id"] = final_shop_id
                 for key, value in change_set.items():
                     setattr(upload, key, value)
                 await session.commit()
@@ -675,8 +683,12 @@ class StorageService:
             result = await session.execute(query)
             return list(result.scalars().all())
     
+    @retry_async(max_retries=3, base_delay=1.0, max_delay=10.0)
     async def get_order_lines(self, csv_upload_id: str) -> List[OrderLine]:
-        """Get order lines for a specific CSV upload"""
+        """Get order lines for a specific CSV upload.
+
+        Retries on transient database errors (connection issues, timeouts).
+        """
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
         async with self.get_session() as session:
@@ -783,16 +795,27 @@ class StorageService:
                 shop_by_upload = {row.id: row.shop_id for row in result.all()}
 
             normalized_rows: List[Dict[str, Any]] = []
-            defaulted_uploads: set[str] = set()
+            missing_shop_ids: set[str] = set()
             missing_upload_refs: set[str] = set()
             for rec in recommendations_data:
                 row = rec.copy()
                 upload_id = row.get("csv_upload_id")
                 explicit_shop = sanitize_shop_id(row.get("shop_id"))
                 fallback_shop = sanitize_shop_id(shop_by_upload.get(upload_id)) if upload_id else None
-                resolved_shop = resolve_shop_id(explicit_shop, fallback_shop)
-                if not explicit_shop and not fallback_shop and upload_id:
-                    defaulted_uploads.add(upload_id)
+
+                # Use explicit shop_id first, then fallback to upload's shop_id
+                resolved_shop = explicit_shop or fallback_shop
+
+                # CRITICAL: Never fallback to DEFAULT_SHOP_ID - fail instead
+                if not resolved_shop:
+                    rec_id = row.get("id", "unknown")
+                    missing_shop_ids.add(f"rec_id={rec_id}, upload_id={upload_id}")
+                    logger.error(
+                        "Bundle recommendation missing shop_id: rec_id=%s, upload_id=%s",
+                        rec_id, upload_id
+                    )
+                    continue  # Skip this bundle - don't save it with wrong shop_id
+
                 if not upload_id:
                     missing_upload_refs.add(str(row.get("id", "")))
                 row["shop_id"] = resolved_shop
@@ -803,11 +826,10 @@ class StorageService:
                     "Bundle recommendations missing csv_upload_id; rec_ids=%s",
                     sorted(r for r in missing_upload_refs if r)
                 )
-            if defaulted_uploads:
-                logger.info(
-                    "Defaulted bundle recommendation shop scope to '%s' for uploads=%s",
-                    DEFAULT_SHOP_ID,
-                    sorted(defaulted_uploads)
+            if missing_shop_ids:
+                logger.error(
+                    "Skipped bundle recommendations with no shop_id: %s",
+                    sorted(missing_shop_ids)
                 )
 
             filtered_rows = self._filter_columns(BundleRecommendation.__table__, normalized_rows)
@@ -927,7 +949,10 @@ class StorageService:
         limit: int = 50
     ) -> List[BundleRecommendation]:
         """Get bundle recommendations scoped to a shop, optionally filtered by upload."""
-        normalized_shop_id = resolve_shop_id(shop_id)
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            raise ValueError("shop_id is required")
 
         async with self.get_session() as session:
             query = select(BundleRecommendation).where(BundleRecommendation.shop_id == normalized_shop_id)
@@ -993,13 +1018,19 @@ class StorageService:
     # Shop sync status operations
     async def get_shop_sync_status(self, shop_id: str) -> Optional[ShopSyncStatus]:
         """Retrieve sync status for a shop."""
-        normalized_shop_id = resolve_shop_id(shop_id)
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            raise ValueError("shop_id is required")
         async with self.get_session() as session:
             return await session.get(ShopSyncStatus, normalized_shop_id)
 
     async def mark_shop_sync_started(self, shop_id: str) -> ShopSyncStatus:
         """Upsert sync status when ingestion begins."""
-        normalized_shop_id = resolve_shop_id(shop_id)
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            raise ValueError("shop_id is required")
         async with self.get_session() as session:
             status = await session.get(ShopSyncStatus, normalized_shop_id)
             now = datetime.utcnow()
@@ -1020,7 +1051,10 @@ class StorageService:
 
     async def mark_shop_sync_completed(self, shop_id: str) -> ShopSyncStatus:
         """Mark the initial ingestion as complete for a shop."""
-        normalized_shop_id = resolve_shop_id(shop_id)
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            raise ValueError("shop_id is required")
         async with self.get_session() as session:
             status = await session.get(ShopSyncStatus, normalized_shop_id)
             now = datetime.utcnow()
@@ -1048,7 +1082,10 @@ class StorageService:
 
         Returns False if initial_sync_completed is True (regular user)
         """
-        normalized_shop_id = resolve_shop_id(shop_id)
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            raise ValueError("shop_id is required")
         async with self.get_session() as session:
             status = await session.get(ShopSyncStatus, normalized_shop_id)
             if not status:
@@ -1095,7 +1132,11 @@ class StorageService:
                     del self._preflight_cache[csv_upload_id]
                     logger.info(f"[{csv_upload_id}] Pre-flight cache expired, fetching fresh data")
 
-            normalized_shop_id = resolve_shop_id(shop_id)
+            # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+            normalized_shop_id = sanitize_shop_id(shop_id)
+            if not normalized_shop_id:
+                logger.error(f"[{csv_upload_id}] Pre-flight failed: invalid shop_id")
+                raise ValueError("shop_id is required")
             logger.info(f"[{csv_upload_id}] Pre-flight: normalized_shop_id={normalized_shop_id}")
 
             async with self.get_session() as session:
@@ -1816,8 +1857,12 @@ class StorageService:
             return list(result.scalars().all())
     
     # Objective Scorer methods
+    @retry_async(max_retries=3, base_delay=1.0, max_delay=10.0)
     async def get_catalog_snapshots_by_upload(self, csv_upload_id: str) -> List[CatalogSnapshot]:
-        """Get all catalog snapshots for an upload"""
+        """Get all catalog snapshots for an upload.
+
+        Retries on transient database errors (connection issues, timeouts).
+        """
         try:
             async with self.get_session() as session:
                 query = select(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)

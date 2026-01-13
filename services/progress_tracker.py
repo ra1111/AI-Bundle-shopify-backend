@@ -19,18 +19,21 @@ logger = logging.getLogger(__name__)
 ProgressStatus = Literal["in_progress", "completed", "failed"]
 
 
-async def _resolve_shop_domain(session, upload_id: str) -> str:
+async def _resolve_shop_domain(session, upload_id: str) -> Optional[str]:
     """Fetch the associated shop domain for an upload."""
+    from settings import sanitize_shop_id
     try:
         result = await session.execute(
             select(CsvUpload.shop_id).where(CsvUpload.id == upload_id)
         )
         shop_id = result.scalar()
         if shop_id:
-            return resolve_shop_id(shop_id)
+            # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+            return sanitize_shop_id(shop_id)
     except Exception:
         logger.exception("Failed to resolve shop domain for upload %s", upload_id)
-    return resolve_shop_id(DEFAULT_SHOP_ID)
+    # Return None instead of DEFAULT - let caller handle missing shop_id
+    return None
 
 
 async def update_generation_progress(

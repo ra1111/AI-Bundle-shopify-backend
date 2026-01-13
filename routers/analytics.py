@@ -19,12 +19,15 @@ router = APIRouter()
 
 @router.get("/dashboard-stats")
 async def get_dashboard_stats(
-    shopId: Optional[str] = None,
+    shopId: str,
     db: AsyncSession = Depends(get_db)
 ):
     """Get dashboard KPI statistics"""
     try:
-        shop_id = resolve_shop_id(shopId)
+        from settings import sanitize_shop_id
+        shop_id = sanitize_shop_id(shopId)
+        if not shop_id:
+            raise HTTPException(status_code=400, detail="shop_id is required")
 
         # Get bundles
         bundles_query = select(Bundle)
@@ -94,12 +97,15 @@ async def get_dashboard_stats(
 
 @router.get("/analytics")
 async def get_analytics(
-    shopId: Optional[str] = None,
+    shopId: str,
     db: AsyncSession = Depends(get_db)
 ):
     """Get analytics data for charts"""
     try:
-        shop_id = resolve_shop_id(shopId)
+        from settings import sanitize_shop_id
+        shop_id = sanitize_shop_id(shopId)
+        if not shop_id:
+            raise HTTPException(status_code=400, detail="shop_id is required")
 
         # Get recommendations for bundle performance
         recommendations_query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)

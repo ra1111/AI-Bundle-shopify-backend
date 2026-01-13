@@ -60,13 +60,16 @@ async def export_bundles(db: AsyncSession = Depends(get_db)):
 
 @router.get("/export/recommendations")
 async def export_recommendations(
-    shopId: Optional[str] = None,
+    shopId: str,
     uploadId: Optional[str] = None,
     db: AsyncSession = Depends(get_db)
 ):
     """Export recommendations as JSON"""
     try:
-        shop_id = resolve_shop_id(shopId)
+        from settings import sanitize_shop_id
+        shop_id = sanitize_shop_id(shopId)
+        if not shop_id:
+            raise HTTPException(status_code=400, detail="shop_id is required")
         from sqlalchemy import select
         
         query = select(BundleRecommendation).where(BundleRecommendation.shop_id == shop_id)
@@ -116,12 +119,15 @@ async def export_recommendations(
 @router.get("/recommendations/{upload_id}/export")
 async def export_csv_recommendations(
     upload_id: str,
-    shopId: Optional[str] = None,
+    shopId: str,
     db: AsyncSession = Depends(get_db)
 ):
     """Export CSV-specific recommendations as CSV format"""
     try:
-        shop_id = resolve_shop_id(shopId)
+        from settings import sanitize_shop_id
+        shop_id = sanitize_shop_id(shopId)
+        if not shop_id:
+            raise HTTPException(status_code=400, detail="shop_id is required")
         from sqlalchemy import select
         
         query = select(BundleRecommendation).where(

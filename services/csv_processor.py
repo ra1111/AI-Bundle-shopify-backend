@@ -190,22 +190,26 @@ class CSVProcessor:
 
             rows = [self._normalize_row_keys(row) for row in raw_rows]
             if not rows:
-                raise ValueError("CSV file is empty")
+                raise ValueError(
+                    "No order data found. AI bundle generation requires order history to identify purchasing patterns. "
+                    "Please ensure your store has at least 10 orders before syncing."
+                )
 
             upload_record = await storage.get_csv_upload(upload_id)
             existing_shop_id = sanitize_shop_id(getattr(upload_record, "shop_id", None)) if upload_record else None
             inferred_shop_id = infer_shop_id_from_rows(rows)
-            final_shop_id = resolve_shop_id(inferred_shop_id, existing_shop_id)
+
+            # Use inferred shop_id if valid, else keep existing - NEVER fallback to DEFAULT
+            final_shop_id = inferred_shop_id or existing_shop_id
+            if not final_shop_id:
+                error_msg = f"Cannot process CSV: No shop_id found (upload_id={upload_id})"
+                logger.error(error_msg)
+                await storage.update_csv_upload_status(upload_id, "failed", error_msg)
+                return
 
             if inferred_shop_id and inferred_shop_id != existing_shop_id:
                 logger.info(
                     "CSV: inferred shop_id=%s from file upload_id=%s",
-                    final_shop_id,
-                    upload_id
-                )
-            elif not existing_shop_id:
-                logger.info(
-                    "CSV: defaulting shop_id=%s for upload_id=%s",
                     final_shop_id,
                     upload_id
                 )

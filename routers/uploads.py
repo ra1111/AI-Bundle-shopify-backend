@@ -90,7 +90,15 @@ async def upload_csv(
         upload_id = str(uuid.uuid4())
         # Use provided runId to correlate multi-file ingests; generate if absent
         effective_run_id = (runId or str(uuid.uuid4())).strip()
-        resolved_shop_id = resolve_shop_id(shopId, shopDomain)
+
+        # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+        from settings import sanitize_shop_id
+        resolved_shop_id = sanitize_shop_id(shopId) or sanitize_shop_id(shopDomain)
+        if not resolved_shop_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Either shopId or shopDomain is required"
+            )
 
         if runId:
             logger.info(f"[{request_id}] Using provided runId={effective_run_id}")

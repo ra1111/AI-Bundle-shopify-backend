@@ -160,7 +160,15 @@ async def shopify_upload(
         )
 
     effective_run_id = (request.run_id or str(uuid4())).strip()
-    resolved_shop_id = resolve_shop_id(request.shop_id)
+
+    # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+    from settings import sanitize_shop_id
+    resolved_shop_id = sanitize_shop_id(request.shop_id)
+    if not resolved_shop_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid shop_id: '{request.shop_id}'. shop_id is required and cannot be empty."
+        )
 
     upload_id = str(uuid4())
     upload = CsvUpload(
@@ -241,7 +249,15 @@ async def shopify_upload_batch(
         )
 
     effective_run_id = (request.run_id or str(uuid4())).strip()
-    resolved_shop_id = resolve_shop_id(request.shop_id)
+
+    # Only sanitize - NEVER fallback to DEFAULT_SHOP_ID
+    from settings import sanitize_shop_id
+    resolved_shop_id = sanitize_shop_id(request.shop_id)
+    if not resolved_shop_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid shop_id: '{request.shop_id}'. shop_id is required and cannot be empty."
+        )
 
     # Create a single "primary" upload record for orders (used for status tracking)
     # All 4 CSVs share the same run_id
@@ -576,7 +592,11 @@ async def get_shop_recommendations(
 ):
     """Fetch bundle recommendations for a shop (optionally restricted to approval state)."""
 
-    normalized_shop_id = resolve_shop_id(shop_id)
+    # Only sanitize - NEVER fallback to a different shop
+    from settings import sanitize_shop_id
+    normalized_shop_id = sanitize_shop_id(shop_id)
+    if not normalized_shop_id:
+        raise HTTPException(status_code=400, detail="Invalid shop_id")
 
     stmt = (
         select(BundleRecommendation)
@@ -631,12 +651,19 @@ async def approve_recommendation(
 ):
     """Mark a recommendation as approved for the given shop."""
 
-    normalized_shop_id = resolve_shop_id(shop_id)
+    # Only sanitize - NEVER fallback to a different shop
+    from settings import sanitize_shop_id
+    normalized_shop_id = sanitize_shop_id(shop_id)
+    if not normalized_shop_id:
+        raise HTTPException(status_code=400, detail="Invalid shop_id")
+
     recommendation = await db.get(BundleRecommendation, recommendation_id)
     if not recommendation:
         raise HTTPException(status_code=404, detail="Recommendation not found")
 
-    if resolve_shop_id(recommendation.shop_id) != normalized_shop_id:
+    # Compare exact shop IDs (both sanitized)
+    rec_shop_id = sanitize_shop_id(recommendation.shop_id)
+    if rec_shop_id != normalized_shop_id:
         raise HTTPException(status_code=403, detail="Not authorized for this shop")
 
     recommendation.is_approved = True
