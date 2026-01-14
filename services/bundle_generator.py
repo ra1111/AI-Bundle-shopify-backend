@@ -1700,31 +1700,60 @@ class BundleGenerator:
                 f"total quantity sold: {sum(variant_sales.values())}"
             )
 
-            # Early exit check: insufficient product variety
+            # Single product case: Generate VOLUME bundles instead of failing
             if len(unique_variants) < 2:
-                logger.warning(
-                    f"[{csv_upload_id}] Quick-start: Insufficient product variety - only {len(unique_variants)} unique products. "
-                    f"Need at least 2 for bundles."
+                logger.info(
+                    f"[{csv_upload_id}] Single product detected ({len(unique_variants)} unique). "
+                    f"Generating volume discount bundles..."
                 )
+
+                # Load catalog for volume bundle generation
+                try:
+                    catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
+                    catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
+                    catalog = {k: v for k, v in catalog.items() if k}
+                except Exception as e:
+                    logger.error(f"[{csv_upload_id}] Failed to load catalog: {e}")
+                    catalog = {}
+
+                # Compute simple product scores
+                product_scores = {}
+                for variant_id, snap in catalog.items():
+                    price = float(getattr(snap, 'price', 0) or 0)
+                    product_scores[variant_id] = min(1.0, price / 100.0)
+
+                # Generate volume bundles for the single product
+                single_product_bundles = _build_catalog_fallback_bundles(
+                    csv_upload_id=csv_upload_id,
+                    catalog=catalog,
+                    product_scores=product_scores,
+                    max_bundles=1  # Just 1 bundle for the single product
+                )
+
                 await update_generation_progress(
                     csv_upload_id,
                     step="finalization",
                     progress=100,
                     status="completed",
-                    message=f"Insufficient product variety for bundles. Found {len(unique_variants)} unique product(s), need at least 2.",
+                    message=f"Generated volume discount bundle (single product catalog)",
+                    bundle_count=len(single_product_bundles),
                     metadata={
-                        "exit_reason": "insufficient_product_variety",
+                        "generation_mode": "single_product_volume",
                         "unique_products": len(unique_variants),
-                        "min_required": 2,
-                        "data_issue": True,
+                        "bundles_generated": len(single_product_bundles),
                     },
                 )
+
+                # Save bundles
+                if single_product_bundles:
+                    await storage.save_bundle_recommendations(single_product_bundles)
+
                 return {
-                    "recommendations": [],
+                    "recommendations": single_product_bundles,
                     "metrics": {
                         "quick_start_mode": True,
-                        "total_recommendations": 0,
-                        "exit_reason": "insufficient_product_variety",
+                        "generation_mode": "single_product_volume",
+                        "total_recommendations": len(single_product_bundles),
                         "unique_variants": len(unique_variants),
                         "data_issue": True,
                     },
