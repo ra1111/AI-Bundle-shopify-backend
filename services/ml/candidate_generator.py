@@ -343,21 +343,27 @@ class CandidateGenerator:
         return ctr
 
     def _materialize_catalog_products(self, catalog_entries: Optional[List[Any]]) -> List[Dict[str, Any]]:
+        """Materialize catalog entries using variant_id as the uniform identifier."""
         products: List[Dict[str, Any]] = []
         if not catalog_entries:
             return products
         for entry in catalog_entries:
-            sku = getattr(entry, "sku", None)
             variant_id = getattr(entry, "variant_id", None)
-            # Use variant_id as fallback when sku is empty (products without SKUs)
-            identifier = sku if sku and str(sku).strip() else variant_id
-            if not identifier:
+            if not variant_id:
                 continue
-            sku_str = str(identifier).strip()
-            if not sku_str:
+
+            variant_id_str = str(variant_id).strip()
+            if not variant_id_str:
                 continue
+
+            # Get SKU for display only (not used as join key)
+            sku = getattr(entry, "sku", None)
+            display_sku = str(sku).strip() if sku else None
+
             product: Dict[str, Any] = {
-                "sku": sku_str,
+                "sku": variant_id_str,  # "sku" field actually stores variant_id for uniform joins
+                "variant_id": variant_id_str,  # Explicit variant_id field
+                "display_sku": display_sku,  # Actual SKU for display only
                 "title": getattr(entry, "product_title", None) or getattr(entry, "title", "") or getattr(entry, "variant_title", ""),
                 "product_type": getattr(entry, "product_type", None) or getattr(entry, "category", None),
                 "product_category": getattr(entry, "product_type", None) or getattr(entry, "category", None),
@@ -377,12 +383,12 @@ class CandidateGenerator:
                 try:
                     product["price"] = float(price)
                 except (TypeError, ValueError) as e:
-                    logger.debug(f"Failed to convert price to float for SKU {sku_str}: {price} - {e}")
+                    logger.debug(f"Failed to convert price to float for variant_id {variant_id_str}: {price} - {e}")
             if compare_at is not None:
                 try:
                     product["compare_at_price"] = float(compare_at)
                 except (TypeError, ValueError) as e:
-                    logger.debug(f"Failed to convert compare_at_price to float for SKU {sku_str}: {compare_at} - {e}")
+                    logger.debug(f"Failed to convert compare_at_price to float for variant_id {variant_id_str}: {compare_at} - {e}")
             products.append(product)
         logger.debug(
             "Materialized catalog entries | input=%d usable=%d",
@@ -894,10 +900,10 @@ class CandidateGenerator:
             return {"candidates": [], "metrics": metrics}
 
     async def get_variantid_to_sku_map(self, csv_upload_id: str) -> Dict[str, str]:
-        """Build a mapping from variant_id to sku using catalog snapshots (run-aware).
+        """Build an identity mapping from variant_id to variant_id (uniform join key).
 
-        IMPORTANT: When SKU is missing, we map variant_id → variant_id as fallback.
-        This ensures products without SKUs can still be used in bundle generation.
+        NOTE: This function name is legacy. It now returns variant_id → variant_id
+        since we use variant_id uniformly as the join key, not SKU.
         """
         try:
             run_id = await storage.get_run_id_for_upload(csv_upload_id)
@@ -905,36 +911,25 @@ class CandidateGenerator:
                 snapshots = await storage.get_catalog_snapshots_by_run(run_id)
             else:
                 snapshots = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+
             mapping = {}
-            sku_count = 0
-            vid_fallback_count = 0
             for s in snapshots:
                 vid = getattr(s, 'variant_id', None)
-                sku = getattr(s, 'sku', None)
                 if vid:
                     vid_str = str(vid)
-                    sku_clean = str(sku).strip() if sku else ""
-                    # Skip synthetic no-sku-* values - treat them as missing
-                    if sku_clean and not sku_clean.startswith('no-sku-'):
-                        # Normal case: map variant_id to real SKU
-                        mapping[vid_str] = sku_clean
-                        sku_count += 1
-                    else:
-                        # Fallback: map variant_id to itself when SKU is missing or synthetic
-                        # This allows SKU-less products to be used in bundles
-                        mapping[vid_str] = vid_str
-                        vid_fallback_count += 1
-            logger.info(f"[{csv_upload_id}] Built variant_id→sku map: {sku_count} with SKU, {vid_fallback_count} using variant_id fallback")
+                    # Identity mapping: variant_id → variant_id (uniform join key)
+                    mapping[vid_str] = vid_str
+
+            logger.info(f"[{csv_upload_id}] Built variant_id identity map: {len(mapping)} variants")
             return mapping
         except Exception as e:
-            logger.warning(f"Error building variant_id→sku map: {e}")
+            logger.warning(f"Error building variant_id map: {e}")
             return {}
     
     async def get_valid_skus_for_csv(self, csv_upload_id: str) -> Set[str]:
-        """Get all valid product identifiers (SKUs or variant_ids as fallback) for the given CSV upload ID.
+        """Get all valid variant_ids for the given CSV upload ID.
 
-        IMPORTANT: When SKU is missing, we use variant_id as a valid identifier.
-        This ensures products without SKUs can still be used in bundle generation.
+        NOTE: This function name is legacy. It now returns variant_ids (uniform join key), not SKUs.
         """
         try:
             # Resolve run_id to aggregate across all related uploads
@@ -944,33 +939,17 @@ class CandidateGenerator:
             else:
                 catalog_entries = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
 
-            valid_identifiers = set()
-            sku_count = 0
-            vid_fallback_count = 0
+            valid_variant_ids = set()
 
             for entry in catalog_entries:
-                sku = getattr(entry, 'sku', None)
                 vid = getattr(entry, 'variant_id', None)
-
-                # Prefer SKU if valid
-                if sku and sku.strip():
-                    sku_str = str(sku).strip()
-                    if (not sku_str.startswith("no-sku-") and
-                        not sku_str.startswith("gid://") and
-                        not sku_str.startswith("null")):
-                        valid_identifiers.add(sku_str)
-                        sku_count += 1
-                        continue
-
-                # Fallback to variant_id when SKU is missing/invalid
                 if vid:
                     vid_str = str(vid).strip()
                     if vid_str:
-                        valid_identifiers.add(vid_str)
-                        vid_fallback_count += 1
+                        valid_variant_ids.add(vid_str)
 
-            logger.info(f"[{csv_upload_id}] Valid identifiers: {len(catalog_entries)} total -> {sku_count} SKUs + {vid_fallback_count} variant_id fallbacks = {len(valid_identifiers)} valid")
-            return valid_identifiers
+            logger.info(f"[{csv_upload_id}] Valid variant_ids: {len(catalog_entries)} total -> {len(valid_variant_ids)} valid")
+            return valid_variant_ids
         except Exception as e:
             logger.warning(f"Error getting valid SKUs for {csv_upload_id}: {e}")
             return set()
@@ -1649,8 +1628,9 @@ class CandidateGenerator:
                     if item.available_total > 0:
                         include_as_anchor = True
                 
-                if include_as_anchor and item.sku:
-                    anchors.append(item.sku)
+                # Use variant_id as the uniform join key (not SKU)
+                if include_as_anchor and item.variant_id:
+                    anchors.append(item.variant_id)
             
             return anchors[:50]  # Limit number of anchors
             

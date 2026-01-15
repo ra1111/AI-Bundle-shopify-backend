@@ -579,10 +579,10 @@ class DataMapper:
 
         catalog_map = self._catalog_map_by_scope.get(scope, {})
         if catalog_map:
-            for sku, snapshot in catalog_map.items():
-                if not sku:
+            for variant_id, snapshot in catalog_map.items():
+                if not variant_id:
                     continue
-                cache_key = self._product_cache_key(scope, sku)
+                cache_key = self._product_cache_key(scope, variant_id)
                 if cache_key not in self._product_meta_cache:
                     self._product_meta_cache[cache_key] = self._convert_snapshot_to_product_data(snapshot)
 
@@ -631,72 +631,59 @@ class DataMapper:
         resolved_variant_obj = None
         resolved_variant_id: Optional[str] = None
 
-        # PRIORITY FIX: Try variant_id FIRST (Quickstart uses variant_id, not SKU)
-        # Only fall back to SKU if variant_id fails
+        # UNIFORM JOIN KEY: Use variant_id as the sole join key (not SKU)
+        # variant_id is the stable, always-present Shopify identifier
+        if not line_vid:
+            # No variant_id = cannot resolve (Shopify always provides variant_id)
+            metrics["unresolved_skus"] += 1
+            return {
+                "index": index,
+                "metrics": metrics,
+                "unresolved_sample": sku or "no_variant_id",
+                "enriched_line": None,
+            }
+
+        # Lookup by variant_id only
         if run_id:
-            # Try variant_id first (primary join key for Quickstart)
-            if line_vid:
-                resolved_variant_obj = scope_variant_id_map.get(line_vid)
-            # Fall back to SKU if variant_id didn't work
-            if not resolved_variant_obj and sku:
-                resolved_variant_obj = scope_variant_map.get(sku)
-            # Database fallbacks
-            if feature_flags.get_flag("data_mapping.enable_run_scope_fallback", True) and not resolved_variant_obj:
-                if line_vid:
-                    resolved_variant_obj = await storage.get_variant_by_id_run(line_vid, run_id)
-                if not resolved_variant_obj and sku:
-                    resolved_variant_obj = await storage.get_variant_by_sku_run(sku, run_id)
-                if not resolved_variant_obj and line_vid:
-                    resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
-                if not resolved_variant_obj and sku:
-                    resolved_variant_obj = await storage.get_variant_by_sku(sku, csv_upload_id)
+            resolved_variant_obj = scope_variant_id_map.get(line_vid)
+            if not resolved_variant_obj and feature_flags.get_flag("data_mapping.enable_run_scope_fallback", True):
+                resolved_variant_obj = await storage.get_variant_by_id_run(line_vid, run_id)
+            if not resolved_variant_obj:
+                resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
         else:
-            # Try variant_id first (primary join key for Quickstart)
-            if line_vid:
-                resolved_variant_obj = scope_variant_id_map.get(line_vid)
-            # Fall back to SKU if variant_id didn't work
-            if not resolved_variant_obj and sku:
-                resolved_variant_obj = scope_variant_map.get(sku)
-            if not resolved_variant_obj and sku:
-                variant_id = await self.resolve_variant_from_sku(sku, csv_upload_id)
-                if variant_id:
-                    resolved_variant_id = variant_id
-            if not resolved_variant_obj and resolved_variant_id:
-                resolved_variant_obj = scope_variant_id_map.get(resolved_variant_id) or await storage.get_variant_by_id(
-                    resolved_variant_id, csv_upload_id
-                )
+            resolved_variant_obj = scope_variant_id_map.get(line_vid)
+            if not resolved_variant_obj:
+                resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
             if not resolved_variant_obj and line_vid:
                 resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
 
-        if resolved_variant_obj and not resolved_variant_id:
+        # Use variant_id from resolved object or from line
+        if resolved_variant_obj:
             resolved_variant_id = getattr(resolved_variant_obj, "variant_id", None)
-
-        if not resolved_variant_id and line_vid:
+        if not resolved_variant_id:
             resolved_variant_id = line_vid
 
         if not resolved_variant_id:
             metrics["unresolved_skus"] += 1
-            sample = sku or line_vid
             return {
                 "index": index,
                 "metrics": metrics,
-                "unresolved_sample": sample,
+                "unresolved_sample": line_vid or sku or "unknown",
                 "enriched_line": None,
             }
 
         metrics["resolved_variants"] += 1
 
+        # Cache by variant_id (primary key)
         if resolved_variant_obj:
             scope_variant_id_map.setdefault(resolved_variant_id, resolved_variant_obj)
+            # Also cache by SKU if available (for backward compat display only)
             variant_sku = getattr(resolved_variant_obj, "sku", None)
             if variant_sku:
                 scope_variant_map.setdefault(variant_sku, resolved_variant_obj)
 
-        if sku:
-            self.resolved_variant_cache[sku] = resolved_variant_id
-
+        # Get product data using variant_id (not SKU)
         product_data = await self._get_product_data(
-            sku or (getattr(resolved_variant_obj, "sku", None) if resolved_variant_obj else None),
             resolved_variant_id,
             csv_upload_id,
             scope,
@@ -723,10 +710,13 @@ class DataMapper:
         else:
             stock_available = inventory_data.get("available_total", 0)
 
+        # Get SKU from variant for display purposes (not used as join key)
+        display_sku = getattr(resolved_variant_obj, "sku", None) if resolved_variant_obj else sku
+
         enriched_line = {
             "order_line_id": line.id,
-            "sku": sku,
-            "variant_id": resolved_variant_id,
+            "variant_id": resolved_variant_id,  # Primary join key
+            "sku": display_sku,  # Display metadata only (not used for joins)
             "inventory_item_id": inventory_item_id,
             "product_data": product_data,
             "inventory_data": inventory_data,
@@ -750,8 +740,9 @@ class DataMapper:
             "enriched_line": enriched_line,
         }
 
-    def _product_cache_key(self, scope: str, sku: str) -> str:
-        return f"{scope}::{sku}"
+    def _product_cache_key(self, scope: str, variant_id: str) -> str:
+        """Generate cache key using variant_id (uniform join key)."""
+        return f"{scope}::{variant_id}"
 
     def _normalize_text(self, value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -807,48 +798,33 @@ class DataMapper:
 
     async def _get_product_data(
         self,
-        sku: Optional[str],
-        variant_id: Optional[str],
+        variant_id: str,
         csv_upload_id: str,
         scope: str,
         catalog_map: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        # PRIORITY FIX: Try variant_id FIRST (Quickstart primary key)
-        # Try variant_id lookup in catalog map
-        if variant_id:
-            snapshot = next(
-                (snap for snap in catalog_map.values() if getattr(snap, "variant_id", None) == variant_id),
-                None,
-            )
-            if snapshot:
-                product_data = self._convert_snapshot_to_product_data(snapshot)
-                # Cache by both variant_id and SKU for future lookups
-                sku_value = getattr(snapshot, "sku", None)
-                if sku_value:
-                    self._product_meta_cache[self._product_cache_key(scope, sku_value)] = product_data
-                return product_data
+        """Get product data using variant_id as the uniform join key."""
+        if not variant_id:
+            return None
 
-        # Fall back to SKU lookup only if variant_id failed
-        sku_key = sku or ""
-        if sku_key:
-            cache_key = self._product_cache_key(scope, sku_key)
-            cached = self._product_meta_cache.get(cache_key)
-            if cached:
-                return cached
-            snapshot = catalog_map.get(sku_key)
-            if snapshot:
-                product_data = self._convert_snapshot_to_product_data(snapshot)
-                self._product_meta_cache[cache_key] = product_data
-                return product_data
+        # Check cache by variant_id
+        cache_key = self._product_cache_key(scope, variant_id)
+        cached = self._product_meta_cache.get(cache_key)
+        if cached:
+            return cached
 
-        # Database fallback
-        if variant_id:
-            product_data = await self.get_product_data_for_variant(variant_id, csv_upload_id)
-            if product_data and sku_key:
-                self._product_meta_cache[self._product_cache_key(scope, sku_key)] = product_data
+        # Lookup in catalog_map by variant_id (catalog_map is keyed by variant_id now)
+        snapshot = catalog_map.get(variant_id)
+        if snapshot:
+            product_data = self._convert_snapshot_to_product_data(snapshot)
+            self._product_meta_cache[cache_key] = product_data
             return product_data
 
-        return None
+        # Database fallback
+        product_data = await self.get_product_data_for_variant(variant_id, csv_upload_id)
+        if product_data:
+            self._product_meta_cache[cache_key] = product_data
+        return product_data
 
     async def _get_inventory_data(
         self,
