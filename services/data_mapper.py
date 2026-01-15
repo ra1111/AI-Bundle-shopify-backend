@@ -624,28 +624,39 @@ class DataMapper:
         sku = getattr(line, "sku", None)
         line_vid = getattr(line, "variant_id", None)
 
+        # Skip synthetic no-sku-* placeholders - treat them as missing SKUs
+        if sku and sku.startswith("no-sku-"):
+            sku = None
+
         resolved_variant_obj = None
         resolved_variant_id: Optional[str] = None
 
+        # PRIORITY FIX: Try variant_id FIRST (Quickstart uses variant_id, not SKU)
+        # Only fall back to SKU if variant_id fails
         if run_id:
-            if sku:
-                resolved_variant_obj = scope_variant_map.get(sku)
-            if not resolved_variant_obj and line_vid:
+            # Try variant_id first (primary join key for Quickstart)
+            if line_vid:
                 resolved_variant_obj = scope_variant_id_map.get(line_vid)
+            # Fall back to SKU if variant_id didn't work
+            if not resolved_variant_obj and sku:
+                resolved_variant_obj = scope_variant_map.get(sku)
+            # Database fallbacks
             if feature_flags.get_flag("data_mapping.enable_run_scope_fallback", True) and not resolved_variant_obj:
-                if sku:
-                    resolved_variant_obj = await storage.get_variant_by_sku_run(sku, run_id)
-                if not resolved_variant_obj and line_vid:
+                if line_vid:
                     resolved_variant_obj = await storage.get_variant_by_id_run(line_vid, run_id)
                 if not resolved_variant_obj and sku:
+                    resolved_variant_obj = await storage.get_variant_by_sku_run(sku, run_id)
+                if not resolved_variant_obj and line_vid:
+                    resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
+                if not resolved_variant_obj and sku:
                     resolved_variant_obj = await storage.get_variant_by_sku(sku, csv_upload_id)
-            if not resolved_variant_obj and line_vid:
-                resolved_variant_obj = await storage.get_variant_by_id(line_vid, csv_upload_id)
         else:
-            if sku:
-                resolved_variant_obj = scope_variant_map.get(sku)
-            if not resolved_variant_obj and line_vid:
+            # Try variant_id first (primary join key for Quickstart)
+            if line_vid:
                 resolved_variant_obj = scope_variant_id_map.get(line_vid)
+            # Fall back to SKU if variant_id didn't work
+            if not resolved_variant_obj and sku:
+                resolved_variant_obj = scope_variant_map.get(sku)
             if not resolved_variant_obj and sku:
                 variant_id = await self.resolve_variant_from_sku(sku, csv_upload_id)
                 if variant_id:
@@ -802,6 +813,22 @@ class DataMapper:
         scope: str,
         catalog_map: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        # PRIORITY FIX: Try variant_id FIRST (Quickstart primary key)
+        # Try variant_id lookup in catalog map
+        if variant_id:
+            snapshot = next(
+                (snap for snap in catalog_map.values() if getattr(snap, "variant_id", None) == variant_id),
+                None,
+            )
+            if snapshot:
+                product_data = self._convert_snapshot_to_product_data(snapshot)
+                # Cache by both variant_id and SKU for future lookups
+                sku_value = getattr(snapshot, "sku", None)
+                if sku_value:
+                    self._product_meta_cache[self._product_cache_key(scope, sku_value)] = product_data
+                return product_data
+
+        # Fall back to SKU lookup only if variant_id failed
         sku_key = sku or ""
         if sku_key:
             cache_key = self._product_cache_key(scope, sku_key)
@@ -814,18 +841,7 @@ class DataMapper:
                 self._product_meta_cache[cache_key] = product_data
                 return product_data
 
-        if variant_id:
-            snapshot = next(
-                (snap for snap in catalog_map.values() if getattr(snap, "variant_id", None) == variant_id),
-                None,
-            )
-            if snapshot:
-                product_data = self._convert_snapshot_to_product_data(snapshot)
-                sku_value = getattr(snapshot, "sku", None)
-                if sku_value:
-                    self._product_meta_cache[self._product_cache_key(scope, sku_value)] = product_data
-                return product_data
-
+        # Database fallback
         if variant_id:
             product_data = await self.get_product_data_for_variant(variant_id, csv_upload_id)
             if product_data and sku_key:

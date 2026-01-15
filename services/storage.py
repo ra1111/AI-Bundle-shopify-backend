@@ -79,6 +79,20 @@ class StorageService:
     RETRY_MAX_ATTEMPTS = 3
     RETRY_BASE_DELAY = 0.5  # seconds
 
+    @staticmethod
+    def _convert_decimals_to_float(obj):
+        """Recursively convert Decimal values to float for JSON serialization."""
+        from decimal import Decimal
+
+        if isinstance(obj, Decimal):
+            return float(obj)
+        elif isinstance(obj, dict):
+            return {k: StorageService._convert_decimals_to_float(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [StorageService._convert_decimals_to_float(item) for item in obj]
+        else:
+            return obj
+
     async def _with_retry(self, operation, *args, **kwargs):
         """
         Execute a database operation with automatic retry on transient failures.
@@ -833,6 +847,12 @@ class StorageService:
                 )
 
             filtered_rows = self._filter_columns(BundleRecommendation.__table__, normalized_rows)
+
+            # Convert Decimal values to float in JSON fields to prevent serialization errors
+            for row in filtered_rows:
+                for json_field in ['products', 'pricing', 'ai_copy']:
+                    if json_field in row and row[json_field]:
+                        row[json_field] = self._convert_decimals_to_float(row[json_field])
 
             # Remove any existing recommendations with matching IDs to support upsert-like behaviour
             existing_ids = [row.get("id") for row in filtered_rows if row.get("id")]
