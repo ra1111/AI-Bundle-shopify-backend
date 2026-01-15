@@ -177,11 +177,29 @@ class DataMapper:
         logger.warning(f"Could not resolve variant_id for SKU: {sku}")
         return None
 
-    async def enrich_order_lines_with_variants(self, csv_upload_id: str) -> Dict[str, Any]:
-        """Enrich order lines with variant mappings and compute metrics"""
+    async def enrich_order_lines_with_variants(
+        self,
+        csv_upload_id: str,
+        catalog_upload_id: Optional[str] = None,
+        variants_upload_id: Optional[str] = None,
+        inventory_upload_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Enrich order lines with variant mappings and compute metrics.
+
+        Args:
+            csv_upload_id: The orders upload ID
+            catalog_upload_id: Optional separate catalog upload ID (for Quickstart mode)
+            variants_upload_id: Optional separate variants upload ID (for Quickstart mode)
+            inventory_upload_id: Optional separate inventory upload ID (for Quickstart mode)
+        """
         import traceback
-        
+
         logger.info(f"[{csv_upload_id}] 🔄 DataMapper.enrich_order_lines_with_variants STARTED")
+        if catalog_upload_id or variants_upload_id or inventory_upload_id:
+            logger.info(
+                f"[{csv_upload_id}] Using separate upload IDs: "
+                f"catalog={catalog_upload_id}, variants={variants_upload_id}, inventory={inventory_upload_id}"
+            )
         
         metrics = {
             "total_order_lines": 0,
@@ -289,7 +307,14 @@ class DataMapper:
                 },
             ):
                 prefetch_start = time.perf_counter() if timing_enabled else None
-                prefetch_data = await self._prefetch_data(csv_upload_id, run_id, order_lines)
+                prefetch_data = await self._prefetch_data(
+                    csv_upload_id,
+                    run_id,
+                    order_lines,
+                    catalog_upload_id=catalog_upload_id,
+                    variants_upload_id=variants_upload_id,
+                    inventory_upload_id=inventory_upload_id,
+                )
                 if timing_enabled and prefetch_start is not None:
                     prefetch_duration = time.perf_counter() - prefetch_start
             
@@ -467,8 +492,25 @@ class DataMapper:
             )
             raise
 
-    async def _prefetch_data(self, csv_upload_id: str, run_id: Optional[str], _order_lines: List[Any]) -> Dict[str, Any]:
-        """Prefetch catalog, variant, and inventory data to minimize per-row I/O."""
+    async def _prefetch_data(
+        self,
+        csv_upload_id: str,
+        run_id: Optional[str],
+        _order_lines: List[Any],
+        catalog_upload_id: Optional[str] = None,
+        variants_upload_id: Optional[str] = None,
+        inventory_upload_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Prefetch catalog, variant, and inventory data to minimize per-row I/O.
+
+        Args:
+            csv_upload_id: The orders upload ID
+            run_id: The run ID correlating all uploads
+            _order_lines: Order lines to prefetch for
+            catalog_upload_id: Optional separate catalog upload ID (fixes Quickstart bug)
+            variants_upload_id: Optional separate variants upload ID (fixes Quickstart bug)
+            inventory_upload_id: Optional separate inventory upload ID (fixes Quickstart bug)
+        """
         scope = self._scope_key(csv_upload_id, run_id)
         self._maybe_expire_scope(scope)
         if not feature_flags.get_flag("data_mapping.prefetch_enabled", True):
@@ -483,21 +525,26 @@ class DataMapper:
 
         tasks: Dict[str, asyncio.Task] = {}
 
+        # Use separate upload IDs if provided (Quickstart mode fix), otherwise fall back to run_id or csv_upload_id
+        effective_variants_upload_id = variants_upload_id or csv_upload_id
+        effective_catalog_upload_id = catalog_upload_id or csv_upload_id
+        effective_inventory_upload_id = inventory_upload_id or csv_upload_id
+
         if scope not in self._variant_map_by_scope or scope not in self._variant_id_map_by_scope:
             tasks["variant_maps"] = asyncio.create_task(
-                storage.get_variant_maps_by_run(run_id) if run_id else storage.get_variant_maps(csv_upload_id)
+                storage.get_variant_maps_by_run(run_id) if run_id and not variants_upload_id else storage.get_variant_maps(effective_variants_upload_id)
             )
 
         if scope not in self._inventory_map_by_scope:
             tasks["inventory_map"] = asyncio.create_task(
-                storage.get_inventory_levels_map_by_run(run_id) if run_id else storage.get_inventory_levels_map(csv_upload_id)
+                storage.get_inventory_levels_map_by_run(run_id) if run_id and not inventory_upload_id else storage.get_inventory_levels_map(effective_inventory_upload_id)
             )
 
         if scope not in self._catalog_map_by_scope:
             tasks["catalog_map"] = asyncio.create_task(
                 storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
-                if run_id
-                else storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+                if run_id and not catalog_upload_id
+                else storage.get_catalog_snapshots_map_by_variant(effective_catalog_upload_id)
             )
 
         if tasks:

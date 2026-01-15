@@ -1443,7 +1443,10 @@ class BundleGenerator:
         csv_upload_id: str,
         max_products: int = 50,
         max_bundles: int = 10,
-        timeout_seconds: int = 120
+        timeout_seconds: int = 120,
+        catalog_upload_id: Optional[str] = None,
+        variants_upload_id: Optional[str] = None,
+        inventory_upload_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Generate quick preview bundles for first-time installations.
 
@@ -1455,10 +1458,13 @@ class BundleGenerator:
         - Skips expensive ML phases
 
         Args:
-            csv_upload_id: Upload ID to process
+            csv_upload_id: Orders upload ID to process
             max_products: Maximum products to consider (default: 50)
             max_bundles: Maximum bundles to generate (default: 10)
             timeout_seconds: Hard timeout in seconds (default: 120)
+            catalog_upload_id: Optional separate catalog upload ID (for Quickstart mode)
+            variants_upload_id: Optional separate variants upload ID (for Quickstart mode)
+            inventory_upload_id: Optional separate inventory upload ID (for Quickstart mode)
 
         Returns:
             Dict with recommendations, metrics, and quick_start flag
@@ -1573,7 +1579,13 @@ class BundleGenerator:
                 logger.info(f"[{csv_upload_id}] 📦 PHASE 2: Loading catalog for fallback generation...")
                 catalog_phase_start = time.time()
                 try:
-                    catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
+                    # Use separate catalog_upload_id if provided (Quickstart mode fix)
+                    effective_catalog_id = catalog_upload_id or csv_upload_id
+                    if catalog_upload_id:
+                        logger.info(
+                            f"[{csv_upload_id}] Using separate catalog upload ID: {catalog_upload_id}"
+                        )
+                    catalog_snaps = await storage.get_catalog_snapshot(effective_catalog_id)
                     catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
                     catalog = {k: v for k, v in catalog.items() if k}
                     logger.info(
@@ -2194,10 +2206,29 @@ class BundleGenerator:
         finally:
             self._current_deadline = None
 
-    async def generate_bundle_recommendations(self, csv_upload_id: str) -> Dict[str, Any]:
-        """Generate bundle recommendations using comprehensive v2 pipeline"""
+    async def generate_bundle_recommendations(
+        self,
+        csv_upload_id: str,
+        catalog_upload_id: Optional[str] = None,
+        variants_upload_id: Optional[str] = None,
+        inventory_upload_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Generate bundle recommendations using comprehensive v2 pipeline.
+
+        Args:
+            csv_upload_id: The orders upload ID
+            catalog_upload_id: Optional separate catalog upload ID (for Quickstart mode)
+            variants_upload_id: Optional separate variants upload ID (for Quickstart mode)
+            inventory_upload_id: Optional separate inventory upload ID (for Quickstart mode)
+        """
         if not csv_upload_id:
             raise ValueError("csv_upload_id is required")
+
+        if catalog_upload_id or variants_upload_id or inventory_upload_id:
+            logger.info(
+                f"[{csv_upload_id}] Using separate upload IDs for Quickstart: "
+                f"catalog={catalog_upload_id}, variants={variants_upload_id}, inventory={inventory_upload_id}"
+            )
 
         await update_generation_progress(
             csv_upload_id,
@@ -2298,7 +2329,12 @@ class BundleGenerator:
             if self.enable_data_mapping and csv_upload_id:
                 phase_start = time.time()
                 logger.info(f"[{csv_upload_id}] Phase 1: Data Mapping & Enrichment - STARTED")
-                data_mapping_result = await self.data_mapper.enrich_order_lines_with_variants(csv_upload_id)
+                data_mapping_result = await self.data_mapper.enrich_order_lines_with_variants(
+                    csv_upload_id,
+                    catalog_upload_id=catalog_upload_id,
+                    variants_upload_id=variants_upload_id,
+                    inventory_upload_id=inventory_upload_id,
+                )
                 phase_duration = int((time.time() - phase_start) * 1000)
                 enrichment_metrics = data_mapping_result.get("metrics", {})
                 total_order_lines = enrichment_metrics.get('total_order_lines', 0)

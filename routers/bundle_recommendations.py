@@ -12,10 +12,10 @@ import os
 import time
 from datetime import datetime
 
-from database import get_db, BundleRecommendation
+from database import get_db, BundleRecommendation, AsyncSessionLocal
 from services.bundle_generator import BundleGenerator
 from services.progress_tracker import update_generation_progress
-from routers.uploads import _resolve_orders_upload, _ensure_data_ready
+from routers.uploads import _resolve_orders_upload, _ensure_data_ready, _resolve_all_uploads_from_run
 from settings import resolve_shop_id
 from services.storage import storage
 from services.pipeline_scheduler import pipeline_scheduler
@@ -243,21 +243,42 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
             shop_id = lock_context["shop_id"]
             
             logger.info(f"Acquired bundle generation lock for shop {shop_id} (CSV upload {csv_upload_id})")
-            
+
             # Atomically update status with precondition check
             logger.info(f"Bundle generation {scope}: updating CSV upload status to generating_bundles (resume={resume_only})")
             expected_status = "bundle_generation_async" if resume_only else None
             status_update = await concurrency_controller.atomic_status_update_with_precondition(
-                csv_upload_id, 
+                csv_upload_id,
                 "generating_bundles",
                 expected_current_status=expected_status
             )
-            
+
             if not status_update["success"]:
                 logger.error(f"Failed to update CSV upload {csv_upload_id} status: {status_update['error']}")
                 return
-            
+
             logger.info(f"Status updated: {status_update['previous_status']} -> {status_update['new_status']}")
+
+            # Resolve all 4 upload IDs (orders, catalog, variants, inventory) from the run
+            # This fixes the Quickstart bug where each data type has a separate upload ID
+            catalog_upload_id = None
+            variants_upload_id = None
+            inventory_upload_id = None
+            try:
+                async with AsyncSessionLocal() as db:
+                    orders_id, catalog_id, variants_id, inventory_id, run_id = await _resolve_all_uploads_from_run(csv_upload_id, db)
+                    catalog_upload_id = catalog_id
+                    variants_upload_id = variants_id
+                    inventory_upload_id = inventory_id
+                    logger.info(
+                        f"[{csv_upload_id}] Resolved upload IDs: "
+                        f"orders={orders_id}, catalog={catalog_id}, variants={variants_id}, inventory={inventory_id}"
+                    )
+            except Exception as resolve_exc:
+                logger.warning(
+                    f"[{csv_upload_id}] Could not resolve all upload IDs (likely single upload, not Quickstart): {resolve_exc}. "
+                    f"Continuing with csv_upload_id={csv_upload_id} for all data types."
+                )
 
             try:
                 # Check if this is a first-time installation and quick-start is enabled
@@ -350,7 +371,10 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                                 csv_upload_id,
                                 max_products=QUICK_START_MAX_PRODUCTS,
                                 max_bundles=QUICK_START_MAX_BUNDLES,
-                                timeout_seconds=QUICK_START_TIMEOUT_SECONDS
+                                timeout_seconds=QUICK_START_TIMEOUT_SECONDS,
+                                catalog_upload_id=catalog_upload_id,
+                                variants_upload_id=variants_upload_id,
+                                inventory_upload_id=inventory_upload_id,
                             ),
                             timeout=float(QUICK_START_TIMEOUT_SECONDS + 30)  # Extra 30s buffer
                         )
@@ -475,14 +499,24 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 try:
                     if BUNDLE_GENERATION_HARD_TIMEOUT_ENABLED:
                         generation_result = await asyncio.wait_for(
-                            generator.generate_bundle_recommendations(csv_upload_id),
+                            generator.generate_bundle_recommendations(
+                                csv_upload_id,
+                                catalog_upload_id=catalog_upload_id,
+                                variants_upload_id=variants_upload_id,
+                                inventory_upload_id=inventory_upload_id,
+                            ),
                             timeout=float(BUNDLE_GENERATION_TIMEOUT_SECONDS),
                         )
                         logger.info("Bundle generation %s: generator completed without hard-timeout", scope)
                     else:
                         # Launch soft watchdog and run without hard timeout to measure true runtime
                         watchdog_task = asyncio.create_task(_soft_watchdog(csv_upload_id, start_time))
-                        generation_result = await generator.generate_bundle_recommendations(csv_upload_id)
+                        generation_result = await generator.generate_bundle_recommendations(
+                            csv_upload_id,
+                            catalog_upload_id=catalog_upload_id,
+                            variants_upload_id=variants_upload_id,
+                            inventory_upload_id=inventory_upload_id,
+                        )
                         logger.info("Bundle generation %s: generator completed under soft-watchdog mode", scope)
                 except asyncio.TimeoutError:
                     logger.error(
@@ -890,8 +924,28 @@ def _run_full_generation_after_quickstart(csv_upload_id: str, shop_id: str):
             from services.bundle_generator import BundleGenerator
             generator = BundleGenerator()
 
+            # Resolve all upload IDs for full generation
+            catalog_upload_id = None
+            variants_upload_id = None
+            inventory_upload_id = None
+            try:
+                async with AsyncSessionLocal() as db:
+                    _, catalog_id, variants_id, inventory_id, _ = await _resolve_all_uploads_from_run(csv_upload_id, db)
+                    catalog_upload_id = catalog_id
+                    variants_upload_id = variants_id
+                    inventory_upload_id = inventory_id
+            except Exception as resolve_exc:
+                logger.warning(
+                    f"[{csv_upload_id}] Could not resolve upload IDs for full generation: {resolve_exc}"
+                )
+
             # Use the normal generate_bundle_recommendations method
-            generation_result = await generator.generate_bundle_recommendations(csv_upload_id)
+            generation_result = await generator.generate_bundle_recommendations(
+                csv_upload_id,
+                catalog_upload_id=catalog_upload_id,
+                variants_upload_id=variants_upload_id,
+                inventory_upload_id=inventory_upload_id,
+            )
 
             total_recs = generation_result.get('metrics', {}).get('total_recommendations', 0)
 

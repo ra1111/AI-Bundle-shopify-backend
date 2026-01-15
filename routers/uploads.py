@@ -277,9 +277,82 @@ async def _get_run_upload(db: AsyncSession, run_id: Optional[str], csv_type: str
     return result.scalars().first()
 
 
+async def _resolve_all_uploads_from_run(csv_upload_id: str, db: AsyncSession) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
+    """
+    Resolve all 4 upload IDs (orders, catalog, variants, inventory) from a given csv_upload_id.
+    Returns: (orders_upload_id, catalog_upload_id, variants_upload_id, inventory_upload_id, run_id)
+
+    This fixes the issue where Quickstart creates separate uploads for each data type,
+    but the system was only resolving orders_upload_id and assuming all data shared the same ID.
+    """
+    upload = await db.get(CsvUpload, csv_upload_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    run_id = upload.run_id
+    if not run_id:
+        raise HTTPException(status_code=400, detail="Run ID required to resolve associated uploads")
+
+    # Query all 4 upload types in parallel
+    orders_query = select(CsvUpload).where(CsvUpload.run_id == run_id, CsvUpload.csv_type == 'orders').order_by(desc(CsvUpload.created_at)).limit(1)
+    catalog_query = select(CsvUpload).where(CsvUpload.run_id == run_id, CsvUpload.csv_type == 'catalog_joined').order_by(desc(CsvUpload.created_at)).limit(1)
+    variants_query = select(CsvUpload).where(CsvUpload.run_id == run_id, CsvUpload.csv_type == 'variants').order_by(desc(CsvUpload.created_at)).limit(1)
+    inventory_query = select(CsvUpload).where(CsvUpload.run_id == run_id, CsvUpload.csv_type == 'inventory_levels').order_by(desc(CsvUpload.created_at)).limit(1)
+
+    orders_result = await db.execute(orders_query)
+    catalog_result = await db.execute(catalog_query)
+    variants_result = await db.execute(variants_query)
+    inventory_result = await db.execute(inventory_query)
+
+    orders_upload = orders_result.scalars().first()
+    catalog_upload = catalog_result.scalars().first()
+    variants_upload = variants_result.scalars().first()
+    inventory_upload = inventory_result.scalars().first()
+
+    orders_upload_id = orders_upload.id if orders_upload else None
+    catalog_upload_id = catalog_upload.id if catalog_upload else None
+    variants_upload_id = variants_upload.id if variants_upload else None
+    inventory_upload_id = inventory_upload.id if inventory_upload else None
+
+    if not orders_upload_id:
+        raise HTTPException(status_code=400, detail=f"No orders upload found for run {run_id}")
+
+    logger.info(
+        f"✅ Resolved run_id {run_id} -> orders={orders_upload_id}, catalog={catalog_upload_id}, "
+        f"variants={variants_upload_id}, inventory={inventory_upload_id}"
+    )
+
+    return orders_upload_id, catalog_upload_id, variants_upload_id, inventory_upload_id, run_id
+
+
 async def _ensure_data_ready(orders_upload_id: str, run_id: Optional[str], db: AsyncSession) -> None:
+    # Resolve all upload IDs (orders, catalog, variants, inventory) for Quickstart fix
+    catalog_upload_id = None
+    variants_upload_id = None
+    inventory_upload_id = None
+    if run_id:
+        try:
+            _, catalog_id, variants_id, inventory_id, _ = await _resolve_all_uploads_from_run(orders_upload_id, db)
+            catalog_upload_id = catalog_id
+            variants_upload_id = variants_id
+            inventory_upload_id = inventory_id
+            logger.info(
+                f"[_ensure_data_ready] Resolved upload IDs for run {run_id}: "
+                f"catalog={catalog_id}, variants={variants_id}, inventory={inventory_id}"
+            )
+        except Exception as resolve_exc:
+            logger.warning(
+                f"[_ensure_data_ready] Could not resolve upload IDs: {resolve_exc}. "
+                f"Using orders_upload_id for all data types."
+            )
+
     mapper = DataMapper()
-    enrichment = await mapper.enrich_order_lines_with_variants(orders_upload_id)
+    enrichment = await mapper.enrich_order_lines_with_variants(
+        orders_upload_id,
+        catalog_upload_id=catalog_upload_id,
+        variants_upload_id=variants_upload_id,
+        inventory_upload_id=inventory_upload_id,
+    )
     metrics = enrichment.get("metrics", {})
 
     if not metrics.get("resolved_variants"):
@@ -300,11 +373,14 @@ async def _ensure_data_ready(orders_upload_id: str, run_id: Optional[str], db: A
     # Use variant_id - always exists and immutable (SKU can be missing/empty)
     order_variant_ids = {str(getattr(line, 'variant_id', '')).strip() for line in order_lines if getattr(line, 'variant_id', None)}
 
-    # Use orders_upload_id (canonical ID) since all CSV types share this ID after processing
-    variant_rows = await storage.get_variants(orders_upload_id)
+    # Use separate upload IDs if available (Quickstart fix)
+    effective_variants_id = variants_upload_id or orders_upload_id
+    effective_catalog_id = catalog_upload_id or orders_upload_id
+
+    variant_rows = await storage.get_variants(effective_variants_id)
     variant_ids = {getattr(v, 'variant_id') for v in variant_rows if getattr(v, 'variant_id', None)}
 
-    catalog_map = await storage.get_catalog_snapshots_map(orders_upload_id)
+    catalog_map = await storage.get_catalog_snapshots_map(effective_catalog_id)
     # catalog_map is keyed by both variant_id (primary) and SKU (fallback)
 
     missing_variant_ids = sorted(vid for vid in order_variant_ids if vid not in variant_ids)
