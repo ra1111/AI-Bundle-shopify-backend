@@ -77,8 +77,8 @@ class WeightedLinearRanker:
             # PERFORMANCE OPTIMIZATION: Preload catalog once for entire batch
             # This reduces ranking time by ~60% by avoiding per-candidate DB queries
             logger.debug(f"Preloading catalog map for {len(candidates)} candidates")
-            catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-            logger.debug(f"Catalog map loaded: {len(catalog_map)} SKUs")
+            catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+            logger.debug(f"Catalog map loaded: {len(catalog_map)} variant_ids")
 
             # Compute all ranking features with shared catalog_map
             enriched_candidates = []
@@ -136,7 +136,7 @@ class WeightedLinearRanker:
         try:
             # ARCHITECT FIX: Preload catalog_map once per batch instead of per-candidate
             if catalog_map is None:
-                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             # Start with existing candidate data
             enriched = candidate.copy()
@@ -192,7 +192,7 @@ class WeightedLinearRanker:
             
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
             if catalog_map is None:
-                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             catalog_items = [catalog_map.get(sku) for sku in product_skus if sku in catalog_map]
             if not catalog_items:
@@ -271,7 +271,7 @@ class WeightedLinearRanker:
             
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
             if catalog_map is None:
-                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             catalog_items = [catalog_map.get(sku) for sku in product_skus if sku in catalog_map]
             if not catalog_items:
@@ -303,7 +303,7 @@ class WeightedLinearRanker:
             
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
             if catalog_map is None:
-                catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
+                catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
             # Get historical discount data for products
             historical_discounts = {}
