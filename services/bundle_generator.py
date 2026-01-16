@@ -1636,6 +1636,13 @@ class BundleGenerator:
                         max_bundles=10
                     )
 
+                    # CRITICAL FIX: Save bundles BEFORE sending completion status
+                    # This prevents race condition where frontend queries DB before bundles are saved
+                    if bayesian_bundles:
+                        await storage.save_bundle_recommendations(bayesian_bundles)
+                        logger.info(f"[{csv_upload_id}] ✅ Saved {len(bayesian_bundles)} Bayesian bundles to DB")
+
+                    # Now send completion status AFTER save completes
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
@@ -1649,10 +1656,6 @@ class BundleGenerator:
                             "bundles_generated": len(bayesian_bundles),
                         },
                     )
-
-                    # Save bundles
-                    if bayesian_bundles:
-                        await storage.save_bundle_recommendations(bayesian_bundles)
 
                     return {
                         "recommendations": bayesian_bundles,
@@ -1679,6 +1682,13 @@ class BundleGenerator:
                         max_bundles=10
                     )
 
+                    # CRITICAL FIX: Save bundles BEFORE sending completion status
+                    # This prevents race condition where frontend queries DB before bundles are saved
+                    if catalog_bundles:
+                        await storage.save_bundle_recommendations(catalog_bundles)
+                        logger.info(f"[{csv_upload_id}] ✅ Saved {len(catalog_bundles)} catalog fallback bundles to DB")
+
+                    # Now send completion status AFTER save completes
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
@@ -1692,10 +1702,6 @@ class BundleGenerator:
                             "bundles_generated": len(catalog_bundles),
                         },
                     )
-
-                    # Save bundles
-                    if catalog_bundles:
-                        await storage.save_bundle_recommendations(catalog_bundles)
 
                     return {
                         "recommendations": catalog_bundles,
@@ -1761,6 +1767,13 @@ class BundleGenerator:
                     max_bundles=1  # Just 1 bundle for the single product
                 )
 
+                # CRITICAL FIX: Save bundles BEFORE sending completion status
+                # This prevents race condition where frontend queries DB before bundles are saved
+                if single_product_bundles:
+                    await storage.save_bundle_recommendations(single_product_bundles)
+                    logger.info(f"[{csv_upload_id}] ✅ Saved {len(single_product_bundles)} single-product volume bundles to DB")
+
+                # Now send completion status AFTER save completes
                 await update_generation_progress(
                     csv_upload_id,
                     step="finalization",
@@ -1774,10 +1787,6 @@ class BundleGenerator:
                         "bundles_generated": len(single_product_bundles),
                     },
                 )
-
-                # Save bundles
-                if single_product_bundles:
-                    await storage.save_bundle_recommendations(single_product_bundles)
 
                 return {
                     "recommendations": single_product_bundles,
