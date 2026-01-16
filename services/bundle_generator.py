@@ -1627,6 +1627,14 @@ class BundleGenerator:
                         f"[{csv_upload_id}] 🧮 TIER 3: BAYESIAN MODE ({multi_item_count} multi-item orders)"
                     )
 
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ml_generation",
+                        progress=50,
+                        status="in_progress",
+                        message="Analyzing sparse order patterns with Bayesian inference...",
+                    )
+
                     bayesian_bundles = _build_bayesian_bundles(
                         csv_upload_id=csv_upload_id,
                         order_lines=order_lines,
@@ -1634,6 +1642,14 @@ class BundleGenerator:
                         product_scores=product_scores,
                         multi_item_count=multi_item_count,
                         max_bundles=10
+                    )
+
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="finalization",
+                        progress=90,
+                        status="in_progress",
+                        message=f"Saving {len(bayesian_bundles)} probabilistic bundles...",
                     )
 
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
@@ -1675,11 +1691,27 @@ class BundleGenerator:
                         f"[{csv_upload_id}] 📋 TIER 4: CATALOG FALLBACK MODE ({multi_item_count} multi-item orders)"
                     )
 
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ml_generation",
+                        progress=50,
+                        status="in_progress",
+                        message="Creating volume bundles from catalog data...",
+                    )
+
                     catalog_bundles = _build_catalog_fallback_bundles(
                         csv_upload_id=csv_upload_id,
                         catalog=catalog,
                         product_scores=product_scores,
                         max_bundles=10
+                    )
+
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="finalization",
+                        progress=90,
+                        status="in_progress",
+                        message=f"Saving {len(catalog_bundles)} starter bundles...",
                     )
 
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
@@ -1744,6 +1776,14 @@ class BundleGenerator:
                     f"Generating volume discount bundles..."
                 )
 
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="ml_generation",
+                    progress=50,
+                    status="in_progress",
+                    message="Creating volume discount bundle for single-product catalog...",
+                )
+
                 # Load catalog for volume bundle generation
                 try:
                     catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
@@ -1765,6 +1805,14 @@ class BundleGenerator:
                     catalog=catalog,
                     product_scores=product_scores,
                     max_bundles=1  # Just 1 bundle for the single product
+                )
+
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="finalization",
+                    progress=90,
+                    status="in_progress",
+                    message=f"Saving volume discount bundle...",
                 )
 
                 # CRITICAL FIX: Save bundles BEFORE sending completion status
