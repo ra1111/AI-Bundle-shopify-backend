@@ -6221,6 +6221,9 @@ def _build_bayesian_bundles(
 
         p1_name = getattr(p1, 'product_title', 'Product')
         p2_name = getattr(p2, 'product_title', 'Product')
+        savings_amount = total_price - bundle_price
+        bundle_name = f"{p1_name} + {p2_name}"
+        bundle_description = f"Get both {p1_name} and {p2_name} together and save {discount_pct}%!"
 
         # EXACT SCHEMA MATCH with existing quick-start bundles
         bundles.append({
@@ -6238,18 +6241,18 @@ def _build_bayesian_bundles(
             "pricing": {
                 "original_total": total_price,
                 "bundle_price": bundle_price,
-                "discount_amount": total_price - bundle_price,
+                "discount_amount": savings_amount,
                 "discount_pct": f"{discount_pct}%",
                 "discount_percentage": float(discount_pct),
                 "discount_type": "percentage",
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
-                "title": f"{p1_name} + {p2_name}",
-                "description": f"Frequently bought together. Save {discount_pct}% when bundled!",
+                "title": bundle_name,
+                "description": bundle_description,
                 "tagline": f"Save {discount_pct}% when bought together",
                 "cta_text": "Add Bundle to Cart",
-                "savings_message": f"Save ${total_price - bundle_price:.2f}!",
+                "savings_message": f"Save ${savings_amount:.2f}!",
                 "is_active": True,
                 "show_on": ["product", "cart"],
                 # Bayesian-specific features for transparency
@@ -6369,7 +6372,7 @@ def _build_catalog_fallback_bundles(
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
                 "title": f"Stock Up & Save: {product_name}",
-                "description": f"Buy more and save! Get up to 15% off {product_name}.",
+                "description": f"Buy 2 or more {product_name} and save up to 15%! Perfect for stocking up on your favorites.",
                 "tagline": "Buy More, Save More!",
                 "cta_text": "Select Quantity",
                 "savings_message": "Save up to 15%!",
