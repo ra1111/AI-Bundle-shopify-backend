@@ -1644,6 +1644,52 @@ class BundleGenerator:
                         max_bundles=10
                     )
 
+                    # Generate AI copy for Tier 3 bundles (same quality as Tier 1)
+                    if bayesian_bundles:
+                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {len(bayesian_bundles)} Bayesian bundles...")
+                        ai_copy_start = time.time()
+                        successful_ai_copy = 0
+
+                        for bundle in bayesian_bundles:
+                            try:
+                                # Extract products from bundle structure
+                                products_data = bundle.get("products", {})
+                                if isinstance(products_data, dict):
+                                    items = products_data.get("items", [])
+                                else:
+                                    items = products_data if isinstance(products_data, list) else []
+
+                                # Generate AI copy
+                                bundle_type = bundle.get("bundle_type", "FBT")
+                                context = f"Objective: {bundle.get('objective', 'cross_sell')}. Bayesian inference from sparse data."
+
+                                ai_copy = await self.ai_generator.generate_bundle_copy(
+                                    items,
+                                    bundle_type,
+                                    context=context,
+                                )
+
+                                # Merge AI copy with existing features metadata
+                                existing_features = bundle.get("ai_copy", {}).get("features", {})
+                                ai_copy["features"] = existing_features
+                                ai_copy["is_active"] = True
+                                ai_copy["show_on"] = ["product", "cart"]
+
+                                bundle["ai_copy"] = ai_copy
+                                successful_ai_copy += 1
+
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[{csv_upload_id}] Failed to generate AI copy for Bayesian bundle: {exc}. Keeping template copy."
+                                )
+                                # Template copy already exists from _build_bayesian_bundles
+
+                        ai_copy_duration = (time.time() - ai_copy_start) * 1000
+                        logger.info(
+                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{len(bayesian_bundles)} bundles "
+                            f"in {ai_copy_duration:.0f}ms"
+                        )
+
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
@@ -1705,6 +1751,52 @@ class BundleGenerator:
                         product_scores=product_scores,
                         max_bundles=10
                     )
+
+                    # Generate AI copy for Tier 4 bundles (volume bundles)
+                    if catalog_bundles:
+                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {len(catalog_bundles)} volume bundles...")
+                        ai_copy_start = time.time()
+                        successful_ai_copy = 0
+
+                        for bundle in catalog_bundles:
+                            try:
+                                # Extract products from bundle structure
+                                products_data = bundle.get("products", {})
+                                if isinstance(products_data, dict):
+                                    items = products_data.get("items", [])
+                                else:
+                                    items = products_data if isinstance(products_data, list) else []
+
+                                # Generate AI copy
+                                bundle_type = bundle.get("bundle_type", "VOLUME")
+                                context = f"Objective: {bundle.get('objective', 'increase_aov')}. Volume discount bundle."
+
+                                ai_copy = await self.ai_generator.generate_bundle_copy(
+                                    items,
+                                    bundle_type,
+                                    context=context,
+                                )
+
+                                # Merge AI copy with existing features metadata
+                                existing_features = bundle.get("ai_copy", {}).get("features", {})
+                                ai_copy["features"] = existing_features
+                                ai_copy["is_active"] = True
+                                ai_copy["show_on"] = ["product"]
+
+                                bundle["ai_copy"] = ai_copy
+                                successful_ai_copy += 1
+
+                            except Exception as exc:
+                                logger.warning(
+                                    f"[{csv_upload_id}] Failed to generate AI copy for volume bundle: {exc}. Keeping template copy."
+                                )
+                                # Template copy already exists from _build_catalog_fallback_bundles
+
+                        ai_copy_duration = (time.time() - ai_copy_start) * 1000
+                        logger.info(
+                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{len(catalog_bundles)} bundles "
+                            f"in {ai_copy_duration:.0f}ms"
+                        )
 
                     await update_generation_progress(
                         csv_upload_id,
@@ -1806,6 +1898,49 @@ class BundleGenerator:
                     product_scores=product_scores,
                     max_bundles=1  # Just 1 bundle for the single product
                 )
+
+                # Generate AI copy for single-product volume bundle
+                if single_product_bundles:
+                    logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for single-product volume bundle...")
+                    ai_copy_start = time.time()
+
+                    for bundle in single_product_bundles:
+                        try:
+                            # Extract products from bundle structure
+                            products_data = bundle.get("products", {})
+                            if isinstance(products_data, dict):
+                                items = products_data.get("items", [])
+                            else:
+                                items = products_data if isinstance(products_data, list) else []
+
+                            # Generate AI copy
+                            bundle_type = bundle.get("bundle_type", "VOLUME")
+                            context = f"Objective: {bundle.get('objective', 'increase_aov')}. Single-product volume bundle."
+
+                            ai_copy = await self.ai_generator.generate_bundle_copy(
+                                items,
+                                bundle_type,
+                                context=context,
+                            )
+
+                            # Merge AI copy with existing features metadata
+                            existing_features = bundle.get("ai_copy", {}).get("features", {})
+                            ai_copy["features"] = existing_features
+                            ai_copy["is_active"] = True
+                            ai_copy["show_on"] = ["product"]
+
+                            bundle["ai_copy"] = ai_copy
+
+                        except Exception as exc:
+                            logger.warning(
+                                f"[{csv_upload_id}] Failed to generate AI copy for single-product volume bundle: {exc}. Keeping template copy."
+                            )
+
+                    ai_copy_duration = (time.time() - ai_copy_start) * 1000
+                    logger.info(
+                        f"[{csv_upload_id}] ✅ AI copy generated for single-product volume bundle "
+                        f"in {ai_copy_duration:.0f}ms"
+                    )
 
                 await update_generation_progress(
                     csv_upload_id,
