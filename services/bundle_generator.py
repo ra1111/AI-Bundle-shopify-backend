@@ -834,7 +834,7 @@ class BundleGenerator:
         self.max_consecutive_failures = 10  # Stop after 10 consecutive failures
         self.circuit_breaker_active = False
 
-    def _enrich_bundle_with_type_structure(
+    async def _enrich_bundle_with_type_structure(
         self,
         recommendation: Dict[str, Any],
         catalog: Dict[str, Any] = None,
@@ -852,6 +852,25 @@ class BundleGenerator:
         bundle_type = recommendation.get("bundle_type", "FBT")
         products = recommendation.get("products", [])
         pricing = recommendation.get("pricing", {})
+
+        # CRITICAL FIX: Enrich products with full metadata if they're just variant_ids
+        # Check if products is a simple array of strings (variant IDs from ML)
+        if isinstance(products, list) and products and isinstance(products[0], str):
+            # Load catalog if not provided
+            if catalog is None:
+                csv_upload_id = recommendation.get("csv_upload_id")
+                if csv_upload_id:
+                    try:
+                        catalog = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+                        logger.info(f"[{csv_upload_id}] Loaded catalog for product enrichment: {len(catalog)} entries")
+                    except Exception as e:
+                        logger.warning(f"[{csv_upload_id}] Failed to load catalog for enrichment: {e}")
+                        catalog = {}
+
+            # Enrich products with full metadata using helper function
+            enriched_products = _enrich_products_with_metadata(products, catalog or {}, bundle_type)
+            recommendation["products"] = enriched_products
+            products = enriched_products  # Update local variable for downstream processing
 
         # Ensure ai_copy exists
         if "ai_copy" not in recommendation:
@@ -3461,7 +3480,7 @@ class BundleGenerator:
                     self.seen_sku_combinations.add(sku_combo_key)
 
                 # Enrich with type-specific structure for frontend compatibility
-                recommendation = self._enrich_bundle_with_type_structure(recommendation)
+                recommendation = await self._enrich_bundle_with_type_structure(recommendation)
 
                 recommendations.append(recommendation)
                 
@@ -5220,7 +5239,7 @@ class BundleGenerator:
                         }
 
                         # Enrich with type-specific structure for frontend compatibility
-                        recommendation = self._enrich_bundle_with_type_structure(recommendation)
+                        recommendation = await self._enrich_bundle_with_type_structure(recommendation)
 
                         recommendations.append(recommendation)
                         
@@ -6319,3 +6338,72 @@ def _build_catalog_fallback_bundles(
     logger.info(f"[{csv_upload_id}]   Bundles created: {len(bundles)}")
 
     return bundles
+
+
+def _enrich_products_with_metadata(
+    variant_ids: List[str],
+    catalog: Dict[str, Any],
+    bundle_type: str,
+) -> Dict[str, Any]:
+    """
+    Enrich simple variant_id array with full product metadata.
+
+    Converts: ["variant_id_1", "variant_id_2"]
+    Into: {"trigger_product": {...}, "addon_products": [...], "items": [...]}
+
+    Args:
+        variant_ids: List of variant IDs from ML candidates
+        catalog: Product catalog mapping variant_id -> catalog entry
+        bundle_type: Bundle type (FBT, BOGO, VOLUME, etc.)
+
+    Returns:
+        Enriched products dict with full Shopify metadata
+    """
+    enriched_items = []
+
+    for variant_id in variant_ids:
+        catalog_entry = catalog.get(variant_id)
+        if not catalog_entry:
+            # Skip missing products
+            continue
+
+        product_data = {
+            "sku": getattr(catalog_entry, 'sku', ''),
+            "name": getattr(catalog_entry, 'product_title', 'Product'),
+            "title": getattr(catalog_entry, 'product_title', 'Product'),
+            "price": float(getattr(catalog_entry, 'price', 0) or 0),
+            "variant_id": variant_id,
+            "product_id": getattr(catalog_entry, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(catalog_entry, 'product_id', '')}",
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "image_url": getattr(catalog_entry, 'image_url', None),
+        }
+        enriched_items.append(product_data)
+
+    # Build structure based on bundle type
+    if bundle_type == "VOLUME":
+        # Volume bundles: single product with volume tiers
+        return {
+            "items": enriched_items,
+        }
+    elif bundle_type in ("FBT", "BOGO", "XFORY"):
+        # Multi-product bundles: trigger + addons structure
+        if len(enriched_items) >= 2:
+            return {
+                "items": enriched_items,
+                "trigger_product": enriched_items[0],
+                "addon_products": enriched_items[1:],
+            }
+        elif len(enriched_items) == 1:
+            # Single product fallback
+            return {
+                "items": enriched_items,
+            }
+        else:
+            # No valid products
+            return {"items": []}
+    else:
+        # Generic multi-product bundle
+        return {
+            "items": enriched_items,
+        }
