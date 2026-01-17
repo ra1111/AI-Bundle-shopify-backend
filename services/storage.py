@@ -1937,37 +1937,22 @@ class StorageService:
     
     async def get_catalog_snapshots_map(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
         """
-        ARCHITECTURE: Returns catalog with DUAL KEYS for backward compatibility.
+        Returns catalog keyed by variant_id ONLY.
 
-        Keys:
-        - variant_id (primary) - Always exists, immutable, unique
-        - sku (fallback) - For legacy ML pipeline compatibility
-
-        This allows:
-        - Quick-start path: Uses variant_id
-        - Full generation path: Uses SKU
-        - Gradual migration to variant_id across entire codebase
+        NOTE: variant_id is the PRIMARY and ONLY key. SKU is unreliable and
+        should never be used as a lookup key.
         """
         try:
             snapshots = await self.get_catalog_snapshots_by_upload(csv_upload_id)
             result = {}
-            variant_id_count = 0
-            sku_count = 0
 
             for snapshot in snapshots:
-                # Primary key: variant_id
+                # Only key by variant_id - SKU is unreliable
                 if snapshot.variant_id:
                     result[snapshot.variant_id] = snapshot
-                    variant_id_count += 1
-
-                # Fallback key: SKU (for backward compatibility with ML pipeline)
-                # Skip 'no-sku-*' placeholders to avoid polluting catalog
-                if snapshot.sku and not snapshot.sku.startswith('no-sku-'):
-                    result[snapshot.sku] = snapshot
-                    sku_count += 1
 
             logger.info(
-                f"[{csv_upload_id}] Catalog map built: {variant_id_count} variant_ids + {sku_count} SKUs = {len(result)} total keys"
+                f"[{csv_upload_id}] Catalog map built: {len(result)} variant_ids"
             )
             return result
         except Exception as e:
@@ -2143,7 +2128,10 @@ class StorageService:
             return list(result.scalars().all())
     
     async def get_catalog_snapshots_map_by_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
-        """Get catalog snapshots with DUAL KEYS (variant_id + SKU) for a run."""
+        """Get catalog snapshots keyed by variant_id ONLY for a run.
+
+        NOTE: SKU is unreliable and should never be used as a lookup key.
+        """
         async with self.get_session() as session:
             query = (
                 select(CatalogSnapshot)
@@ -2152,17 +2140,7 @@ class StorageService:
             )
             result = await session.execute(query)
             snapshots = list(result.scalars().all())
-
-            # Build dual-key map for backward compatibility
-            catalog_map = {}
-            for snapshot in snapshots:
-                # Primary key: variant_id
-                if snapshot.variant_id:
-                    catalog_map[snapshot.variant_id] = snapshot
-                # Fallback key: SKU (for backward compatibility)
-                if snapshot.sku and not snapshot.sku.startswith('no-sku-'):
-                    catalog_map[snapshot.sku] = snapshot
-            return catalog_map
+            return {snapshot.variant_id: snapshot for snapshot in snapshots if snapshot.variant_id}
 
     async def get_catalog_snapshots_map_by_variant(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
         """Get catalog snapshots as a map keyed by variant_id."""
