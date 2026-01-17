@@ -32,6 +32,9 @@ from .bundle_schemas import (
     AICopy,
     AICopyDict,
 
+    # Defaults
+    DEFAULT_VOLUME_TIERS,
+
     # Helper functions
     normalize_product_data,
     normalize_fbt_bundle,
