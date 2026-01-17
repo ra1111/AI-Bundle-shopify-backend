@@ -414,14 +414,18 @@ class CandidateGenerator:
         catalog_map: Dict[str, Dict[str, Any]],
         variant_id_frequency: Counter,
     ) -> List[str]:
+        """Choose variant_ids for embedding generation.
+
+        NOTE: catalog_map is keyed by variant_id (primary key).
+        """
         prioritized: List[str] = []
         if variant_id_frequency:
             prioritized.extend(
-                [sku for sku, _ in variant_id_frequency.most_common(self.max_embedding_targets + self.anchor_prefetch_extra)]
+                [vid for vid, _ in variant_id_frequency.most_common(self.max_embedding_targets + self.anchor_prefetch_extra)]
             )
         flagged = [
-            sku
-            for sku, meta in catalog_map.items()
+            vid
+            for vid, meta in catalog_map.items()
             if meta.get("is_slow_mover") or meta.get("is_new_launch") or meta.get("is_seasonal") or meta.get("is_high_margin")
         ]
         prioritized.extend(flagged)
@@ -429,20 +433,20 @@ class CandidateGenerator:
             prioritized.extend(valid_variant_ids)
         deduped: List[str] = []
         seen: Set[str] = set()
-        for sku in prioritized:
-            sku_key = (sku or "").strip()
-            if not sku_key or sku_key in seen or sku_key not in catalog_map:
+        for vid in prioritized:
+            vid_key = (vid or "").strip()
+            if not vid_key or vid_key in seen or vid_key not in catalog_map:
                 continue
-            deduped.append(sku_key)
-            seen.add(sku_key)
+            deduped.append(vid_key)
+            seen.add(vid_key)
             if len(deduped) >= self.max_embedding_targets:
                 break
         if len(deduped) < self.min_embedding_targets:
-            for sku in catalog_map.keys():
-                if sku in seen:
+            for vid in catalog_map.keys():
+                if vid in seen:
                     continue
-                deduped.append(sku)
-                seen.add(sku)
+                deduped.append(vid)
+                seen.add(vid)
                 if len(deduped) >= self.min_embedding_targets or len(deduped) >= self.max_embedding_targets:
                     break
         logger.info(
@@ -557,6 +561,10 @@ class CandidateGenerator:
         seed_variant_ids: List[str],
         catalog_map: Dict[str, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Prioritize catalog products for embedding generation.
+
+        NOTE: catalog_map is keyed by variant_id (primary key).
+        """
         if not catalog_subset and catalog_map:
             catalog_subset = list(catalog_map.values())
 
@@ -577,20 +585,20 @@ class CandidateGenerator:
 
         if len(prioritized) < self.max_embedding_targets:
             for product in catalog_subset:
-                sku = product.get("sku")
-                if not sku or sku in seen:
+                vid = product.get("variant_id")
+                if not vid or vid in seen:
                     continue
                 prioritized.append(product)
-                seen.add(sku)
+                seen.add(vid)
                 if len(prioritized) >= self.max_embedding_targets:
                     break
 
         if len(prioritized) < self.max_embedding_targets and catalog_map:
-            for sku, product in catalog_map.items():
-                if sku in seen:
+            for vid, product in catalog_map.items():
+                if vid in seen:
                     continue
                 prioritized.append(product)
-                seen.add(sku)
+                seen.add(vid)
                 if len(prioritized) >= self.max_embedding_targets:
                     break
 
@@ -606,17 +614,21 @@ class CandidateGenerator:
         catalog_map: Dict[str, Dict[str, Any]],
         objective: str,
     ) -> List[str]:
+        """Get variant_ids matching the objective flags.
+
+        NOTE: catalog_map is keyed by variant_id (primary key).
+        """
         objective = (objective or "").lower()
         if not catalog_map:
             return []
         if objective == "clear_slow_movers":
-            return [sku for sku, meta in catalog_map.items() if meta.get("is_slow_mover")]
+            return [vid for vid, meta in catalog_map.items() if meta.get("is_slow_mover")]
         if objective == "new_launch":
-            return [sku for sku, meta in catalog_map.items() if meta.get("is_new_launch")]
+            return [vid for vid, meta in catalog_map.items() if meta.get("is_new_launch")]
         if objective == "seasonal_promo":
-            return [sku for sku, meta in catalog_map.items() if meta.get("is_seasonal")]
+            return [vid for vid, meta in catalog_map.items() if meta.get("is_seasonal")]
         if objective == "margin_guard":
-            return [sku for sku, meta in catalog_map.items() if meta.get("is_high_margin")]
+            return [vid for vid, meta in catalog_map.items() if meta.get("is_high_margin")]
         return []
     
     async def generate_candidates(
@@ -748,7 +760,7 @@ class CandidateGenerator:
                             else await storage.get_catalog_snapshots_by_upload(csv_upload_id)
                         )
                         fallback_products = self._materialize_catalog_products(fallback_catalog)
-                        catalog_map = {item["sku"]: item for item in fallback_products if item.get("sku")}
+                        catalog_map = {item["variant_id"]: item for item in fallback_products if item.get("variant_id")}
                         catalog_subset = fallback_products[: min(self.max_embedding_targets, len(fallback_products))]
 
                     seed_variant_ids = self._derive_similarity_seed_variant_ids(

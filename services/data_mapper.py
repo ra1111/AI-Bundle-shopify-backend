@@ -320,7 +320,8 @@ class DataMapper:
             
             logger.info(
                 f"[{csv_upload_id}] ✅ Prefetch complete in {prefetch_duration * 1000:.0f}ms\n"
-                f"  Variants: {len(prefetch_data.get('variants_by_sku', {}))}\n"
+                f"  Variants (by_id): {len(prefetch_data.get('variants_by_id', {}))}\n"
+                f"  Variants (by_sku): {len(prefetch_data.get('variants_by_sku', {}))}\n"
                 f"  Catalog: {len(prefetch_data.get('catalog_map', {}))}"
             )
 
@@ -569,8 +570,9 @@ class DataMapper:
                     self._catalog_map_by_scope[scope] = result
 
         logger.info(
-            "DataMapper prefetch summary | scope=%s variants=%d inventory=%d catalog=%d tasks_started=%d",
+            "DataMapper prefetch summary | scope=%s variants_by_id=%d variants_by_sku=%d inventory=%d catalog=%d tasks_started=%d",
             scope,
+            len(self._variant_id_map_by_scope.get(scope, {})),
             len(self._variant_map_by_scope.get(scope, {})),
             len(self._inventory_map_by_scope.get(scope, {})),
             len(self._catalog_map_by_scope.get(scope, {})),
