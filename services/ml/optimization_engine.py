@@ -452,7 +452,7 @@ class EnterpriseOptimizationEngine:
             
             # Get product pricing data
             total_value = Decimal('0')
-            catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in products if vid in catalog_map]
             
             for item in catalog_items:
                 if item.price:
@@ -482,7 +482,7 @@ class EnterpriseOptimizationEngine:
             if not catalog_map:
                 logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
                 catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-            catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in products if vid in catalog_map]
             
             for item in catalog_items:
                 if hasattr(item, 'is_high_margin') and item.is_high_margin:
@@ -509,7 +509,7 @@ class EnterpriseOptimizationEngine:
             if not catalog_map:
                 logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
                 catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-            catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in products if vid in catalog_map]
             
             for item in catalog_items:
                 available = item.available_total or 0
@@ -563,7 +563,7 @@ class EnterpriseOptimizationEngine:
             if not catalog_map:
                 logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
                 catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-            catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in products if vid in catalog_map]
             categories = set()
             for item in catalog_items:
                 if hasattr(item, 'category') and item.category:
@@ -588,7 +588,7 @@ class EnterpriseOptimizationEngine:
             if not catalog_map:
                 logger.warning(f"Catalog cache miss for {csv_upload_id}, fetching from DB")
                 catalog_map = await storage.get_catalog_snapshots_map(csv_upload_id)
-            catalog_items = [catalog_map.get(sku) for sku in products if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in products if vid in catalog_map]
             categories = []
             for item in catalog_items:
                 if hasattr(item, 'category') and item.category:

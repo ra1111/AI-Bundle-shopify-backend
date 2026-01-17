@@ -262,20 +262,22 @@ class BundleGenerator:
             result = maximum
         return result
 
-    def _extract_sku_list(self, recommendation: Dict[str, Any]) -> List[str]:
+    def _extract_variant_id_list(self, recommendation: Dict[str, Any]) -> List[str]:
         """
-        Normalize the products payload on a recommendation into a list of SKUs.
+        Normalize the products payload on a recommendation into a list of variant_ids.
         Handles both simple string lists and richer dict payloads.
+
+        NOTE: variant_id is the PRIMARY identifier. SKU is unreliable and not used.
         """
-        skus: List[str] = []
+        variant_ids: List[str] = []
         products = recommendation.get("products") or []
         for entry in products:
             candidate: Optional[str] = None
             if isinstance(entry, dict):
+                # Prioritize variant_id - SKU is unreliable
                 candidate = (
-                    entry.get("sku")
+                    entry.get("variant_id")
                     or entry.get("id")
-                    or entry.get("variant_id")
                     or entry.get("product_id")
                 )
             else:
@@ -284,8 +286,8 @@ class BundleGenerator:
             if candidate:
                 candidate_str = str(candidate).strip()
                 if candidate_str:
-                    skus.append(candidate_str)
-        return skus
+                    variant_ids.append(candidate_str)
+        return variant_ids
 
     def _parse_stage_thresholds(self, raw: Any) -> List[int]:
         if isinstance(raw, list):
@@ -5202,14 +5204,14 @@ class BundleGenerator:
                 skipped += 1
                 continue
 
-            skus = self._extract_sku_list(recommendation)
-            if len(skus) < 2:
+            variant_ids = self._extract_variant_id_list(recommendation)
+            if len(variant_ids) < 2:
                 skipped += 1
                 continue
 
             try:
                 result = await self.pricing_engine.compute_bundle_pricing(
-                    skus,
+                    variant_ids,
                     recommendation.get("objective", "increase_aov"),
                     csv_upload_id,
                     recommendation.get("bundle_type", "FBT"),
@@ -5326,26 +5328,26 @@ class BundleGenerator:
                 break
 
             rec_id = recommendation.get("id")
-            skus = self._extract_sku_list(recommendation)
+            variant_ids = self._extract_variant_id_list(recommendation)
 
             missing: List[str] = []
             out_of_stock: List[str] = []
             inactive: List[str] = []
 
-            for sku in skus:
-                snapshot = catalog_map.get(sku)
+            for vid in variant_ids:
+                snapshot = catalog_map.get(vid)
                 if not snapshot:
-                    missing.append(sku)
+                    missing.append(vid)
                     continue
 
                 available = getattr(snapshot, "available_total", None)
                 if available is not None and available <= 0:
-                    out_of_stock.append(sku)
+                    out_of_stock.append(vid)
                     continue
 
                 status = (getattr(snapshot, "product_status", "") or "").lower()
                 if status and status not in {"active", "available"}:
-                    inactive.append(sku)
+                    inactive.append(vid)
 
             # Check environment variable to control inventory validation strictness
             # INVENTORY_VALIDATION_MODE: "strict" (drop bundles), "warn" (log only), "off" (skip)

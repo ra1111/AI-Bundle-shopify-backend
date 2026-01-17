@@ -343,10 +343,10 @@ class CandidateGenerator:
         if not transactions:
             return ctr
         for tx in transactions:
-            for sku in tx:
-                ctr[sku] += 1
+            for vid in tx:
+                ctr[vid] += 1
         logger.debug(
-            "SKU frequency computed | transactions=%d distinct_skus=%d",
+            "variant_id frequency computed | transactions=%d distinct_variant_ids=%d",
             len(transactions),
             len(ctr),
         )
@@ -532,13 +532,13 @@ class CandidateGenerator:
         seed_variant_ids: Set[str],
     ) -> Dict[str, np.ndarray]:
         missing = [
-            sku
-            for sku in seed_variant_ids
-            if sku not in embeddings and sku in catalog_map
+            vid
+            for vid in seed_variant_ids
+            if vid not in embeddings and vid in catalog_map
         ]
         if not missing:
             return embeddings
-        products = [catalog_map[sku] for sku in missing if sku in catalog_map]
+        products = [catalog_map[vid] for vid in missing if vid in catalog_map]
         if not products:
             return embeddings
         supplemental = await llm_embedding_engine.get_embeddings_batch(products, use_cache=True)
@@ -560,18 +560,18 @@ class CandidateGenerator:
         if not catalog_subset and catalog_map:
             catalog_subset = list(catalog_map.values())
 
-        seed_set = {sku for sku in seed_variant_ids if sku}
+        seed_set = {vid for vid in seed_variant_ids if vid}
         prioritized: List[Dict[str, Any]] = []
         seen: Set[str] = set()
 
-        for sku in seed_variant_ids:
-            product = catalog_map.get(sku)
+        for vid in seed_variant_ids:
+            product = catalog_map.get(vid)
             if not product:
                 continue
-            if sku in seen:
+            if vid in seen:
                 continue
             prioritized.append(product)
-            seen.add(sku)
+            seen.add(vid)
             if len(prioritized) >= self.max_embedding_targets:
                 break
 
