@@ -1017,7 +1017,27 @@ class StorageService:
                 query = query.where(BundleRecommendation.shop_id == resolved_shop)
             await session.execute(query)
             await session.commit()
-    
+
+    async def get_bundle_count_for_upload(self, csv_upload_id: str) -> int:
+        """Get the actual count of bundle recommendations from DB for an upload.
+
+        This is used for accurate progress reporting after saving bundles,
+        rather than relying on in-memory counts which may differ due to
+        deduplication, filtering, or save failures.
+        """
+        if not csv_upload_id:
+            return 0
+
+        async with self.get_session() as session:
+            query = (
+                select(func.count())
+                .select_from(BundleRecommendation)
+                .where(BundleRecommendation.csv_upload_id == csv_upload_id)
+            )
+            result = await session.execute(query)
+            count = result.scalar_one_or_none() or 0
+            return int(count)
+
     # Bundle operations
     async def create_bundle(self, bundle_data: Dict[str, Any]) -> Bundle:
         """Create new bundle"""

@@ -232,7 +232,17 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
     if not csv_upload_id:
         logger.error("Bundle generation requires a valid CSV upload ID")
         return
-    
+
+    # Add queueing step at the very start
+    if not resume_only:
+        await update_generation_progress(
+            csv_upload_id,
+            step="queueing",
+            progress=0,
+            status="in_progress",
+            message="Bundle generation queued and starting...",
+        )
+
     try:
         logger.info(f"Bundle generation {scope}: attempting to acquire shop lock")
         # Use the new concurrency control system that locks by shop_id

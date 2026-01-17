@@ -979,12 +979,21 @@ class CandidateGenerator:
                 sku = getattr(line, "sku", None)
                 variant_id = getattr(line, "variant_id", None)
 
-                # Use variant_id as fallback when sku is empty (products without SKUs)
-                identifier = sku if sku and str(sku).strip() else variant_id
+                # ALWAYS use variant_id as primary identifier (uniform join key)
+                # variant_id is stable and always present from Shopify
+                # SKU is for display only and may be synthetic (no-sku-*)
+                if variant_id:
+                    identifier = str(variant_id).strip()
+                elif sku and str(sku).strip() and not str(sku).startswith('no-sku-'):
+                    # Fallback to real SKU only if variant_id is missing
+                    identifier = str(sku).strip()
+                else:
+                    continue
+
                 if not order_id or not identifier:
                     continue
-                identifier = str(identifier).strip()
-                if not identifier or identifier.startswith("gid://") or identifier.startswith("no-sku-"):
+                # Only filter GraphQL IDs which are internal Shopify references
+                if identifier.startswith("gid://"):
                     continue
                 order_sku_map[order_id].add(identifier)
 
@@ -1528,21 +1537,21 @@ class CandidateGenerator:
                 # Get all variant_ids (or SKUs) in this order
                 order_items = set()
                 for line in order.order_lines:
-                    key = None
                     sku = getattr(line, 'sku', None)
                     variant_id = getattr(line, 'variant_id', None)
 
-                    # Prefer variant_id if SKU is synthetic (no-sku-*) or missing
-                    # This matches how valid_skus is built from catalog
-                    if sku and not sku.startswith('no-sku-'):
+                    # ALWAYS use variant_id as primary identifier (uniform join key)
+                    # variant_id is stable and always present from Shopify
+                    # SKU is for display only and may be synthetic (no-sku-*)
+                    if variant_id:
+                        key = str(variant_id)
+                    elif sku and not sku.startswith('no-sku-'):
+                        # Fallback to real SKU only if variant_id is missing
                         key = sku
-                    elif variant_id:
-                        key = variant_id
-                    elif sku:  # Fallback to synthetic SKU only if no variant_id
-                        key = sku
+                    else:
+                        continue
 
-                    if key:
-                        order_items.add(key)
+                    order_items.add(key)
 
                 if len(order_items) >= 2:  # Only multi-item orders
                     transactions.append(order_items)
@@ -1566,21 +1575,21 @@ class CandidateGenerator:
             for order in orders:
                 sequence = []
                 for line in order.order_lines:
-                    key = None
                     sku = getattr(line, 'sku', None)
                     variant_id = getattr(line, 'variant_id', None)
 
-                    # Prefer variant_id if SKU is synthetic (no-sku-*) or missing
-                    # This matches how valid_skus is built from catalog
-                    if sku and not sku.startswith('no-sku-'):
+                    # ALWAYS use variant_id as primary identifier (uniform join key)
+                    # variant_id is stable and always present from Shopify
+                    # SKU is for display only and may be synthetic (no-sku-*)
+                    if variant_id:
+                        key = str(variant_id)
+                    elif sku and not sku.startswith('no-sku-'):
+                        # Fallback to real SKU only if variant_id is missing
                         key = sku
-                    elif variant_id:
-                        key = variant_id
-                    elif sku:  # Fallback to synthetic SKU only if no variant_id
-                        key = sku
+                    else:
+                        continue
 
-                    if key:
-                        sequence.append(key)
+                    sequence.append(key)
 
                 if len(sequence) >= 2:
                     sequences.append(sequence)

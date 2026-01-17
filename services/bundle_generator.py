@@ -1704,18 +1704,31 @@ class BundleGenerator:
                         await storage.save_bundle_recommendations(bayesian_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(bayesian_bundles)} Bayesian bundles to DB")
 
-                    # Now send completion status AFTER save completes
+                    # Add staged_publish step after save
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="staged_publish",
+                        progress=95,
+                        status="in_progress",
+                        message="Bundles saved, verifying count...",
+                    )
+
+                    # Query actual bundle count from DB for accurate reporting
+                    actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+                    logger.info(f"[{csv_upload_id}] DB verification: {actual_bundle_count} bundles (memory: {len(bayesian_bundles)})")
+
+                    # Now send completion status AFTER save completes with DB-verified count
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
                         progress=100,
                         status="completed",
-                        message=f"Generated {len(bayesian_bundles)} probabilistic bundles (Bayesian mode)",
-                        bundle_count=len(bayesian_bundles),
+                        message=f"Generated {actual_bundle_count} probabilistic bundles (Bayesian mode)",
+                        bundle_count=actual_bundle_count,
                         metadata={
                             "generation_mode": "bayesian",
                             "multi_item_orders": multi_item_count,
-                            "bundles_generated": len(bayesian_bundles),
+                            "bundles_generated": actual_bundle_count,
                         },
                     )
 
@@ -1812,18 +1825,31 @@ class BundleGenerator:
                         await storage.save_bundle_recommendations(catalog_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(catalog_bundles)} catalog fallback bundles to DB")
 
-                    # Now send completion status AFTER save completes
+                    # Add staged_publish step after save
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="staged_publish",
+                        progress=95,
+                        status="in_progress",
+                        message="Bundles saved, verifying count...",
+                    )
+
+                    # Query actual bundle count from DB for accurate reporting
+                    actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+                    logger.info(f"[{csv_upload_id}] DB verification: {actual_bundle_count} bundles (memory: {len(catalog_bundles)})")
+
+                    # Now send completion status AFTER save completes with DB-verified count
                     await update_generation_progress(
                         csv_upload_id,
                         step="finalization",
                         progress=100,
                         status="completed",
-                        message=f"Generated {len(catalog_bundles)} starter bundles (catalog mode)",
-                        bundle_count=len(catalog_bundles),
+                        message=f"Generated {actual_bundle_count} starter bundles (catalog mode)",
+                        bundle_count=actual_bundle_count,
                         metadata={
                             "generation_mode": "catalog_fallback",
                             "multi_item_orders": multi_item_count,
-                            "bundles_generated": len(catalog_bundles),
+                            "bundles_generated": actual_bundle_count,
                         },
                     )
 
@@ -1956,18 +1982,31 @@ class BundleGenerator:
                     await storage.save_bundle_recommendations(single_product_bundles)
                     logger.info(f"[{csv_upload_id}] ✅ Saved {len(single_product_bundles)} single-product volume bundles to DB")
 
-                # Now send completion status AFTER save completes
+                # Add staged_publish step after save
+                await update_generation_progress(
+                    csv_upload_id,
+                    step="staged_publish",
+                    progress=95,
+                    status="in_progress",
+                    message="Bundles saved, verifying count...",
+                )
+
+                # Query actual bundle count from DB for accurate reporting
+                actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+                logger.info(f"[{csv_upload_id}] DB verification: {actual_bundle_count} bundles (memory: {len(single_product_bundles)})")
+
+                # Now send completion status AFTER save completes with DB-verified count
                 await update_generation_progress(
                     csv_upload_id,
                     step="finalization",
                     progress=100,
                     status="completed",
                     message=f"Generated volume discount bundle (single product catalog)",
-                    bundle_count=len(single_product_bundles),
+                    bundle_count=actual_bundle_count,
                     metadata={
                         "generation_mode": "single_product_volume",
                         "unique_products": len(unique_variants),
-                        "bundles_generated": len(single_product_bundles),
+                        "bundles_generated": actual_bundle_count,
                     },
                 )
 
@@ -2324,17 +2363,29 @@ class BundleGenerator:
 
             phase4_duration = (time.time() - phase4_start) * 1000
 
+            # Add staged_publish step after save
+            await update_generation_progress(
+                csv_upload_id,
+                step="staged_publish",
+                progress=95,
+                status="in_progress",
+                message="Bundles saved, verifying count...",
+            )
+
+            # Query actual bundle count from DB for accurate reporting
+            actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+            logger.info(f"[{csv_upload_id}] DB verification: {actual_bundle_count} bundles (memory: {len(recommendations)})")
+
             total_duration = (time.time() - pipeline_start) * 1000
 
             # Safety check: Mark as failed if no bundles were generated
-            bundle_count = len(recommendations)
-            if bundle_count == 0:
+            if actual_bundle_count == 0:
                 status = "failed"
                 message = "No bundle patterns detected"
                 logger.warning(f"[{csv_upload_id}] Quick-start completed with 0 bundles - marking as failed")
             else:
                 status = "completed"
-                message = f"Quick-start complete: {bundle_count} bundles in {total_duration/1000:.1f}s"
+                message = f"Quick-start complete: {actual_bundle_count} bundles in {total_duration/1000:.1f}s"
 
             await update_generation_progress(
                 csv_upload_id,
@@ -2342,6 +2393,7 @@ class BundleGenerator:
                 progress=100,
                 status=status,
                 message=message,
+                bundle_count=actual_bundle_count,
             )
 
             # Build metrics
@@ -3604,21 +3656,22 @@ class BundleGenerator:
                     "sku_combo_key": sku_combo_key
                 }
                 
-                # CRITICAL FIX: Validate SKUs before pricing to prevent infinite loop
+                # CRITICAL FIX: Validate product identifiers before pricing to prevent infinite loop
+                # NOTE: Products are now identified by variant_id (not SKU), so we don't filter
+                # 'no-sku-*' prefixes anymore. Only filter GraphQL IDs and null literals.
                 if self.enable_bayesian_pricing and recommendation["products"]:
-                    # Filter out invalid SKUs before pricing
+                    # Filter out invalid identifiers before pricing
                     valid_products = []
                     invalid_skus = []
-                    
-                    for sku in recommendation["products"]:
-                        if (sku and 
-                            not sku.startswith("gid://") and 
-                            not sku.startswith("no-sku-") and 
-                            not sku.startswith("null") and
-                            sku.strip() != ""):
-                            valid_products.append(sku)
+
+                    for product_id in recommendation["products"]:
+                        if (product_id and
+                            not product_id.startswith("gid://") and
+                            not product_id.startswith("null") and
+                            product_id.strip() != ""):
+                            valid_products.append(product_id)
                         else:
-                            invalid_skus.append(sku)
+                            invalid_skus.append(product_id)
                     
                     if invalid_skus:
                         logger.warning(f"Filtered invalid SKUs from pricing: {invalid_skus}")
