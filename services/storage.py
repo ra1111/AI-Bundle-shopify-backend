@@ -2142,16 +2142,8 @@ class StorageService:
             result = await session.execute(query)
             return list(result.scalars().all())
     
-    async def get_catalog_snapshots_map(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
-        """Get catalog snapshots as a map keyed by SKU."""
-        async with self.get_session() as session:
-            query = select(CatalogSnapshot).where(CatalogSnapshot.csv_upload_id == csv_upload_id)
-            result = await session.execute(query)
-            snapshots = list(result.scalars().all())
-            return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku is not None}
-
     async def get_catalog_snapshots_map_by_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
-        """Get catalog snapshots as a map keyed by SKU for a run."""
+        """Get catalog snapshots with DUAL KEYS (variant_id + SKU) for a run."""
         async with self.get_session() as session:
             query = (
                 select(CatalogSnapshot)
@@ -2160,7 +2152,17 @@ class StorageService:
             )
             result = await session.execute(query)
             snapshots = list(result.scalars().all())
-            return {snapshot.sku: snapshot for snapshot in snapshots if snapshot.sku}
+
+            # Build dual-key map for backward compatibility
+            catalog_map = {}
+            for snapshot in snapshots:
+                # Primary key: variant_id
+                if snapshot.variant_id:
+                    catalog_map[snapshot.variant_id] = snapshot
+                # Fallback key: SKU (for backward compatibility)
+                if snapshot.sku and not snapshot.sku.startswith('no-sku-'):
+                    catalog_map[snapshot.sku] = snapshot
+            return catalog_map
 
     async def get_catalog_snapshots_map_by_variant(self, csv_upload_id: str) -> Dict[str, CatalogSnapshot]:
         """Get catalog snapshots as a map keyed by variant_id."""
