@@ -139,7 +139,7 @@ class BundleGenerator:
         recommendations: Optional[List[Dict[str, Any]]],
     ) -> Dict[str, Any]:
         transactions = len(getattr(context, "transactions", []) or [])
-        sku_count = len(getattr(context, "valid_skus", []) or [])
+        sku_count = len(getattr(context, "valid_variant_ids", []) or [])
         candidate_count = len(recommendations or [])
         tier = "small"
         if (
@@ -1361,7 +1361,7 @@ class BundleGenerator:
         try:
             # Check transaction count
             txn_count = len(context.transactions) if context and context.transactions else 0
-            product_count = len(context.valid_skus) if context and context.valid_skus else 0
+            product_count = len(context.valid_variant_ids) if context and context.valid_variant_ids else 0
 
             logger.info(
                 f"[{csv_upload_id}] PARETO: Early termination check | "
@@ -1434,7 +1434,7 @@ class BundleGenerator:
                 return ['increase_aov']
 
             txn_count = len(context.transactions) if context and context.transactions else 0
-            product_count = len(context.valid_skus) if context and context.valid_skus else 0
+            product_count = len(context.valid_variant_ids) if context and context.valid_variant_ids else 0
     
             logger.info(
                 f"PARETO: Objective selection | "

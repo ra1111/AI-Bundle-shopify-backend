@@ -3,6 +3,7 @@ ML Candidate Generator Service
 Implements LLM embeddings (replacing item2vec) and FPGrowth algorithm for better candidate generation
 """
 from typing import List, Dict, Any, Optional, Tuple, Set, Iterable
+import asyncio
 import logging
 import os
 import numpy as np
