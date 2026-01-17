@@ -29,6 +29,20 @@ from services.ml.constraint_manager import EnterpriseConstraintManager
 from services.ml.performance_monitor import EnterprisePerformanceMonitor
 from services.ml.fallback_ladder import FallbackLadder
 
+# Import standardized bundle schemas for data consistency
+from schemas import (
+    normalize_fbt_bundle,
+    normalize_volume_bundle,
+    normalize_bogo_bundle,
+    validate_bundle,
+    enrich_products_from_catalog,
+    normalize_product_data,
+    DEFAULT_VOLUME_TIERS,
+    DEFAULT_BOGO_CONFIG,
+    SHOP_SIZE_TIERS,
+    get_shop_tier,
+)
+
 # Import observability and feature flag systems (PR-8)
 from services.obs.metrics import metrics_collector
 from services.feature_flags import feature_flags
@@ -840,123 +854,296 @@ class BundleGenerator:
         catalog: Dict[str, Any] = None,
     ) -> Dict[str, Any]:
         """
-        Enrich a bundle recommendation with type-specific structure.
+        Enrich a bundle recommendation with type-specific structure using standardized schemas.
 
-        Frontend expects:
-        - FBT: products array with product details
-        - VOLUME: volume_tiers array with tier configuration
-        - BOGO: bogo_config, qualifiers, rewards
+        This function ensures ALL bundles (regardless of shop size or generation method)
+        conform to the schema expected by the frontend:
 
-        This ensures full generation outputs match quick-start structure.
+        - FBT: products.items with full product details, trigger_product, addon_products
+        - VOLUME: products.items + volume_tiers, top-level volume_tiers
+        - BOGO: products.items + qualifiers + rewards, top-level bogo_config
+
+        CRITICAL: Products MUST have: product_gid, name, price, variant_id
         """
+        csv_upload_id = recommendation.get("csv_upload_id", "")
         bundle_type = recommendation.get("bundle_type", "FBT")
         products = recommendation.get("products", [])
+
+        # Step 1: Load catalog if not provided
+        if catalog is None:
+            if csv_upload_id:
+                try:
+                    catalog = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+                    logger.debug(f"[{csv_upload_id}] Loaded catalog for enrichment: {len(catalog)} entries")
+                except Exception as e:
+                    logger.warning(f"[{csv_upload_id}] Failed to load catalog: {e}")
+                    catalog = {}
+            else:
+                catalog = {}
+
+        # Step 2: Extract raw product identifiers (handles all input formats)
+        raw_products = self._extract_raw_products(products)
+
+        # Step 3: Enrich ALL products with full metadata from catalog
+        enriched_items = []
+        for product_id in raw_products:
+            enriched = self._enrich_single_product(product_id, catalog)
+            if enriched.get("product_gid") or enriched.get("price", 0) > 0:
+                enriched_items.append(enriched)
+
+        # Step 4: Ensure minimum confidence and ranking scores
+        if recommendation.get("confidence", 0) == 0:
+            recommendation["confidence"] = Decimal("0.5")  # Default confidence
+        if recommendation.get("ranking_score", 0) == 0:
+            conf = float(recommendation.get("confidence", 0.5))
+            lift = float(recommendation.get("lift", 1.0))
+            recommendation["ranking_score"] = Decimal(str(conf * max(lift, 1.0)))
+
+        # Step 5: Build type-specific structure
+        if bundle_type == "VOLUME":
+            recommendation = self._build_volume_structure(recommendation, enriched_items, catalog)
+        elif bundle_type == "BOGO":
+            recommendation = self._build_bogo_structure(recommendation, enriched_items, catalog)
+        else:  # FBT (default)
+            recommendation = self._build_fbt_structure(recommendation, enriched_items, catalog)
+
+        # Step 6: Ensure ai_copy is properly set
+        recommendation = self._ensure_ai_copy(recommendation, enriched_items)
+
+        # Step 7: Validate the bundle (log warnings but don't fail)
+        is_valid, errors = validate_bundle(recommendation)
+        if not is_valid:
+            logger.warning(f"[{csv_upload_id}] Bundle validation warnings: {errors}")
+
+        return recommendation
+
+    def _extract_raw_products(self, products: Any) -> List[str]:
+        """Extract raw product identifiers from any products format."""
+        if isinstance(products, dict):
+            # New format: {"items": [...], ...}
+            items = products.get("items", [])
+            return self._extract_raw_products(items)
+        elif isinstance(products, list):
+            raw = []
+            for p in products:
+                if isinstance(p, str):
+                    raw.append(p)
+                elif isinstance(p, dict):
+                    # Extract variant_id or sku
+                    vid = p.get("variant_id") or p.get("sku") or p.get("product_id", "")
+                    if vid:
+                        raw.append(str(vid))
+            return raw
+        return []
+
+    def _enrich_single_product(self, product_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
+        """Enrich a single product identifier with full metadata from catalog."""
+        # Try to find in catalog (keyed by variant_id)
+        snap = catalog.get(product_id)
+
+        if snap:
+            # Found in catalog - extract full metadata
+            product_id_str = getattr(snap, 'product_id', '')
+            variant_id = getattr(snap, 'variant_id', product_id)
+            return {
+                "product_gid": f"gid://shopify/Product/{product_id_str}" if product_id_str else "",
+                "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+                "variant_id": variant_id,
+                "product_id": product_id_str,
+                "name": getattr(snap, 'product_title', 'Product'),
+                "title": getattr(snap, 'product_title', 'Product'),
+                "price": float(getattr(snap, 'price', 0) or 0),
+                "sku": getattr(snap, 'sku', ''),
+                "image_url": getattr(snap, 'image_url', None),
+            }
+        else:
+            # Not in catalog - return minimal structure with identifier
+            return {
+                "product_gid": "",
+                "variant_gid": f"gid://shopify/ProductVariant/{product_id}" if product_id else "",
+                "variant_id": product_id,
+                "product_id": "",
+                "name": "Unknown Product",
+                "title": "Unknown Product",
+                "price": 0.0,
+                "sku": product_id,
+                "image_url": None,
+            }
+
+    def _build_fbt_structure(
+        self,
+        recommendation: Dict[str, Any],
+        enriched_items: List[Dict[str, Any]],
+        catalog: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build FBT bundle structure with trigger/addon products."""
         pricing = recommendation.get("pricing", {})
 
-        # CRITICAL FIX: Enrich products with full metadata if they're just variant_ids
-        # Check if products is a simple array of strings (variant IDs from ML)
-        if isinstance(products, list) and products and isinstance(products[0], str):
-            # Load catalog if not provided
-            if catalog is None:
-                csv_upload_id = recommendation.get("csv_upload_id")
-                if csv_upload_id:
-                    try:
-                        catalog = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
-                        logger.info(f"[{csv_upload_id}] Loaded catalog for product enrichment: {len(catalog)} entries")
-                    except Exception as e:
-                        logger.warning(f"[{csv_upload_id}] Failed to load catalog for enrichment: {e}")
-                        catalog = {}
+        # Calculate pricing if missing
+        if not pricing.get("original_total") and enriched_items:
+            pricing["original_total"] = sum(p.get("price", 0) for p in enriched_items)
 
-            # Enrich products with full metadata using helper function
-            enriched_products = _enrich_products_with_metadata(products, catalog or {}, bundle_type)
-            recommendation["products"] = enriched_products
-            products = enriched_products  # Update local variable for downstream processing
+        if not pricing.get("bundle_price") and pricing.get("original_total"):
+            discount_pct = float(pricing.get("discount_percentage", 10))
+            pricing["bundle_price"] = pricing["original_total"] * (1 - discount_pct / 100)
 
-        # Ensure ai_copy exists
-        if "ai_copy" not in recommendation:
-            recommendation["ai_copy"] = {
-                "title": f"{bundle_type} Bundle",
-                "description": f"AI-generated {bundle_type} bundle recommendation",
-            }
+        if not pricing.get("discount_amount") and pricing.get("original_total"):
+            pricing["discount_amount"] = pricing["original_total"] - pricing.get("bundle_price", 0)
 
-        if bundle_type == "VOLUME":
-            # Add volume_tiers structure for VOLUME bundles
-            volume_tiers = [
-                {"min_qty": 1, "discount_type": "NONE", "discount_value": 0, "label": None, "type": "percentage", "value": 0},
-                {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5, "label": "Starter Pack", "type": "percentage", "value": 5},
-                {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10, "label": "Popular", "type": "percentage", "value": 10},
-                {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15, "label": "Best Value", "type": "percentage", "value": 15},
-            ]
+        if not pricing.get("discount_percentage") and pricing.get("original_total", 0) > 0:
+            pricing["discount_percentage"] = (pricing.get("discount_amount", 0) / pricing["original_total"]) * 100
 
-            # Structure products for VOLUME
-            if isinstance(products, list) and products:
-                first_product = products[0] if isinstance(products[0], dict) else {"sku": products[0]}
-                recommendation["products"] = {
-                    "items": [first_product] if isinstance(first_product, dict) else [{"sku": first_product}],
-                    "volume_tiers": volume_tiers,
-                }
+        pricing.setdefault("discount_type", "percentage")
+        pricing.setdefault("discount_pct", f"{pricing.get('discount_percentage', 10):.0f}%")
 
-            # Add volume_tiers to pricing
-            pricing["discount_type"] = "tiered"
-            pricing["volume_tiers"] = volume_tiers
-            recommendation["pricing"] = pricing
+        recommendation["products"] = {
+            "items": enriched_items,
+            "trigger_product": enriched_items[0] if enriched_items else {},
+            "addon_products": enriched_items[1:] if len(enriched_items) > 1 else [],
+        }
+        recommendation["pricing"] = pricing
 
-            # Top-level volume_tiers for frontend compatibility
-            recommendation["volume_tiers"] = volume_tiers
+        return recommendation
 
-        elif bundle_type == "BOGO":
-            # Add BOGO structure
-            bogo_config = {
-                "buy_qty": 2,
-                "get_qty": 1,
-                "discount_type": "free",
-                "discount_percent": 100,
-                "same_product": True,
-                "mode": "free_same_variant",
-            }
+    def _build_volume_structure(
+        self,
+        recommendation: Dict[str, Any],
+        enriched_items: List[Dict[str, Any]],
+        catalog: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build VOLUME bundle structure with tiers."""
+        # Use existing volume_tiers or default
+        volume_tiers = recommendation.get("volume_tiers") or [
+            {"min_qty": 1, "discount_type": "NONE", "discount_value": 0, "label": None, "type": "percentage", "value": 0},
+            {"min_qty": 2, "discount_type": "PERCENTAGE", "discount_value": 5, "label": "Starter Pack", "type": "percentage", "value": 5},
+            {"min_qty": 3, "discount_type": "PERCENTAGE", "discount_value": 10, "label": "Popular", "type": "percentage", "value": 10},
+            {"min_qty": 5, "discount_type": "PERCENTAGE", "discount_value": 15, "label": "Best Value", "type": "percentage", "value": 15},
+        ]
 
-            # Structure products for BOGO
-            if isinstance(products, list) and products:
-                first_product = products[0] if isinstance(products[0], dict) else {"sku": products[0]}
-                product_data = first_product if isinstance(first_product, dict) else {"sku": first_product}
+        # VOLUME bundles use single product
+        product = enriched_items[0] if enriched_items else {
+            "product_gid": "", "name": "Unknown Product", "price": 0, "variant_id": "", "sku": ""
+        }
 
-                recommendation["products"] = {
-                    "items": [product_data],
-                    "qualifiers": [{"quantity": 2, **product_data}],
-                    "rewards": [{"quantity": 1, "discount_type": "free", "discount_percent": 100, **product_data}],
-                }
+        # Build pricing
+        price = product.get("price", 0)
+        pricing = {
+            "original_total": price,
+            "bundle_price": price,
+            "discount_amount": 0,
+            "discount_type": "tiered",
+            "volume_tiers": volume_tiers,
+        }
 
-            # Add bogo_config to pricing
-            pricing["discount_type"] = "bogo"
-            pricing["bogo_config"] = bogo_config
-            recommendation["pricing"] = pricing
+        recommendation["products"] = {
+            "items": [product],
+            "volume_tiers": volume_tiers,
+        }
+        recommendation["pricing"] = pricing
+        recommendation["volume_tiers"] = volume_tiers  # Top-level for frontend
 
-            # Top-level fields for frontend compatibility
-            recommendation["bogo_config"] = bogo_config
-            recommendation["qualifiers"] = recommendation.get("products", {}).get("qualifiers", [])
-            recommendation["rewards"] = recommendation.get("products", {}).get("rewards", [])
+        return recommendation
 
-        else:  # FBT (default)
-            # FBT keeps products as array of product objects
-            if isinstance(products, list):
-                enriched_products = []
-                for p in products:
-                    if isinstance(p, dict):
-                        enriched_products.append(p)
-                    elif isinstance(p, str):
-                        # SKU string - try to enrich from catalog
-                        product_data = {"sku": p}
-                        if catalog and p in catalog:
-                            snap = catalog[p]
-                            product_data.update({
-                                "title": getattr(snap, "product_title", p),
-                                "price": float(getattr(snap, "price", 0) or 0),
-                                "image_url": getattr(snap, "image_url", None),
-                                "variant_id": getattr(snap, "variant_id", None),
-                            })
-                        enriched_products.append(product_data)
-                recommendation["products"] = enriched_products
+    def _build_bogo_structure(
+        self,
+        recommendation: Dict[str, Any],
+        enriched_items: List[Dict[str, Any]],
+        catalog: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build BOGO bundle structure with qualifiers/rewards."""
+        # Use existing bogo_config or default
+        bogo_config = recommendation.get("bogo_config") or {
+            "buy_qty": 2,
+            "get_qty": 1,
+            "discount_type": "free",
+            "discount_percent": 100,
+            "same_product": True,
+            "mode": "free_same_variant",
+        }
 
+        # BOGO bundles use single product
+        product = enriched_items[0] if enriched_items else {
+            "product_gid": "", "name": "Unknown Product", "price": 0, "variant_id": "", "sku": ""
+        }
+
+        # Build qualifiers and rewards
+        qualifiers = [{
+            "quantity": bogo_config.get("buy_qty", 2),
+            **product,
+        }]
+        rewards = [{
+            "quantity": bogo_config.get("get_qty", 1),
+            "discount_type": bogo_config.get("discount_type", "free"),
+            "discount_percent": bogo_config.get("discount_percent", 100),
+            **product,
+        }]
+
+        # Build pricing
+        price = product.get("price", 0)
+        buy_qty = bogo_config.get("buy_qty", 2)
+        get_qty = bogo_config.get("get_qty", 1)
+        discount_pct = bogo_config.get("discount_percent", 100)
+
+        pricing = {
+            "buy_total": price * buy_qty,
+            "get_value": price * get_qty,
+            "final_price": price * buy_qty,
+            "savings": price * get_qty * (discount_pct / 100),
+            "discount_type": "bogo",
+            "bogo_config": bogo_config,
+        }
+
+        recommendation["products"] = {
+            "items": [product],
+            "qualifiers": qualifiers,
+            "rewards": rewards,
+        }
+        recommendation["pricing"] = pricing
+        recommendation["bogo_config"] = bogo_config  # Top-level for frontend
+        recommendation["qualifiers"] = qualifiers    # Top-level for frontend
+        recommendation["rewards"] = rewards          # Top-level for frontend
+
+        return recommendation
+
+    def _ensure_ai_copy(
+        self,
+        recommendation: Dict[str, Any],
+        enriched_items: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Ensure ai_copy has proper title and description."""
+        bundle_type = recommendation.get("bundle_type", "FBT")
+        ai_copy = recommendation.get("ai_copy", {})
+
+        if not ai_copy.get("title"):
+            if bundle_type == "FBT" and len(enriched_items) >= 2:
+                names = [p.get("name", "Product") for p in enriched_items[:2]]
+                ai_copy["title"] = " + ".join(names)
+            elif bundle_type == "VOLUME" and enriched_items:
+                ai_copy["title"] = f"Buy More, Save More - {enriched_items[0].get('name', 'Product')}"
+            elif bundle_type == "BOGO" and enriched_items:
+                config = recommendation.get("bogo_config", {})
+                buy_qty = config.get("buy_qty", 2)
+                get_qty = config.get("get_qty", 1)
+                discount = config.get("discount_percent", 100)
+                if discount >= 100:
+                    ai_copy["title"] = f"Buy {buy_qty}, Get {get_qty} FREE"
+                else:
+                    ai_copy["title"] = f"Buy {buy_qty}, Get {get_qty} at {discount}% Off"
+            else:
+                ai_copy["title"] = f"{bundle_type} Bundle"
+
+        if not ai_copy.get("description"):
+            if bundle_type == "FBT":
+                discount = recommendation.get("pricing", {}).get("discount_percentage", 10)
+                ai_copy["description"] = f"Save {discount:.0f}% when bought together!"
+            elif bundle_type == "VOLUME" and enriched_items:
+                ai_copy["description"] = f"The more {enriched_items[0].get('name', 'you')} buy, the more you save!"
+            elif bundle_type == "BOGO" and enriched_items:
+                ai_copy["description"] = f"Stock up on {enriched_items[0].get('name', 'this product')} and save!"
+            else:
+                ai_copy["description"] = "Great bundle offer!"
+
+        recommendation["ai_copy"] = ai_copy
         return recommendation
 
     def _initialize_caps_and_safeguards(self) -> None:
@@ -1336,22 +1523,33 @@ class BundleGenerator:
             if signature in existing_signatures:
                 continue
 
+            # Extract confidence/lift with proper minimums to avoid 0 scores
+            raw_confidence = float(getattr(rule, "confidence", 0.0) or 0.0)
+            raw_lift = float(getattr(rule, "lift", 1.0) or 1.0)
+            raw_support = float(getattr(rule, "support", 0.0) or 0.0)
+
+            # Ensure minimum scores for fallback bundles (avoid 0 which breaks ranking)
+            confidence = max(raw_confidence, 0.3)  # Minimum 0.3 confidence for fallbacks
+            lift = max(raw_lift, 1.0)
+            support = max(raw_support, 0.01)
+
             fallback_rec = {
                 "id": str(uuid.uuid4()),
                 "csv_upload_id": csv_upload_id,
                 "bundle_type": "FBT",
                 "objective": "increase_aov",
-                "products": products,
-                "confidence": float(getattr(rule, "confidence", 0.0) or 0.0),
-                "lift": float(getattr(rule, "lift", 1.0) or 1.0),
-                "support": float(getattr(rule, "support", 0.0) or 0.0),
+                "products": products,  # Will be enriched by _enrich_bundle_with_type_structure
+                "confidence": confidence,
+                "lift": lift,
+                "support": support,
+                "predicted_lift": 1.0 + (confidence * 0.5),  # Estimated lift based on confidence
                 "generation_sources": ["association_rule_fallback"],
                 "generation_method": "forced_top_pair",
                 "is_fallback": True,
                 "fallback_reason": "top_pair_injection"
             }
-            # Provide a baseline ranking score so downstream ordering remains deterministic
-            fallback_rec["ranking_score"] = fallback_rec["confidence"] * max(fallback_rec["lift"], 1.0)
+            # Calculate meaningful ranking score
+            fallback_rec["ranking_score"] = confidence * lift
             injected.append(fallback_rec)
             existing_signatures.add(signature)
             if len(injected) >= needed:
@@ -1583,17 +1781,26 @@ class BundleGenerator:
             )
 
             # 4-TIER DATA STRATEGY: Always generate bundles
-            # Tier 1 (≥50): Full ML (not in quick-start)
-            # Tier 2 (10-49): Quick ML (current quick-start flow)
-            # Tier 3 (3-9): Bayesian pair scoring ⭐ NEW
-            # Tier 4 (0-2): Catalog fallback ⭐ NEW
+            # Primary signal: multi_item_count (orders with 2+ unique products)
+            # Tier 1: Full ML (not in quick-start, handled by full pipeline)
+            # Tier 2: Quick ML with co-visitation (multi_item_count >= 5)
+            # Tier 3: Bayesian pair scoring (multi_item_count 2-4)
+            # Tier 4: Catalog fallback (multi_item_count 0-1)
 
             logger.info(f"[{csv_upload_id}] 🔍 Determining generation tier...")
+
+            # FIX: Use multi_item_count as primary signal for tier selection
+            # Co-visitation (Tier 2) needs 5+ multi-item orders for meaningful patterns
+            # Bayesian (Tier 3) works with 2-4 multi-item orders
+            # Catalog fallback (Tier 4) for 0-1 multi-item orders
+            total_orders = len(set(getattr(line, 'order_id', None) for line in order_lines if getattr(line, 'order_id', None)))
             multi_item_count = _count_multi_item_orders(order_lines)
+
+            logger.info(f"[{csv_upload_id}]   Total orders: {total_orders}")
             logger.info(f"[{csv_upload_id}]   Order lines: {len(order_lines)}")
             logger.info(f"[{csv_upload_id}]   Multi-item orders: {multi_item_count}")
 
-            if len(order_lines) < 10:
+            if multi_item_count < 5:
                 # Load catalog for fallback tiers
                 logger.info(f"[{csv_upload_id}] 📦 PHASE 2: Loading catalog for fallback generation...")
                 catalog_phase_start = time.time()
@@ -1621,8 +1828,9 @@ class BundleGenerator:
                     price = float(getattr(snap, 'price', 0) or 0)
                     product_scores[variant_id] = min(1.0, price / 100.0)  # Normalize by $100
 
-                if multi_item_count >= 3:
-                    # TIER 3: Bayesian (3-9 multi-item orders)
+                if multi_item_count >= 2:
+                    # TIER 3: Bayesian (2+ multi-item orders) - lowered from 3
+                    # Bayesian inference works with as few as 2 multi-item baskets
                     logger.info(
                         f"[{csv_upload_id}] 🧮 TIER 3: BAYESIAN MODE ({multi_item_count} multi-item orders)"
                     )
@@ -1745,7 +1953,7 @@ class BundleGenerator:
                     }
 
                 else:
-                    # TIER 4: Catalog fallback (0-2 multi-item orders)
+                    # TIER 4: Catalog fallback (0-1 multi-item orders)
                     logger.info(
                         f"[{csv_upload_id}] 📋 TIER 4: CATALOG FALLBACK MODE ({multi_item_count} multi-item orders)"
                     )
@@ -3591,16 +3799,40 @@ class BundleGenerator:
                     fallback_duration = int((time.time() - fallback_start) * 1000)
                     logger.info(f"[{csv_upload_id}] Task {objective_type_key} - FallbackLadder COMPLETED in {fallback_duration}ms | generated={len(fallback_candidates)}")
 
-                    # Convert FallbackCandidate objects to regular dict format
+                    # Convert FallbackCandidate objects to regular dict format with proper scores
                     for fb_candidate in fallback_candidates:
+                        # Extract confidence from various feature names (different tiers use different names)
+                        raw_confidence = (
+                            fb_candidate.features.get("confidence") or
+                            fb_candidate.features.get("smoothed_p") or  # Tier 3
+                            fb_candidate.features.get("jaccard_similarity") or  # Tier 4
+                            fb_candidate.features.get("cosine_similarity") or  # Tier 4
+                            0.0
+                        )
+                        # Ensure minimum confidence of 0.4 for fallback bundles
+                        confidence = max(float(raw_confidence), 0.4)
+
+                        raw_lift = fb_candidate.features.get("lift", 1.0)
+                        lift = max(float(raw_lift), 1.0)
+
+                        raw_support = fb_candidate.features.get("support", 0.0)
+                        support = max(float(raw_support), 0.01)
+
+                        tier_weight = fb_candidate.features.get("tier_weight", 0.5)
+
+                        # Calculate ranking score based on confidence and tier weight
+                        ranking_score = confidence * tier_weight * lift
+
                         fallback_dict = {
                             "products": fb_candidate.products,
-                            "confidence": fb_candidate.features.get("confidence", 0.5),
-                            "lift": fb_candidate.features.get("lift", 1.2),
-                            "support": fb_candidate.features.get("support", 0.1),
+                            "confidence": confidence,
+                            "lift": lift,
+                            "support": support,
+                            "predicted_lift": 1.0 + (confidence * 0.3),
+                            "ranking_score": ranking_score,
                             "generation_sources": [fb_candidate.source_tier],
                             "generation_method": "fallback_ladder",
-                            "tier_weight": fb_candidate.features.get("tier_weight", 0.5),
+                            "tier_weight": tier_weight,
                             "explanation": fb_candidate.explanation
                         }
                         candidates.append(fallback_dict)
@@ -3642,15 +3874,27 @@ class BundleGenerator:
                 # ARCHITECT FIX: Count attempt immediately, mark as seen AFTER successful pricing
                 self.generation_stats['total_attempts'] += 1
                 
+                # Extract scores with proper minimum values to avoid 0 rankings
+                raw_confidence = float(candidate.get("confidence", 0) or 0)
+                raw_lift = float(candidate.get("lift", 1) or 1)
+                raw_support = float(candidate.get("support", 0) or 0)
+
+                # Ensure minimum scores for proper ranking (avoid 0 which breaks frontend)
+                confidence = max(raw_confidence, 0.3) if raw_confidence == 0 else raw_confidence
+                lift = max(raw_lift, 1.0)
+                support = max(raw_support, 0.01) if raw_support == 0 else raw_support
+
                 recommendation = {
                     "id": str(uuid.uuid4()),
                     "csv_upload_id": csv_upload_id,
                     "bundle_type": bundle_type,
                     "objective": objective,
                     "products": candidate.get("products", []),
-                    "confidence": candidate.get("confidence", 0),
-                    "lift": candidate.get("lift", 1),
-                    "support": candidate.get("support", 0),
+                    "confidence": confidence,
+                    "lift": lift,
+                    "support": support,
+                    "predicted_lift": candidate.get("predicted_lift", 1.0 + (confidence * 0.3)),
+                    "ranking_score": confidence * lift,  # Pre-compute ranking score
                     "generation_sources": candidate.get("generation_sources", []),
                     "generation_method": candidate.get("generation_method", "unknown"),
                     "sku_combo_key": sku_combo_key
@@ -5862,16 +6106,22 @@ def _build_quick_start_bogo_bundles(
     max_bogo_bundles: int,
 ) -> List[Dict[str, Any]]:
     """
-    Build simple BOGO bundles from slow-mover products.
-    Heuristics:
-    - is_slow_mover == True
-    - available_total > 5
-    - Buy 2, get 1 effectively 50% off (3 units for price of 2)
+    Build simple BOGO bundles with fallback chain.
+
+    Selection priority:
+    1. Products marked as slow movers (is_slow_mover=True) with stock >5
+    2. Fallback: High inventory products (>20 units) - likely overstocked
+    3. Fallback: Any product with stock (>5 units) - last resort
+
+    Buy 2, get 1 effectively 50% off (3 units for price of 2)
     """
     logger.info(f"[{csv_upload_id}] 🎁 BOGO BUNDLE GENERATION - STARTED")
     logger.info(f"[{csv_upload_id}]   Target: {max_bogo_bundles} BOGO bundles")
 
     candidates = []
+    fallback_source = "slow_mover"
+
+    # PRIMARY: Products marked as slow movers
     for key, snap in catalog.items():
         try:
             available = int(getattr(snap, 'available_total', 0) or 0)
@@ -5879,15 +6129,65 @@ def _build_quick_start_bogo_bundles(
             available = 0
 
         if getattr(snap, "is_slow_mover", False) and available > 5:
-            # Use SKU for display (catalog has dual keys: variant_id and SKU)
             sku = getattr(snap, 'sku', '')
             candidates.append((sku, available, snap))
 
     logger.info(f"[{csv_upload_id}]   Slow-mover candidates found: {len(candidates)}/{len(catalog)}")
 
+    # FALLBACK 1: High inventory products (likely overstocked)
+    if len(candidates) < max_bogo_bundles:
+        fallback_source = "high_inventory"
+        existing_variants = set(getattr(c[2], 'variant_id', '') for c in candidates)
+
+        high_inventory = []
+        for key, snap in catalog.items():
+            variant_id = getattr(snap, 'variant_id', '')
+            if variant_id in existing_variants:
+                continue
+            try:
+                available = int(getattr(snap, 'available_total', 0) or 0)
+            except (TypeError, ValueError):
+                available = 0
+
+            if available > 20:  # High inventory threshold
+                sku = getattr(snap, 'sku', '')
+                high_inventory.append((sku, available, snap))
+
+        # Sort by inventory desc and add to candidates
+        high_inventory.sort(key=lambda t: t[1], reverse=True)
+        candidates.extend(high_inventory[:max_bogo_bundles - len(candidates)])
+        logger.info(f"[{csv_upload_id}]   Added {len(high_inventory[:max_bogo_bundles - len(candidates)])} high-inventory fallbacks")
+
+    # FALLBACK 2: Any product with stock (last resort)
+    if len(candidates) < max_bogo_bundles:
+        fallback_source = "any_with_stock"
+        existing_variants = set(getattr(c[2], 'variant_id', '') for c in candidates)
+
+        with_stock = []
+        for key, snap in catalog.items():
+            variant_id = getattr(snap, 'variant_id', '')
+            if variant_id in existing_variants:
+                continue
+            try:
+                available = int(getattr(snap, 'available_total', 0) or 0)
+            except (TypeError, ValueError):
+                available = 0
+
+            price = float(getattr(snap, 'price', 0) or 0)
+            if available > 5 and price > 0:
+                sku = getattr(snap, 'sku', '')
+                with_stock.append((sku, available, snap))
+
+        # Sort by inventory desc and add to candidates
+        with_stock.sort(key=lambda t: t[1], reverse=True)
+        candidates.extend(with_stock[:max_bogo_bundles - len(candidates)])
+        logger.info(f"[{csv_upload_id}]   Added {len(with_stock[:max_bogo_bundles - len(candidates)])} any-stock fallbacks")
+
     if not candidates:
-        logger.warning(f"[{csv_upload_id}] ⚠️  No slow-mover products found for BOGO!")
+        logger.warning(f"[{csv_upload_id}] ⚠️  No products found for BOGO (even with fallbacks)!")
         return []
+
+    logger.info(f"[{csv_upload_id}]   Final BOGO candidates: {len(candidates)} (source: {fallback_source})")
 
     # Sort by excess inventory (desc)
     candidates.sort(key=lambda t: t[1], reverse=True)

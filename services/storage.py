@@ -21,6 +21,13 @@ from database import (
 from settings import resolve_shop_id, sanitize_shop_id, DEFAULT_SHOP_ID
 from utils import retry_async, is_transient_error
 
+# Import bundle validation for data quality checks
+try:
+    from schemas import validate_bundle
+except ImportError:
+    # Fallback if schemas module not available
+    validate_bundle = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -853,6 +860,22 @@ class StorageService:
                 for json_field in ['products', 'pricing', 'ai_copy']:
                     if json_field in row and row[json_field]:
                         row[json_field] = self._convert_decimals_to_float(row[json_field])
+
+            # Validate bundles and log warnings for data quality issues
+            if validate_bundle:
+                validation_warnings = 0
+                for row in filtered_rows:
+                    is_valid, errors = validate_bundle(row)
+                    if not is_valid:
+                        validation_warnings += 1
+                        if validation_warnings <= 3:  # Log first 3 warnings in detail
+                            logger.warning(
+                                f"Bundle validation warning (id={row.get('id', 'unknown')}): {errors[:3]}"
+                            )
+                if validation_warnings > 0:
+                    logger.warning(
+                        f"Bundle validation: {validation_warnings}/{len(filtered_rows)} bundles have data quality issues"
+                    )
 
             # Remove any existing recommendations with matching IDs to support upsert-like behaviour
             existing_ids = [row.get("id") for row in filtered_rows if row.get("id")]
