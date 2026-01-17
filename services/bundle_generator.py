@@ -62,6 +62,27 @@ except ImportError:  # pragma: no cover - optional dependency
 
 logger = logging.getLogger(__name__)
 
+
+def _make_product_gid(product_id: Any) -> str:
+    """Build a valid Shopify product GID, or empty string if no product_id.
+
+    CRITICAL: Frontend requires full GID format: gid://shopify/Product/123
+    An empty product_gid is better than an invalid one like gid://shopify/Product/
+    """
+    pid = str(product_id or "").strip()
+    if pid:
+        return f"gid://shopify/Product/{pid}"
+    return ""
+
+
+def _make_variant_gid(variant_id: Any) -> str:
+    """Build a valid Shopify variant GID, or empty string if no variant_id."""
+    vid = str(variant_id or "").strip()
+    if vid:
+        return f"gid://shopify/ProductVariant/{vid}"
+    return ""
+
+
 class BundleGenerator:
     """Bundle generator service creating recommendations from association rules"""
     
@@ -937,36 +958,61 @@ class BundleGenerator:
         return []
 
     def _enrich_single_product(self, product_id: str, catalog: Dict[str, Any]) -> Dict[str, Any]:
-        """Enrich a single product identifier with full metadata from catalog."""
-        # Try to find in catalog (keyed by variant_id)
+        """Enrich a single product identifier with full metadata from catalog.
+
+        Tries multiple lookup strategies:
+        1. Direct lookup by variant_id (catalog is keyed by variant_id)
+        2. Lookup by SKU (iterate through catalog)
+        3. Lookup by product_id (iterate through catalog)
+        """
+        snap = None
+
+        # Strategy 1: Direct lookup by variant_id (most common)
         snap = catalog.get(product_id)
+
+        # Strategy 2: Lookup by SKU if not found
+        if not snap and product_id:
+            for cat_snap in catalog.values():
+                if getattr(cat_snap, 'sku', None) == product_id:
+                    snap = cat_snap
+                    break
+
+        # Strategy 3: Lookup by product_id if still not found
+        if not snap and product_id:
+            for cat_snap in catalog.values():
+                if str(getattr(cat_snap, 'product_id', '')) == str(product_id):
+                    snap = cat_snap
+                    break
 
         if snap:
             # Found in catalog - extract full metadata
-            product_id_str = getattr(snap, 'product_id', '')
-            variant_id = getattr(snap, 'variant_id', product_id)
+            product_id_str = str(getattr(snap, 'product_id', '') or '')
+            variant_id = str(getattr(snap, 'variant_id', product_id) or product_id)
+
+            # CRITICAL: product_gid MUST be full GID format for frontend
             return {
-                "product_gid": f"gid://shopify/Product/{product_id_str}" if product_id_str else "",
-                "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
-                "variant_id": variant_id,
+                "product_gid": _make_product_gid(product_id_str),
+                "variant_gid": _make_variant_gid(variant_id),
+                "variant_id": variant_id,  # Plain ID, not GID (frontend converts)
                 "product_id": product_id_str,
-                "name": getattr(snap, 'product_title', 'Product'),
-                "title": getattr(snap, 'product_title', 'Product'),
+                "name": getattr(snap, 'product_title', '') or 'Product',
+                "title": getattr(snap, 'product_title', '') or 'Product',
                 "price": float(getattr(snap, 'price', 0) or 0),
-                "sku": getattr(snap, 'sku', ''),
+                "sku": getattr(snap, 'sku', '') or '',
                 "image_url": getattr(snap, 'image_url', None),
             }
         else:
-            # Not in catalog - return minimal structure with identifier
+            # Not in catalog - log warning and return minimal structure
+            logger.warning(f"Product not found in catalog: {product_id}")
             return {
-                "product_gid": "",
+                "product_gid": "",  # Empty = frontend will show "Unknown Product"
                 "variant_gid": f"gid://shopify/ProductVariant/{product_id}" if product_id else "",
                 "variant_id": product_id,
                 "product_id": "",
                 "name": "Unknown Product",
                 "title": "Unknown Product",
                 "price": 0.0,
-                "sku": product_id,
+                "sku": product_id or "",
                 "image_url": None,
             }
 
@@ -5922,8 +5968,8 @@ def _build_quick_start_fbt_bundles(
             "price": price1,
             "variant_id": variant_id_1,
             "product_id": getattr(p1, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(p1, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id_1}",
+            "product_gid": _make_product_gid(getattr(p1, 'product_id', '')),
+            "variant_gid": _make_variant_gid(variant_id_1),
             "image_url": getattr(p1, 'image_url', None),
         }
         product2_data = {
@@ -5933,8 +5979,8 @@ def _build_quick_start_fbt_bundles(
             "price": price2,
             "variant_id": variant_id_2,
             "product_id": getattr(p2, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(p2, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id_2}",
+            "product_gid": _make_product_gid(getattr(p2, 'product_id', '')),
+            "variant_gid": _make_variant_gid(variant_id_2),
             "image_url": getattr(p2, 'image_url', None),
         }
 
@@ -6219,8 +6265,8 @@ def _build_quick_start_bogo_bundles(
             "price": price,
             "variant_id": variant_id,
             "product_id": product_id,
-            "product_gid": f"gid://shopify/Product/{product_id}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "product_gid": _make_product_gid(product_id),
+            "variant_gid": _make_variant_gid(variant_id),
             "image_url": getattr(snap, 'image_url', None),
         }
 
@@ -6416,8 +6462,8 @@ def _build_quick_start_volume_bundles(
             "price": price,
             "variant_id": variant_id,
             "product_id": product_id_str,
-            "product_gid": f"gid://shopify/Product/{product_id_str}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "product_gid": _make_product_gid(product_id_str),
+            "variant_gid": _make_variant_gid(variant_id),
             "image_url": getattr(snap, 'image_url', None),
         }
 
@@ -6690,8 +6736,8 @@ def _build_bayesian_bundles(
             "price": price1,
             "variant_id": v1,
             "product_id": getattr(p1, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(p1, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{v1}",
+            "product_gid": _make_product_gid(getattr(p1, 'product_id', '')),
+            "variant_gid": _make_variant_gid(v1),
             "image_url": getattr(p1, 'image_url', None),
         }
 
@@ -6702,8 +6748,8 @@ def _build_bayesian_bundles(
             "price": price2,
             "variant_id": v2,
             "product_id": getattr(p2, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(p2, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{v2}",
+            "product_gid": _make_product_gid(getattr(p2, 'product_id', '')),
+            "variant_gid": _make_variant_gid(v2),
             "image_url": getattr(p2, 'image_url', None),
         }
 
@@ -6832,8 +6878,8 @@ def _build_catalog_fallback_bundles(
             "price": price,
             "variant_id": variant_id,
             "product_id": getattr(product, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(product, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "product_gid": _make_product_gid(getattr(product, 'product_id', '')),
+            "variant_gid": _make_variant_gid(variant_id),
             "image_url": getattr(product, 'image_url', None),
         }
 
@@ -6922,8 +6968,8 @@ def _enrich_products_with_metadata(
             "price": float(getattr(catalog_entry, 'price', 0) or 0),
             "variant_id": variant_id,
             "product_id": getattr(catalog_entry, 'product_id', ''),
-            "product_gid": f"gid://shopify/Product/{getattr(catalog_entry, 'product_id', '')}",
-            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "product_gid": _make_product_gid(getattr(catalog_entry, 'product_id', '')),
+            "variant_gid": _make_variant_gid(variant_id),
             "image_url": getattr(catalog_entry, 'image_url', None),
         }
         enriched_items.append(product_data)

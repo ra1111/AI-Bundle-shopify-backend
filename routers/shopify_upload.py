@@ -18,7 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from database import AsyncSessionLocal, BundleRecommendation, CsvUpload, get_db
+from database import AsyncSessionLocal, BundleRecommendation, CsvUpload, GenerationProgress, get_db
 from routers.bundle_recommendations import generate_bundles_background
 from routers.uploads import (
     _ensure_data_ready,
@@ -515,19 +515,48 @@ async def stream_progress(upload_id: str):
                     count = result.scalar() or 0
                     bundle_count = count if count > 0 else None
 
-                    # Calculate progress percentage
-                    progress = 0
-                    if upload.total_rows > 0:
-                        progress = int((upload.processed_rows / upload.total_rows) * 100)
+                    # Get generation progress for step, message, metadata
+                    # This is the source of truth for generation state
+                    gen_progress = None
+                    try:
+                        gen_stmt = select(GenerationProgress).where(
+                            GenerationProgress.upload_id == upload.id
+                        )
+                        gen_result = await db.execute(gen_stmt)
+                        gen_progress = gen_result.scalar_one_or_none()
+                    except Exception:
+                        pass  # Fall back to CsvUpload-based progress
 
-                    # Normalize status for frontend
-                    frontend_status = upload.status
-                    if upload.status in {"bundle_generation_completed"}:
-                        frontend_status = "completed"
-                    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
-                        frontend_status = "processing"
-                    elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
-                        frontend_status = "failed"
+                    # Use generation_progress if available, else derive from CsvUpload
+                    if gen_progress:
+                        step = gen_progress.step
+                        progress = gen_progress.progress
+                        message = gen_progress.message or ""
+                        metadata = gen_progress.metadata_json if isinstance(gen_progress.metadata_json, dict) else {}
+                        frontend_status = gen_progress.status
+                        if frontend_status == "in_progress":
+                            frontend_status = "processing"
+                    else:
+                        # Fallback: derive step from CsvUpload status
+                        step = "queueing"
+                        progress = 0
+                        message = "Processing..."
+                        metadata = {}
+                        if upload.total_rows > 0:
+                            progress = int((upload.processed_rows / upload.total_rows) * 100)
+
+                        # Normalize status for frontend
+                        frontend_status = upload.status
+                        if upload.status in {"bundle_generation_completed"}:
+                            frontend_status = "completed"
+                            step = "finalization"
+                            progress = 100
+                        elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+                            frontend_status = "processing"
+                            step = "ml_generation"
+                        elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
+                            frontend_status = "failed"
+                            message = upload.error_message or "Generation failed"
 
                     # Only send event if something changed
                     if frontend_status != last_status or progress != last_progress:
@@ -536,12 +565,12 @@ async def stream_progress(upload_id: str):
 
                         event_data = {
                             "upload_id": upload.id,
+                            "step": step,
                             "status": frontend_status,
-                            "internal_status": upload.status,
                             "progress": progress,
-                            "total_rows": upload.total_rows,
-                            "processed_rows": upload.processed_rows,
-                            "bundle_count": bundle_count,
+                            "message": message,
+                            "bundle_count": bundle_count if bundle_count else 0,
+                            "metadata": metadata,
                             "error_message": upload.error_message,
                         }
                         yield f"event: progress\ndata: {json_lib.dumps(event_data)}\n\n"
@@ -551,8 +580,10 @@ async def stream_progress(upload_id: str):
                         # Send final event and close
                         event_data = {
                             "upload_id": upload.id,
+                            "step": "finalization" if frontend_status == "completed" else step,
                             "status": frontend_status,
-                            "bundle_count": bundle_count,
+                            "progress": 100 if frontend_status == "completed" else progress,
+                            "bundle_count": bundle_count if bundle_count else 0,
                             "final": True,
                         }
                         yield f"event: complete\ndata: {json_lib.dumps(event_data)}\n\n"
