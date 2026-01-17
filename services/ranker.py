@@ -174,7 +174,7 @@ class WeightedLinearRanker:
             logger.warning(f"Error computing ranking features: {e}")
             return candidate
     
-    async def compute_objective_fit(self, product_skus: List[str], objective: str, csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
+    async def compute_objective_fit(self, variant_ids: List[str], objective: str, csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
         """
         DEPRECATED: Objective fit is no longer used (weight = 0.0).
 
@@ -187,39 +187,39 @@ class WeightedLinearRanker:
         # Old implementation below (kept for reference, never executed)
         # -----------------------------------------------------------
         try:
-            if not product_skus:
+            if not variant_ids:
                 return Decimal('0')
             
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
             if catalog_map is None:
                 catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
             
-            catalog_items = [catalog_map.get(sku) for sku in product_skus if sku in catalog_map]
+            catalog_items = [catalog_map.get(vid) for vid in variant_ids if vid in catalog_map]
             if not catalog_items:
                 return Decimal('0')
-            
+
             total_score = Decimal('0')
             for item in catalog_items:
                 item_score = Decimal('0')
-                
+
                 # Get objective flags if available
                 flags = {}
                 if hasattr(item, 'objective_flags') and item.objective_flags:
                     flags = item.objective_flags if isinstance(item.objective_flags, dict) else {}
-                
+
                 # Score based on objective
                 if objective == "clear_slow_movers":
                     if flags.get("is_slow_mover", False):
                         item_score += Decimal('0.8')
                     if item.available_total > 10:
                         item_score += Decimal('0.2')
-                
+
                 elif objective == "new_launch":
                     if flags.get("is_new_launch", False):
                         item_score += Decimal('0.8')
                     if item.available_total > 0:
                         item_score += Decimal('0.2')
-                
+
                 elif objective == "margin_guard":
                     if flags.get("is_high_margin", False):
                         item_score += Decimal('0.7')
@@ -228,22 +228,22 @@ class WeightedLinearRanker:
                         item_score += Decimal('0.3')
                     elif avg_discount > Decimal('25'):
                         item_score -= Decimal('0.2')  # Penalty for high historical discounts
-                
+
                 elif objective == "increase_aov":
                     # Favor higher-priced items and multi-item bundles
                     if item.price > Decimal('25'):
                         item_score += Decimal('0.4')
-                    if len(product_skus) > 2:
+                    if len(variant_ids) > 2:
                         item_score += Decimal('0.3')
                     if item.available_total > 0:
                         item_score += Decimal('0.3')
-                
+
                 elif objective == "seasonal_promo":
                     if flags.get("is_seasonal", False):
                         item_score += Decimal('0.7')
                     if item.available_total > 0:
                         item_score += Decimal('0.3')
-                
+
                 else:
                     # Default scoring
                     if item.available_total > 0:
@@ -252,28 +252,28 @@ class WeightedLinearRanker:
                         item_score += Decimal('0.3')
                     if not flags.get("is_gift_card", False):
                         item_score += Decimal('0.2')
-                
+
                 total_score += item_score
-            
+
             # Average score across items, normalized to [0, 1]
             avg_score = total_score / Decimal(str(len(catalog_items)))
             return min(Decimal('1'), max(Decimal('0'), avg_score))
-            
+
         except Exception as e:
             logger.warning(f"Error computing objective fit: {e}")
             return Decimal('0')
-    
-    async def compute_inventory_term(self, product_skus: List[str], csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
+
+    async def compute_inventory_term(self, variant_ids: List[str], csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
         """Compute inventory availability score"""
         try:
-            if not product_skus:
+            if not variant_ids:
                 return Decimal('0')
-            
+
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
             if catalog_map is None:
                 catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
-            
-            catalog_items = [catalog_map.get(sku) for sku in product_skus if sku in catalog_map]
+
+            catalog_items = [catalog_map.get(vid) for vid in variant_ids if vid in catalog_map]
             if not catalog_items:
                 return Decimal('0')
             
@@ -295,10 +295,10 @@ class WeightedLinearRanker:
             logger.warning(f"Error computing inventory term: {e}")
             return Decimal('0.5')  # Default middle score
     
-    async def compute_price_sanity(self, product_skus: List[str], pricing: Dict[str, Any], csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
+    async def compute_price_sanity(self, variant_ids: List[str], pricing: Dict[str, Any], csv_upload_id: str, catalog_map: Dict = None) -> Decimal:
         """Compute price sanity score (penalize over-discounting)"""
         try:
-            if not product_skus or not pricing:
+            if not variant_ids or not pricing:
                 return Decimal('0.5')  # Neutral score if no pricing data
             
             # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-pair queries
@@ -307,20 +307,20 @@ class WeightedLinearRanker:
             
             # Get historical discount data for products
             historical_discounts = {}
-            for sku in product_skus:
-                # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-SKU queries
+            for vid in variant_ids:
+                # ARCHITECT FIX: Use preloaded catalog_map instead of unsafe per-variant queries
                 try:
-                    if catalog_map and sku in catalog_map:
-                        catalog_item = catalog_map[sku]
+                    if catalog_map and vid in catalog_map:
+                        catalog_item = catalog_map[vid]
                         if catalog_item and hasattr(catalog_item, 'objective_flags') and catalog_item.objective_flags:
                             flags = catalog_item.objective_flags if isinstance(catalog_item.objective_flags, dict) else {}
-                            historical_discounts[sku] = Decimal('10')  # Default since avg_discount_pct removed
+                            historical_discounts[vid] = Decimal('10')  # Default since avg_discount_pct removed
                         else:
-                            historical_discounts[sku] = Decimal('10')  # Default
+                            historical_discounts[vid] = Decimal('10')  # Default
                     else:
-                        historical_discounts[sku] = Decimal('10')  # Default
+                        historical_discounts[vid] = Decimal('10')  # Default
                 except Exception:
-                    historical_discounts[sku] = Decimal('10')
+                    historical_discounts[vid] = Decimal('10')
             
             # Check bundle discount against historical baselines
             bundle_discount_pct = Decimal('0')

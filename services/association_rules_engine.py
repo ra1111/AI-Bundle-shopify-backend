@@ -70,18 +70,15 @@ class AssociationRulesEngine:
         orders_map: Dict[str, Set[str]] = defaultdict(set)
         
         for line in order_lines:
-            # Use variant_id as canonical key, fallback to sku for compatibility
+            # Use variant_id as the PRIMARY key (no SKU fallback)
             variant_id = getattr(line, 'variant_id', None)
-            sku = getattr(line, 'sku', None)
             order_id = getattr(line, 'order_id', None)
-            
-            # Prefer variant_id, but allow sku fallback
-            product_key = variant_id or sku
-            if product_key and order_id:
-                orders_map[order_id].add(product_key)
-        
+
+            if variant_id and order_id:
+                orders_map[order_id].add(variant_id)
+
         # Filter out single-item transactions (need at least 2 items for rules)
-        transactions = [skus for skus in orders_map.values() if len(skus) >= 2]
+        transactions = [variant_ids for variant_ids in orders_map.values() if len(variant_ids) >= 2]
         return transactions
     
     def generate_frequent_itemsets(self, transactions: List[Set[str]]) -> Dict[int, List[Tuple[frozenset, float]]]:

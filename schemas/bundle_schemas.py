@@ -45,16 +45,20 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class ProductDataDict(TypedDict, total=False):
-    """Product data structure - REQUIRED fields for frontend."""
+    """Product data structure - REQUIRED fields for frontend.
+
+    NOTE: variant_id is the PRIMARY identifier used for all internal lookups.
+    SKU is optional and only used for display purposes.
+    """
     # === REQUIRED ===
     product_gid: str      # "gid://shopify/Product/123" - CRITICAL for Shopify API
     name: str             # Product display name
     price: float          # Product price (number, not string)
+    variant_id: str       # Shopify variant ID - PRIMARY KEY for all lookups
 
     # === RECOMMENDED ===
-    variant_id: str       # Shopify variant ID (numeric string)
     variant_gid: str      # "gid://shopify/ProductVariant/456"
-    sku: str              # Product SKU (may be empty)
+    sku: str              # Product SKU - DISPLAY ONLY (may be empty)
     title: str            # Same as name (for backward compatibility)
     image_url: Optional[str]  # Product image URL
     product_id: str       # Shopify product ID (numeric string)
@@ -214,13 +218,17 @@ class BOGOBundleDict(TypedDict, total=False):
 
 @dataclass
 class ProductData:
-    """Product data - REQUIRED fields for frontend."""
+    """Product data - REQUIRED fields for frontend.
+
+    NOTE: variant_id is the PRIMARY identifier used for all internal lookups.
+    SKU is optional and only used for display purposes.
+    """
     product_gid: str  # "gid://shopify/Product/123"
     name: str
     price: float
-    variant_id: str = ""
+    variant_id: str  # PRIMARY KEY - required for all lookups
     variant_gid: str = ""
-    sku: str = ""
+    sku: str = ""  # Display only - may be empty
     title: str = ""
     image_url: Optional[str] = None
     product_id: str = ""
@@ -596,19 +604,21 @@ def normalize_product_data(
     Normalize a product entry to the standard ProductDataDict format.
 
     Handles:
-    - String (SKU or variant_id)
+    - String (variant_id - primary identifier)
     - Dict with partial data
     - Dict with full data
 
     Args:
-        product: Product data in any format
+        product: Product data in any format (variant_id string or dict)
         catalog: Optional catalog mapping variant_id -> CatalogSnapshot
 
     Returns:
         Normalized ProductDataDict with all required fields
+
+    NOTE: variant_id is the PRIMARY identifier. SKU is only for display.
     """
     if isinstance(product, str):
-        # Just a SKU or variant_id string
+        # Assume it's a variant_id (primary identifier)
         variant_id = product
         if catalog and variant_id in catalog:
             snap = catalog[variant_id]
@@ -620,7 +630,7 @@ def normalize_product_data(
                 "price": float(getattr(snap, 'price', 0) or 0),
                 "variant_id": variant_id,
                 "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
-                "sku": getattr(snap, 'sku', ''),
+                "sku": getattr(snap, 'sku', '') or "",  # Display only
                 "image_url": getattr(snap, 'image_url', None),
                 "product_id": product_id,
             }
@@ -633,14 +643,15 @@ def normalize_product_data(
                 "price": 0.0,
                 "variant_id": variant_id,
                 "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
-                "sku": variant_id,
+                "sku": "",  # Don't use variant_id as SKU fallback
                 "image_url": None,
                 "product_id": "",
             }
 
     elif isinstance(product, dict):
         # Already a dict - normalize it
-        variant_id = product.get("variant_id", product.get("sku", ""))
+        # variant_id is PRIMARY, do not fall back to SKU
+        variant_id = product.get("variant_id", "")
         product_id = product.get("product_id", "")
 
         # Try to get product_gid from various sources
@@ -657,8 +668,8 @@ def normalize_product_data(
             "title": name,
             "price": float(product.get("price", 0) or 0),
             "variant_id": variant_id,
-            "variant_gid": product.get("variant_gid", f"gid://shopify/ProductVariant/{variant_id}"),
-            "sku": product.get("sku", ""),
+            "variant_gid": product.get("variant_gid", f"gid://shopify/ProductVariant/{variant_id}") if variant_id else "",
+            "sku": product.get("sku", "") or "",  # Display only
             "image_url": product.get("image_url"),
             "product_id": product_id,
         }

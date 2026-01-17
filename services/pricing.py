@@ -33,51 +33,58 @@ class BayesianPricingEngine:
         self.category_prior_weight = 0.3
         self.global_prior_weight = 0.1
     
-    async def compute_bundle_pricing(self, bundle_products: List[str], objective: str,
+    async def compute_bundle_pricing(self, bundle_variant_ids: List[str], objective: str,
                                    csv_upload_id: str, bundle_type: str) -> Dict[str, Any]:
-        """Compute bundle pricing with Bayesian discount shrinkage"""
+        """Compute bundle pricing with Bayesian discount shrinkage.
+
+        Args:
+            bundle_variant_ids: List of variant_ids (primary identifier) in the bundle
+            objective: Business objective for pricing
+            csv_upload_id: CSV upload ID
+            bundle_type: Type of bundle
+        """
         try:
             # ARCHITECT FIX: Preload catalog_map once for in-memory lookups
             catalog_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
 
-            # Check if all SKUs exist in catalog - return success=False if missing
-            missing_skus = [sku for sku in bundle_products if sku not in catalog_map]
-            if missing_skus:
-                logger.warning(f"Missing SKUs in catalog: {missing_skus}")
+            # Check if all variant_ids exist in catalog - return success=False if missing
+            missing_variant_ids = [vid for vid in bundle_variant_ids if vid not in catalog_map]
+            if missing_variant_ids:
+                logger.warning(f"Missing variant_ids in catalog: {missing_variant_ids}")
                 return {
                     "success": False,
-                    "error": f"Missing catalog data for SKUs: {missing_skus}",
+                    "error": f"Missing catalog data for variant_ids: {missing_variant_ids}",
                     "pricing": {"original_total": Decimal('0'), "bundle_price": Decimal('0'), "discount_amount": Decimal('0')}
                 }
 
             # PERFORMANCE FIX: Preload ALL order_lines once and build in-memory index
             # This prevents N+1 queries when falling back to order_lines for pricing
-            order_lines_by_sku = await self._build_order_lines_index(csv_upload_id)
+            order_lines_by_variant = await self._build_order_lines_index(csv_upload_id)
 
             # Get historical data for all products in bundle
-            product_data = await self.get_product_pricing_data(bundle_products, csv_upload_id, catalog_map)
+            product_data = await self.get_product_pricing_data(bundle_variant_ids, csv_upload_id, catalog_map)
 
             # Compute shrunk discount baselines for each product
             shrunk_discounts = {}
             category_priors = await self.compute_category_priors(csv_upload_id)
             global_prior = await self.compute_global_prior(csv_upload_id)
 
-            for product_sku in bundle_products:
-                if product_sku in product_data:
+            for variant_id in bundle_variant_ids:
+                if variant_id in product_data:
                     shrunk_discount = await self.compute_shrunk_discount(
-                        product_data[product_sku], category_priors, global_prior
+                        product_data[variant_id], category_priors, global_prior
                     )
-                    shrunk_discounts[product_sku] = shrunk_discount
+                    shrunk_discounts[variant_id] = shrunk_discount
                 else:
                     # Fallback for products without historical data
-                    shrunk_discounts[product_sku] = self.get_default_discount(objective)
+                    shrunk_discounts[variant_id] = self.get_default_discount(objective)
 
             # Apply objective-based caps
             capped_discounts = self.apply_objective_caps(shrunk_discounts, objective)
 
             # Compute bundle pricing using preloaded catalog_map and order_lines index
             bundle_pricing = await self.compute_bundle_totals(
-                bundle_products, capped_discounts, csv_upload_id, bundle_type, catalog_map, order_lines_by_sku
+                bundle_variant_ids, capped_discounts, csv_upload_id, bundle_type, catalog_map, order_lines_by_variant
             )
             
             return {
@@ -97,38 +104,44 @@ class BayesianPricingEngine:
                 "pricing": {"original_total": Decimal('0'), "bundle_price": Decimal('0'), "discount_amount": Decimal('0')}
             }
     
-    async def get_product_pricing_data(self, product_skus: List[str], csv_upload_id: str, catalog_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-        """Get historical pricing data for products using preloaded catalog_map"""
+    async def get_product_pricing_data(self, variant_ids: List[str], csv_upload_id: str, catalog_map: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+        """Get historical pricing data for products using preloaded catalog_map.
+
+        Args:
+            variant_ids: List of variant_ids (primary identifier)
+            csv_upload_id: CSV upload ID
+            catalog_map: Preloaded catalog map keyed by variant_id
+        """
         product_data = {}
-        
-        for sku in product_skus:
+
+        for variant_id in variant_ids:
             try:
                 # Get historical sales data for this product
-                sales_data = await storage.get_variant_sales_data(sku, csv_upload_id, days=180)
-                catalog_item = catalog_map.get(sku)  # Use in-memory lookup instead of DB query
-                
+                sales_data = await storage.get_variant_sales_data(variant_id, csv_upload_id, days=180)
+                catalog_item = catalog_map.get(variant_id)  # Use in-memory lookup instead of DB query
+
                 if sales_data and catalog_item:
                     # Compute historical discount statistics
                     total_revenue = Decimal('0')
                     total_discount = Decimal('0')
                     transaction_count = 0
-                    
+
                     for sale in sales_data:
                         line_revenue = sale.unit_price * sale.quantity
                         total_revenue += line_revenue
-                        
+
                         # Estimate discount from price difference (if compare_at_price available)
                         if catalog_item.compare_at_price and catalog_item.compare_at_price > sale.unit_price:
                             line_discount = (catalog_item.compare_at_price - sale.unit_price) * sale.quantity
                             total_discount += line_discount
-                        
+
                         transaction_count += 1
-                    
+
                     discount_pct = Decimal('0')
                     if total_revenue > 0:
                         discount_pct = (total_discount / total_revenue) * Decimal('100')
-                    
-                    product_data[sku] = {
+
+                    product_data[variant_id] = {
                         "historical_discount_pct": discount_pct,
                         "transaction_count": transaction_count,
                         "category": catalog_item.product_type or "general",
@@ -136,11 +149,11 @@ class BayesianPricingEngine:
                         "compare_at_price": catalog_item.compare_at_price,
                         "total_revenue": total_revenue
                     }
-                
+
             except Exception as e:
-                logger.warning(f"Error getting pricing data for {sku}: {e}")
+                logger.warning(f"Error getting pricing data for variant_id {variant_id}: {e}")
                 continue
-        
+
         return product_data
     
     async def compute_category_priors(self, csv_upload_id: str) -> Dict[str, Decimal]:
@@ -149,26 +162,27 @@ class BayesianPricingEngine:
             # Get all catalog items with sales data
             catalog_items = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
             category_stats = defaultdict(lambda: {"total_discount": Decimal('0'), "total_revenue": Decimal('0'), "count": 0})
-            
+
             for item in catalog_items:
                 try:
-                    sales_data = await storage.get_variant_sales_data(item.sku, csv_upload_id, days=90)
+                    # Use variant_id as the primary identifier for lookups
+                    sales_data = await storage.get_variant_sales_data(item.variant_id, csv_upload_id, days=90)
                     if sales_data:
                         category = item.product_type or "general"
-                        
+
                         for sale in sales_data:
                             line_revenue = sale.unit_price * sale.quantity
                             category_stats[category]["total_revenue"] += line_revenue
-                            
+
                             # Estimate discount
                             if item.compare_at_price and item.compare_at_price > sale.unit_price:
                                 line_discount = (item.compare_at_price - sale.unit_price) * sale.quantity
                                 category_stats[category]["total_discount"] += line_discount
-                            
+
                             category_stats[category]["count"] += 1
-                
+
                 except Exception as e:
-                    logger.warning(f"Error processing category data for {item.sku}: {e}")
+                    logger.warning(f"Error processing category data for variant_id {item.variant_id}: {e}")
                     continue
             
             # Compute category priors
@@ -192,25 +206,25 @@ class BayesianPricingEngine:
             # Get overall discount statistics
             all_sales = await storage.get_all_sales_data(csv_upload_id, days=90)
             catalog_items_map = await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
-            
+
             total_revenue = Decimal('0')
             total_discount = Decimal('0')
-            
+
             for sale in all_sales:
                 line_revenue = sale.unit_price * sale.quantity
                 total_revenue += line_revenue
-                
-                # Get catalog data for discount calculation
-                catalog_item = catalog_items_map.get(sale.sku)
+
+                # Get catalog data for discount calculation using variant_id
+                catalog_item = catalog_items_map.get(sale.variant_id)
                 if catalog_item and catalog_item.compare_at_price and catalog_item.compare_at_price > sale.unit_price:
                     line_discount = (catalog_item.compare_at_price - sale.unit_price) * sale.quantity
                     total_discount += line_discount
-            
+
             if total_revenue > 0:
                 return (total_discount / total_revenue) * Decimal('100')
             else:
                 return Decimal('12')  # Default global prior
-                
+
         except Exception as e:
             logger.warning(f"Error computing global prior: {e}")
             return Decimal('12')
@@ -266,16 +280,21 @@ class BayesianPricingEngine:
             return Decimal('10')  # Safe fallback
     
     def apply_objective_caps(self, shrunk_discounts: Dict[str, Decimal], objective: str) -> Dict[str, Decimal]:
-        """Apply objective-based caps to shrunk discounts"""
+        """Apply objective-based caps to shrunk discounts.
+
+        Args:
+            shrunk_discounts: Dict mapping variant_id -> discount percentage
+            objective: Business objective
+        """
         caps = self.objective_caps.get(objective, {"min_discount": Decimal('0'), "max_discount": Decimal('30')})
         min_cap = caps["min_discount"]
         max_cap = caps["max_discount"]
-        
+
         capped_discounts = {}
-        for sku, discount in shrunk_discounts.items():
+        for variant_id, discount in shrunk_discounts.items():
             capped_discount = max(min_cap, min(max_cap, discount))
-            capped_discounts[sku] = capped_discount
-        
+            capped_discounts[variant_id] = capped_discount
+
         return capped_discounts
     
     def get_default_discount(self, objective: str) -> Decimal:
@@ -285,66 +304,69 @@ class BayesianPricingEngine:
         return (caps["min_discount"] + caps["max_discount"]) / Decimal('2')
 
     async def _build_order_lines_index(self, csv_upload_id: str) -> Dict[str, List[Any]]:
-        """Build in-memory index of order_lines grouped by SKU/variant_id.
+        """Build in-memory index of order_lines grouped by variant_id.
 
         This prevents N+1 queries when looking up order_lines for pricing fallback.
-        Fetches ALL order_lines once and groups them by both SKU and variant_id.
+        Fetches ALL order_lines once and groups them by variant_id (primary key).
         """
         try:
             # Fetch ALL order lines in one query
             order_lines = await storage.get_order_lines(csv_upload_id)
 
-            # Build index: both sku -> lines and variant_id -> lines
-            by_sku = defaultdict(list)
+            # Build index: variant_id -> lines (primary key)
+            by_variant = defaultdict(list)
             for line in order_lines:
-                sku = getattr(line, 'sku', None)
                 variant_id = getattr(line, 'variant_id', None)
 
-                # Index by SKU if present
-                if sku:
-                    sku_str = str(sku).strip()
-                    if sku_str:
-                        by_sku[sku_str].append(line)
-
-                # Also index by variant_id (for products without SKUs)
+                # Index by variant_id (primary key)
                 if variant_id:
                     variant_id_str = str(variant_id).strip()
                     if variant_id_str:
-                        by_sku[variant_id_str].append(line)
+                        by_variant[variant_id_str].append(line)
 
             logger.info(
-                f"[{csv_upload_id}] Built order_lines index: {len(order_lines)} lines -> {len(by_sku)} unique identifiers"
+                f"[{csv_upload_id}] Built order_lines index: {len(order_lines)} lines -> {len(by_variant)} unique variant_ids"
             )
-            return dict(by_sku)
+            return dict(by_variant)
 
         except Exception as e:
             logger.warning(f"Failed to build order_lines index: {e}. Returning empty index.")
             return {}
 
-    async def compute_bundle_totals(self, product_skus: List[str], capped_discounts: Dict[str, Decimal],
+    async def compute_bundle_totals(self, variant_ids: List[str], capped_discounts: Dict[str, Decimal],
                                   csv_upload_id: str, bundle_type: str, catalog_map: Dict[str, Any],
-                                  order_lines_by_sku: Optional[Dict[str, List[Any]]] = None) -> Dict[str, Any]:
-        """Compute final bundle pricing totals using preloaded catalog_map"""
+                                  order_lines_by_variant: Optional[Dict[str, List[Any]]] = None) -> Dict[str, Any]:
+        """Compute final bundle pricing totals using preloaded catalog_map.
+
+        Args:
+            variant_ids: List of variant_ids (primary identifier)
+            capped_discounts: Dict mapping variant_id -> discount percentage
+            csv_upload_id: CSV upload ID
+            bundle_type: Type of bundle
+            catalog_map: Preloaded catalog map keyed by variant_id
+            order_lines_by_variant: Preloaded order lines index keyed by variant_id
+        """
         try:
             original_total = Decimal('0')
             discount_amount = Decimal('0')
             product_details = []
-            
-            for sku in product_skus:
+
+            for variant_id in variant_ids:
                 # Use preloaded catalog_map for in-memory lookup
-                catalog_item = catalog_map.get(sku)
+                catalog_item = catalog_map.get(variant_id)
                 if catalog_item:
                     product_price = catalog_item.price
-                    discount_pct = capped_discounts.get(sku, Decimal('10'))
-                    
+                    discount_pct = capped_discounts.get(variant_id, Decimal('10'))
+
                     product_discount = product_price * (discount_pct / Decimal('100'))
                     discounted_price = product_price - product_discount
-                    
+
                     original_total += product_price
                     discount_amount += product_discount
-                    
+
                     product_details.append({
-                        "sku": sku,
+                        "variant_id": variant_id,
+                        "sku": catalog_item.sku or "",  # Display only
                         "name": catalog_item.product_title,
                         "original_price": product_price,
                         "discount_pct": discount_pct,
@@ -353,28 +375,28 @@ class BayesianPricingEngine:
                     })
                 else:
                     # Architect's fix: Fallback to order_lines pricing when catalog missing
-                    logger.info(f"Catalog missing for SKU: {sku}, trying order_lines fallback")
+                    logger.info(f"Catalog missing for variant_id: {variant_id}, trying order_lines fallback")
 
                     # PERFORMANCE FIX: Use preloaded index instead of N+1 queries
-                    # Old: order_lines = await storage.get_order_lines_by_sku(sku, csv_upload_id)
-                    order_lines = order_lines_by_sku.get(sku, []) if order_lines_by_sku else []
+                    order_lines = order_lines_by_variant.get(variant_id, []) if order_lines_by_variant else []
                     if order_lines:
                         # Use average unit_price from order_lines as fallback
                         avg_price = sum(line.unit_price for line in order_lines if line.unit_price) / len(order_lines)
                         product_price = Decimal(str(avg_price))
-                        discount_pct = capped_discounts.get(sku, Decimal('10'))
-                        
+                        discount_pct = capped_discounts.get(variant_id, Decimal('10'))
+
                         product_discount = product_price * (discount_pct / Decimal('100'))
                         discounted_price = product_price - product_discount
-                        
+
                         original_total += product_price
                         discount_amount += product_discount
-                        
+
                         # Use first order line for name fallback
-                        product_name = order_lines[0].name if order_lines[0].name else f"Product {sku}"
-                        
+                        product_name = order_lines[0].name if order_lines[0].name else f"Product {variant_id}"
+
                         product_details.append({
-                            "sku": sku,
+                            "variant_id": variant_id,
+                            "sku": getattr(order_lines[0], 'sku', '') or "",  # Display only
                             "name": product_name,
                             "original_price": product_price,
                             "discount_pct": discount_pct,
@@ -382,9 +404,9 @@ class BayesianPricingEngine:
                             "discounted_price": discounted_price,
                             "fallback_source": "order_lines"
                         })
-                        logger.info(f"Used order_lines fallback pricing for SKU: {sku}, price: {product_price}")
+                        logger.info(f"Used order_lines fallback pricing for variant_id: {variant_id}, price: {product_price}")
                     else:
-                        logger.warning(f"No pricing data available for SKU: {sku} in catalog or order_lines")
+                        logger.warning(f"No pricing data available for variant_id: {variant_id} in catalog or order_lines")
             
             bundle_price = original_total - discount_amount
             

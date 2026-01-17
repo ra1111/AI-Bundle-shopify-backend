@@ -41,7 +41,7 @@ class LLMEmbeddingEngine:
     Public API:
       - get_embedding(product)
       - get_embeddings_batch(products)
-      - find_similar_products(target_sku, catalog, embeddings, top_k, min_similarity)
+      - find_similar_products(target_variant_id, catalog, embeddings, top_k, min_similarity)
       - compute_bundle_similarity(products, embeddings)
       - generate_candidates_by_similarity(csv_upload_id, bundle_type, objective, catalog, embeddings, num_candidates)
     """
@@ -313,8 +313,10 @@ class LLMEmbeddingEngine:
     # --------- batched embedding (dedup + retries) ---------
     async def get_embeddings_batch(self, products: List[Dict[str, Any]], use_cache: bool = True) -> Dict[str, np.ndarray]:
         """
-        Returns {sku: embedding}. Skips products with no sku.
+        Returns {variant_id: embedding}. Skips products with no variant_id.
         Deduplicates identical texts to save tokens.
+
+        NOTE: Uses variant_id as PRIMARY key for embeddings.
         """
         logger.info("LLM_EMBEDDINGS: request count=%d use_cache=%s", len(products) if products else 0, use_cache)
 
@@ -323,15 +325,16 @@ class LLMEmbeddingEngine:
             return out
 
         # prepare texts & dedup by text hash
-        pending: List[Tuple[str, str, str]] = []  # (sku, text, cache_key)
-        text_to_skus: Dict[str, List[str]] = {}
+        pending: List[Tuple[str, str, str]] = []  # (variant_id, text, cache_key)
+        text_to_variant_ids: Dict[str, List[str]] = {}
         cache_hits = 0
-        missing_sku = 0
+        missing_variant_id = 0
 
         for p in products:
-            sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
-            if not sku:
-                missing_sku += 1
+            # Use variant_id as PRIMARY key
+            variant_id = p.get("variant_id") or p.get("Variant ID")
+            if not variant_id:
+                missing_variant_id += 1
                 continue
             text = self._create_product_text(p)
             cache_key = self._hash(text)
@@ -339,15 +342,15 @@ class LLMEmbeddingEngine:
             if use_cache:
                 cached = await self._get_cached_embedding(cache_key)
                 if cached is not None:
-                    out[sku] = cached
+                    out[variant_id] = cached
                     cache_hits += 1
                     continue
 
-            pending.append((sku, text, cache_key))
-            text_to_skus.setdefault(cache_key, []).append(sku)
+            pending.append((variant_id, text, cache_key))
+            text_to_variant_ids.setdefault(cache_key, []).append(variant_id)
 
-        if missing_sku:
-            logger.info("LLM_EMBEDDINGS: skipped %d catalog entries with no SKU/variant identifier", missing_sku)
+        if missing_variant_id:
+            logger.info("LLM_EMBEDDINGS: skipped %d catalog entries with no variant_id", missing_variant_id)
 
         if not pending:
             logger.info("LLM_EMBEDDINGS: served fully from cache | cache_hits=%d", cache_hits)
@@ -417,14 +420,14 @@ class LLMEmbeddingEngine:
                 await self._set_cached_embedding(ck, v)
                 generated[ck] = v
 
-        # fan out to SKUs
-        for ck, skus in text_to_skus.items():
+        # fan out to variant_ids
+        for ck, variant_ids in text_to_variant_ids.items():
             v = generated.get(ck)
             if v is None:
                 # might have been filled earlier by cache in the same run
                 v = self._memory_cache.get(ck, np.zeros(self.embedding_dim, dtype=np.float32))
-            for sku in skus:
-                out[sku] = v
+            for variant_id in variant_ids:
+                out[variant_id] = v
 
         logger.info("LLM_EMBEDDINGS: done | total=%d cache_hits=%d newly_embedded_unique=%d",
                     len(out), cache_hits, len(generated))
@@ -483,7 +486,7 @@ class LLMEmbeddingEngine:
     # --------- similarity & candidates ---------
     async def find_similar_products(
         self,
-        target_sku: str,
+        target_variant_id: str,
         catalog: List[Dict[str, Any]],
         embeddings: Dict[str, np.ndarray],
         top_k: int = 20,
@@ -491,29 +494,30 @@ class LLMEmbeddingEngine:
         csv_upload_id: Optional[str] = None,
     ) -> List[Tuple[str, float]]:
         span_attrs = {
-            "target_sku": target_sku,
+            "target_variant_id": target_variant_id,
             "catalog_size": len(catalog),
             "threshold": min_similarity,
         }
         with self._start_span("llm_embeddings.similarity_search", span_attrs):
-            if target_sku not in embeddings:
-                logger.warning("SIM: target SKU %s missing embedding", target_sku)
+            if target_variant_id not in embeddings:
+                logger.warning("SIM: target SKU %s missing embedding", target_variant_id)
                 return []
 
-            t = embeddings[target_sku]
+            t = embeddings[target_variant_id]
             sims: List[Tuple[str, float]] = []
             highest_miss: Optional[float] = None
             scope = csv_upload_id or "unknown_upload"
             for p in catalog:
-                sku = p.get("sku") or p.get("Variant SKU") or p.get("variant_sku")
-                if not sku or sku == target_sku:
+                # Use variant_id as PRIMARY key
+                vid = p.get("variant_id") or p.get("Variant ID")
+                if not vid or vid == target_variant_id:
                     continue
-                v = embeddings.get(sku)
+                v = embeddings.get(vid)
                 if v is None:
                     continue
                 s = self._cosine(t, v)
                 if s >= min_similarity:
-                    sims.append((sku, float(s)))
+                    sims.append((vid, float(s)))
                 else:
                     if highest_miss is None or s > highest_miss:
                         highest_miss = float(s)
@@ -524,7 +528,7 @@ class LLMEmbeddingEngine:
                 logger.debug(
                     "[%s] SIM miss | target=%s threshold=%.3f below=%.3f delta=%.3f",
                     scope,
-                    target_sku,
+                    target_variant_id,
                     min_similarity,
                     highest_miss,
                     delta,
@@ -533,7 +537,7 @@ class LLMEmbeddingEngine:
                 logger.info(
                     "[%s] SIM search produced no matches | target=%s threshold=%.3f catalog_checked=%d",
                     scope,
-                    target_sku,
+                    target_variant_id,
                     min_similarity,
                     len(catalog),
                 )
@@ -561,7 +565,7 @@ class LLMEmbeddingEngine:
         embeddings: Dict[str, np.ndarray],
         num_candidates: int = 20,
         orders_count: Optional[int] = None,
-        seed_skus: Optional[List[str]] = None,
+        seed_variant_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         if not catalog or not embeddings:
             return []
@@ -571,14 +575,14 @@ class LLMEmbeddingEngine:
             "bundle_type": bt,
             "objective": objective,
             "catalog_size": len(catalog),
-            "seed_skus": len(seed_skus) if seed_skus else 0,
+            "seed_variant_ids": len(seed_variant_ids) if seed_variant_ids else 0,
         }
         with self._start_span("llm_embeddings.generate_candidates", span_attrs):
-            if seed_skus:
+            if seed_variant_ids:
                 prioritized: List[Dict[str, Any]] = []
                 seen: Set[str] = set()
-                catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
-                for sku in seed_skus:
+                catalog_lookup = {item.get("variant_id"): item for item in catalog if item.get("variant_id")}
+                for sku in seed_variant_ids:
                     item = catalog_lookup.get(sku)
                     if not item:
                         continue
@@ -594,11 +598,11 @@ class LLMEmbeddingEngine:
                         prioritized.append(item)
                     catalog = prioritized
                 logger.info(
-                    "[%s] Similarity pipeline seed info | bundle=%s objective=%s seed_skus=%d prioritized_catalog=%d",
+                    "[%s] Similarity pipeline seed info | bundle=%s objective=%s seed_variant_ids=%d prioritized_catalog=%d",
                     csv_upload_id,
                     bt,
                     objective,
-                    len(seed_skus),
+                    len(seed_variant_ids),
                     len(catalog),
                 )
             fbt_min, too_similar, volume_min = self._resolve_similarity_thresholds(len(catalog))
@@ -758,9 +762,9 @@ class LLMEmbeddingEngine:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(50, len(catalog))]
         scope = csv_upload_id or "unknown_upload"
-        catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
+        catalog_lookup = {item.get("variant_id"): item for item in catalog if item.get("variant_id")}
         anchors_total = len(head)
-        anchors_missing_sku = 0
+        anchors_missing_variant_id = 0
         anchors_missing_embedding = 0
         neighbors_total = 0
         neighbors_added = 0
@@ -781,12 +785,12 @@ class LLMEmbeddingEngine:
             sku = p.get("sku")
             if not sku or sku not in embeddings:
                 if not sku:
-                    anchors_missing_sku += 1
+                    anchors_missing_variant_id += 1
                 else:
                     anchors_missing_embedding += 1
                 continue
             neigh = await self.find_similar_products(
-                target_sku=sku,
+                target_variant_id=sku,
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=10,
@@ -818,10 +822,10 @@ class LLMEmbeddingEngine:
                 neighbors_added += 1
                 if len(out) >= n:
                     logger.info(
-                        "[%s] LLM FBT generation summary | anchors=%d missing_sku=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
+                        "[%s] LLM FBT generation summary | anchors=%d missing_variant_id=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
                         scope,
                         anchors_total,
-                        anchors_missing_sku,
+                        anchors_missing_variant_id,
                         anchors_missing_embedding,
                         neighbors_total,
                         neighbors_added,
@@ -830,10 +834,10 @@ class LLMEmbeddingEngine:
                     )
                     return out
         logger.info(
-            "[%s] LLM FBT generation summary | anchors=%d missing_sku=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
+            "[%s] LLM FBT generation summary | anchors=%d missing_variant_id=%d missing_embedding=%d neighbors=%d added=%d too_similar=%d truncated=%d",
             scope,
             anchors_total,
-            anchors_missing_sku,
+            anchors_missing_variant_id,
             anchors_missing_embedding,
             neighbors_total,
             neighbors_added,
@@ -854,7 +858,7 @@ class LLMEmbeddingEngine:
         out: List[Dict[str, Any]] = []
         head = catalog[: min(30, len(catalog))]
         scope = csv_upload_id or "unknown_upload"
-        catalog_lookup = {item.get("sku"): item for item in catalog if item.get("sku")}
+        catalog_lookup = {item.get("variant_id"): item for item in catalog if item.get("variant_id")}
         anchors_total = len(head)
         anchors_missing = 0
         neighbors_total = 0
@@ -876,7 +880,7 @@ class LLMEmbeddingEngine:
                     anchors_missing += 1
                     continue
                 neigh = await self.find_similar_products(
-                    target_sku=sku,
+                    target_variant_id=sku,
                     catalog=catalog,
                     embeddings=embeddings,
                     top_k=5,

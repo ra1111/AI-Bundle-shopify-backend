@@ -22,16 +22,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class CandidateGenerationContext:
+    """Context for candidate generation.
+
+    NOTE: All identifiers use variant_id as the PRIMARY key.
+    SKU is only stored for display purposes (varid_to_display_sku map).
+    """
     run_id: Optional[str]
-    valid_skus: Set[str]
-    varid_to_sku: Dict[str, str]
-    transactions: List[Set[str]]
-    sequences: List[List[str]]
-    embeddings: Dict[str, np.ndarray]
-    catalog_products: Dict[str, Dict[str, Any]]
+    valid_variant_ids: Set[str]  # Set of valid variant_ids (primary key)
+    varid_to_display_sku: Dict[str, str]  # Maps variant_id -> display SKU (for UI only)
+    transactions: List[Set[str]]  # Sets of variant_ids
+    sequences: List[List[str]]  # Lists of variant_ids
+    embeddings: Dict[str, np.ndarray]  # variant_id -> embedding
+    catalog_products: Dict[str, Dict[str, Any]]  # variant_id -> product data
     catalog_subset: List[Dict[str, Any]]
-    embedding_targets: Set[str]
-    sku_frequency: Dict[str, int]
+    embedding_targets: Set[str]  # Set of variant_ids to embed
+    variant_id_frequency: Dict[str, int]  # variant_id -> frequency count
     llm_candidate_target: int
     llm_only: bool = False
     covis_vectors: Optional[Dict[str, Any]] = None  # MODERN: Co-visitation graph (pseudo-Item2Vec)
@@ -91,56 +96,60 @@ class CandidateGenerator:
         return self.store_size_thresholds[tier]["min_transactions"]
     
     async def prepare_context(self, csv_upload_id: str) -> CandidateGenerationContext:
-        """Prefetch expensive data needed by candidate generation."""
+        """Prefetch expensive data needed by candidate generation.
+
+        NOTE: All identifiers use variant_id as PRIMARY key.
+        """
         import time
         start_time = time.time()
 
         run_id = await storage.get_run_id_for_upload(csv_upload_id)
-        valid_skus = await self.get_valid_skus_for_csv(csv_upload_id)
-        varid_to_sku = await self.get_variantid_to_sku_map(csv_upload_id)
+        valid_variant_ids = await self.get_valid_variant_ids_for_csv(csv_upload_id)
+        varid_to_display_sku = await self.get_variantid_to_display_sku_map(csv_upload_id)
         raw_transactions = await self.get_transactions_for_mining(csv_upload_id)
         raw_sequences = await self.get_purchase_sequences(csv_upload_id)
 
-        transactions = self._normalize_transactions(raw_transactions, varid_to_sku, valid_skus)
-        sequences = self._normalize_sequences(raw_sequences, varid_to_sku, valid_skus)
-        sku_frequency = self._compute_sku_frequency(transactions)
+        transactions = self._normalize_transactions(raw_transactions, varid_to_display_sku, valid_variant_ids)
+        sequences = self._normalize_sequences(raw_sequences, varid_to_display_sku, valid_variant_ids)
+        variant_id_frequency = self._compute_variant_id_frequency(transactions)
 
         # NEW: Generate LLM embeddings (replaces item2vec)
         # Expected time: 2-3 seconds (vs 60-120s for item2vec)
         embeddings: Dict[str, np.ndarray] = {}
         catalog_products: List[Dict[str, Any]] = []
-        catalog_map: Dict[str, Dict[str, Any]] = {}
+        catalog_map: Dict[str, Dict[str, Any]] = {}  # Keyed by variant_id
         catalog_subset: List[Dict[str, Any]] = []
         embedding_targets: Set[str] = set()
         try:
             # Get catalog products for embedding generation
             catalog_entries = await storage.get_catalog_snapshots_by_run(run_id)
             catalog_products = self._materialize_catalog_products(catalog_entries)
-            catalog_map = {item["sku"]: item for item in catalog_products if item.get("sku")}
+            # Key by variant_id (primary key), not SKU
+            catalog_map = {item["variant_id"]: item for item in catalog_products if item.get("variant_id")}
             embedding_targets = set(
                 self._choose_embedding_targets(
-                    valid_skus=valid_skus,
+                    valid_variant_ids=valid_variant_ids,
                     catalog_map=catalog_map,
-                    sku_frequency=sku_frequency,
+                    variant_id_frequency=variant_id_frequency,
                 )
             )
             catalog_subset = [
-                catalog_map[sku]
-                for sku in embedding_targets
-                if sku in catalog_map
+                catalog_map[variant_id]
+                for variant_id in embedding_targets
+                if variant_id in catalog_map
             ]
 
             if not catalog_subset and catalog_products:
                 fallback_subset = catalog_products[: min(self.max_embedding_targets, len(catalog_products))]
                 catalog_subset = fallback_subset
-                embedding_targets = {item["sku"] for item in fallback_subset if item.get("sku")}
+                embedding_targets = {item["variant_id"] for item in fallback_subset if item.get("variant_id")}
 
-            with_sku = sum(1 for item in catalog_products if item.get("sku"))
+            with_variant_id = sum(1 for item in catalog_products if item.get("variant_id"))
             logger.info(
-                "[%s] Preparing LLM embeddings | catalog_items=%d with_sku=%d",
+                "[%s] Preparing LLM embeddings | catalog_items=%d with_variant_id=%d",
                 csv_upload_id,
                 len(catalog_products),
-                with_sku,
+                with_variant_id,
             )
 
             logger.info(
@@ -154,12 +163,12 @@ class CandidateGenerator:
             embeddings = await llm_embedding_engine.get_embeddings_batch(catalog_subset, use_cache=True)
 
             missing_targets = [
-                sku
-                for sku in embedding_targets
-                if sku not in embeddings and sku in catalog_map
+                variant_id
+                for variant_id in embedding_targets
+                if variant_id not in embeddings and variant_id in catalog_map
             ]
             if missing_targets:
-                supplemental_products = [catalog_map[sku] for sku in missing_targets if sku in catalog_map]
+                supplemental_products = [catalog_map[variant_id] for variant_id in missing_targets if variant_id in catalog_map]
                 if supplemental_products:
                     supplemental = await llm_embedding_engine.get_embeddings_batch(
                         supplemental_products, use_cache=True
@@ -194,7 +203,7 @@ class CandidateGenerator:
                 covis_start = time.time()
                 covis_vectors = build_covis_vectors(
                     order_lines=order_lines,
-                    top_skus=embedding_targets,  # Limit to same SKUs as embeddings
+                    top_variant_ids=embedding_targets,  # Limit to same variant_ids as embeddings
                     min_co_visits=1,
                     max_neighbors=50,
                 )
@@ -214,15 +223,15 @@ class CandidateGenerator:
 
         context = CandidateGenerationContext(
             run_id=run_id,
-            valid_skus=valid_skus,
-            varid_to_sku=varid_to_sku,
+            valid_variant_ids=valid_variant_ids,
+            varid_to_display_sku=varid_to_display_sku,
             transactions=transactions,
             sequences=sequences,
             embeddings=embeddings or {},
             catalog_products=catalog_map,
             catalog_subset=catalog_subset,
             embedding_targets=embedding_targets,
-            sku_frequency=dict(sku_frequency),
+            variant_id_frequency=dict(variant_id_frequency),
             llm_candidate_target=20,
             covis_vectors=covis_vectors,  # MODERN: Add co-visitation vectors
         )
@@ -240,9 +249,10 @@ class CandidateGenerator:
     def _normalize_transactions(
         self,
         transactions: Optional[List[Set[str]]],
-        varid_to_sku: Dict[str, str],
-        valid_skus: Set[str],
+        varid_to_display_sku: Dict[str, str],
+        valid_variant_ids: Set[str],
     ) -> List[Set[str]]:
+        """Normalize transactions to use variant_id as primary key."""
         if not transactions:
             logger.warning("No transactions provided for normalization")
             return []
@@ -252,27 +262,27 @@ class CandidateGenerator:
         filtered_items = 0
         retained_items = 0
 
-        # DEBUG: Log sample raw items and valid_skus to understand mismatch
+        # DEBUG: Log sample raw items and valid_variant_ids to understand mismatch
         if transactions:
             sample_raw = list(transactions[0])[:3] if transactions[0] else []
-            logger.warning(f"DEBUG _normalize_transactions | sample_raw_items={sample_raw} | valid_skus_count={len(valid_skus) if valid_skus else 0} | varid_map_count={len(varid_to_sku)}")
-            sample_valid = list(valid_skus)[:5] if valid_skus else []
-            logger.warning(f"DEBUG _normalize_transactions | sample_valid_skus={sample_valid}")
-            sample_varid = list(varid_to_sku.items())[:3] if varid_to_sku else []
-            logger.warning(f"DEBUG _normalize_transactions | sample_varid_to_sku={sample_varid}")
+            logger.warning(f"DEBUG _normalize_transactions | sample_raw_items={sample_raw} | valid_variant_ids_count={len(valid_variant_ids) if valid_variant_ids else 0} | varid_map_count={len(varid_to_display_sku)}")
+            sample_valid = list(valid_variant_ids)[:5] if valid_variant_ids else []
+            logger.warning(f"DEBUG _normalize_transactions | sample_valid_variant_ids={sample_valid}")
+            sample_varid = list(varid_to_display_sku.items())[:3] if varid_to_display_sku else []
+            logger.warning(f"DEBUG _normalize_transactions | sample_varid_to_display_sku={sample_varid}")
 
         for raw_items in transactions:
             cast_items: Set[str] = set()
             for raw in raw_items:
                 total_items += 1
-                resolved = varid_to_sku.get(raw, raw)
+                resolved = varid_to_display_sku.get(raw, raw)
                 if not resolved:
                     continue
                 sku = str(resolved).strip()
                 if not sku:
                     continue
                 mapped_items += 1
-                if valid_skus and sku not in valid_skus:
+                if valid_variant_ids and sku not in valid_variant_ids:
                     filtered_items += 1
                     # DEBUG: Log first few filtered items to understand mismatch
                     if filtered_items <= 3:
@@ -292,16 +302,16 @@ class CandidateGenerator:
             mapped_items,
             filtered_items,
             retained_items,
-            len(valid_skus) if valid_skus else 0,
-            len(varid_to_sku),
+            len(valid_variant_ids) if valid_variant_ids else 0,
+            len(varid_to_display_sku),
         )
         return normalized
 
     def _normalize_sequences(
         self,
         sequences: Optional[List[List[str]]],
-        varid_to_sku: Dict[str, str],
-        valid_skus: Set[str],
+        varid_to_display_sku: Dict[str, str],
+        valid_variant_ids: Set[str],
     ) -> List[List[str]]:
         if not sequences:
             return []
@@ -309,13 +319,13 @@ class CandidateGenerator:
         for raw_seq in sequences:
             seq: List[str] = []
             for raw in raw_seq:
-                resolved = varid_to_sku.get(raw, raw)
+                resolved = varid_to_display_sku.get(raw, raw)
                 if not resolved:
                     continue
                 sku = str(resolved).strip()
                 if not sku:
                     continue
-                if valid_skus and sku not in valid_skus:
+                if valid_variant_ids and sku not in valid_variant_ids:
                     continue
                 seq.append(sku)
             if len(seq) >= 2:
@@ -328,7 +338,7 @@ class CandidateGenerator:
         return normalized
 
     @staticmethod
-    def _compute_sku_frequency(transactions: Optional[List[Set[str]]]) -> Counter:
+    def _compute_variant_id_frequency(transactions: Optional[List[Set[str]]]) -> Counter:
         ctr: Counter = Counter()
         if not transactions:
             return ctr
@@ -400,14 +410,14 @@ class CandidateGenerator:
     def _choose_embedding_targets(
         self,
         *,
-        valid_skus: Set[str],
+        valid_variant_ids: Set[str],
         catalog_map: Dict[str, Dict[str, Any]],
-        sku_frequency: Counter,
+        variant_id_frequency: Counter,
     ) -> List[str]:
         prioritized: List[str] = []
-        if sku_frequency:
+        if variant_id_frequency:
             prioritized.extend(
-                [sku for sku, _ in sku_frequency.most_common(self.max_embedding_targets + self.anchor_prefetch_extra)]
+                [sku for sku, _ in variant_id_frequency.most_common(self.max_embedding_targets + self.anchor_prefetch_extra)]
             )
         flagged = [
             sku
@@ -415,8 +425,8 @@ class CandidateGenerator:
             if meta.get("is_slow_mover") or meta.get("is_new_launch") or meta.get("is_seasonal") or meta.get("is_high_margin")
         ]
         prioritized.extend(flagged)
-        if len(valid_skus) <= self.max_embedding_targets:
-            prioritized.extend(valid_skus)
+        if len(valid_variant_ids) <= self.max_embedding_targets:
+            prioritized.extend(valid_variant_ids)
         deduped: List[str] = []
         seen: Set[str] = set()
         for sku in prioritized:
@@ -436,15 +446,15 @@ class CandidateGenerator:
                 if len(deduped) >= self.min_embedding_targets or len(deduped) >= self.max_embedding_targets:
                     break
         logger.info(
-            "Embedding targets finalized | distinct=%d frequency_prioritized=%d flagged=%d valid_skus=%d",
+            "Embedding targets finalized | distinct=%d frequency_prioritized=%d flagged=%d valid_variant_ids=%d",
             len(deduped),
-            len(sku_frequency),
+            len(variant_id_frequency),
             len(flagged),
-            len(valid_skus),
+            len(valid_variant_ids),
         )
         return deduped
 
-    def _derive_similarity_seed_skus(
+    def _derive_similarity_seed_variant_ids(
         self,
         apriori_candidates: List[Dict[str, Any]],
         fpgrowth_candidates: List[Dict[str, Any]],
@@ -454,17 +464,17 @@ class CandidateGenerator:
         objective: str,
     ) -> List[str]:
         seeds: Set[str] = set()
-        varid_to_sku = context.varid_to_sku if context else {}
-        valid_skus = context.valid_skus if context else set()
+        varid_to_display_sku = context.varid_to_display_sku if context else {}
+        valid_variant_ids = context.valid_variant_ids if context else set()
 
         def _resolve(identifier: Any) -> Optional[str]:
-            value = varid_to_sku.get(identifier, identifier)
+            value = varid_to_display_sku.get(identifier, identifier)
             if not value:
                 return None
             sku = str(value).strip()
             if not sku:
                 return None
-            if valid_skus and sku not in valid_skus:
+            if valid_variant_ids and sku not in valid_variant_ids:
                 return None
             return sku
 
@@ -478,12 +488,12 @@ class CandidateGenerator:
         if context and context.embedding_targets:
             seeds.update(context.embedding_targets)
 
-        objective_skus = []
+        objective_variant_ids = []
         if context and context.catalog_products:
-            objective_skus = self._objective_specific_skus(context.catalog_products, objective)
-            seeds.update(objective_skus)
+            objective_variant_ids = self._objective_specific_variant_ids(context.catalog_products, objective)
+            seeds.update(objective_variant_ids)
 
-        frequency = context.sku_frequency if context else {}
+        frequency = context.variant_id_frequency if context else {}
 
         ordered: List[str] = []
         seen: Set[str] = set()
@@ -502,7 +512,7 @@ class CandidateGenerator:
 
         freq_sorted = sorted(seeds, key=lambda sku: (-frequency.get(sku, 0), sku))
         _append_candidates(freq_sorted)
-        _append_candidates(objective_skus)
+        _append_candidates(objective_variant_ids)
 
         if len(ordered) < self.min_embedding_targets and context and context.catalog_products:
             _append_candidates(context.catalog_products.keys())
@@ -515,15 +525,15 @@ class CandidateGenerator:
         )
         return ordered[: self.max_embedding_targets]
 
-    async def _ensure_embeddings_for_seed_skus(
+    async def _ensure_embeddings_for_seed_variant_ids(
         self,
         embeddings: Dict[str, np.ndarray],
         catalog_map: Dict[str, Dict[str, Any]],
-        seed_skus: Set[str],
+        seed_variant_ids: Set[str],
     ) -> Dict[str, np.ndarray]:
         missing = [
             sku
-            for sku in seed_skus
+            for sku in seed_variant_ids
             if sku not in embeddings and sku in catalog_map
         ]
         if not missing:
@@ -544,17 +554,17 @@ class CandidateGenerator:
     def _prioritize_catalog_subset(
         self,
         catalog_subset: List[Dict[str, Any]],
-        seed_skus: List[str],
+        seed_variant_ids: List[str],
         catalog_map: Dict[str, Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         if not catalog_subset and catalog_map:
             catalog_subset = list(catalog_map.values())
 
-        seed_set = {sku for sku in seed_skus if sku}
+        seed_set = {sku for sku in seed_variant_ids if sku}
         prioritized: List[Dict[str, Any]] = []
         seen: Set[str] = set()
 
-        for sku in seed_skus:
+        for sku in seed_variant_ids:
             product = catalog_map.get(sku)
             if not product:
                 continue
@@ -586,12 +596,12 @@ class CandidateGenerator:
 
         logger.debug(
             "Catalog subset prioritised | seed_count=%d prioritized=%d",
-            len(seed_skus),
+            len(seed_variant_ids),
             len(prioritized),
         )
         return prioritized[: self.max_embedding_targets]
 
-    def _objective_specific_skus(
+    def _objective_specific_variant_ids(
         self,
         catalog_map: Dict[str, Dict[str, Any]],
         objective: str,
@@ -624,7 +634,7 @@ class CandidateGenerator:
             "top_pair_candidates": 0,
             "total_unique_candidates": 0,
             "generation_method": "hybrid",
-            "invalid_sku_candidates_filtered": 0,
+            "invalid_variant_id_candidates_filtered": 0,
             "store_tier": "unknown",
             "order_count": 0,
         }
@@ -646,10 +656,10 @@ class CandidateGenerator:
 
             # CRITICAL FIX: Preload valid SKUs to prevent infinite loop
             logger.info(f"Preloading valid SKUs for scope: run_id={run_id} csv_upload_id={csv_upload_id}")
-            valid_skus = context.valid_skus if context else await self.get_valid_skus_for_csv(csv_upload_id)
+            valid_variant_ids = context.valid_variant_ids if context else await self.get_valid_variant_ids_for_csv(csv_upload_id)
             # Map variant_id -> sku so rule products expressed as variant_ids can be validated against catalog
-            varid_to_sku = context.varid_to_sku if context else await self.get_variantid_to_sku_map(csv_upload_id)
-            logger.info(f"Found {len(valid_skus)} valid SKUs for prefiltering")
+            varid_to_display_sku = context.varid_to_display_sku if context else await self.get_variantid_to_display_sku_map(csv_upload_id)
+            logger.info(f"Found {len(valid_variant_ids)} valid SKUs for prefiltering")
             
             llm_only_mode = bool(getattr(context, "llm_only", False))
             if llm_only_mode:
@@ -741,21 +751,21 @@ class CandidateGenerator:
                         catalog_map = {item["sku"]: item for item in fallback_products if item.get("sku")}
                         catalog_subset = fallback_products[: min(self.max_embedding_targets, len(fallback_products))]
 
-                    seed_skus = self._derive_similarity_seed_skus(
+                    seed_variant_ids = self._derive_similarity_seed_variant_ids(
                         apriori_candidates,
                         fpgrowth_candidates,
                         top_pair_candidates,
                         context=context,
                         objective=objective,
                     )
-                    embeddings = await self._ensure_embeddings_for_seed_skus(
+                    embeddings = await self._ensure_embeddings_for_seed_variant_ids(
                         embeddings,
                         catalog_map,
-                        set(seed_skus),
+                        set(seed_variant_ids),
                     )
                     prioritized_catalog = self._prioritize_catalog_subset(
                         catalog_subset,
-                        seed_skus,
+                        seed_variant_ids,
                         catalog_map,
                     )
                     if context is not None:
@@ -776,15 +786,15 @@ class CandidateGenerator:
                         embeddings=embeddings,
                         num_candidates=llm_target,
                         orders_count=orders_count,
-                        seed_skus=seed_skus if seed_skus else None,
+                        seed_variant_ids=seed_variant_ids if seed_variant_ids else None,
                     )
-                    metrics["llm_candidates_seeded"] = len(seed_skus)
+                    metrics["llm_candidates_seeded"] = len(seed_variant_ids)
                     logger.info(
-                        "[%s] Generated %d LLM-based candidates (target=%d seed_skus=%d catalog_subset=%d)",
+                        "[%s] Generated %d LLM-based candidates (target=%d seed_variant_ids=%d catalog_subset=%d)",
                         csv_upload_id,
                         len(llm_candidates),
                         llm_target,
-                        len(seed_skus),
+                        len(seed_variant_ids),
                         len(prioritized_catalog),
                     )
                     if llm_candidates:
@@ -836,14 +846,14 @@ class CandidateGenerator:
 
             # CRITICAL FIX: Filter out candidates with invalid products (allow variant_id by mapping to sku)
             original_count = len(all_candidates)
-            all_candidates = self.filter_candidates_by_valid_skus(
-                all_candidates, valid_skus, varid_to_sku, csv_upload_id=csv_upload_id
+            all_candidates = self.filter_candidates_by_valid_variant_ids(
+                all_candidates, valid_variant_ids, varid_to_display_sku, csv_upload_id=csv_upload_id
             )
             invalid_filtered = original_count - len(all_candidates)
-            metrics["invalid_sku_candidates_filtered"] = invalid_filtered
+            metrics["invalid_variant_id_candidates_filtered"] = invalid_filtered
 
             if invalid_filtered > 0:
-                logger.warning(f"Candidates: filtered_invalid={invalid_filtered} remaining={len(all_candidates)} valid_skus={len(valid_skus)} varid_map={len(varid_to_sku)}")
+                logger.warning(f"Candidates: filtered_invalid={invalid_filtered} remaining={len(all_candidates)} valid_variant_ids={len(valid_variant_ids)} varid_map={len(varid_to_display_sku)}")
 
             # 5.5. MODERN ML: Enrich candidates with co-visitation similarity
             # This adds Item2Vec-style features without training overhead
@@ -899,7 +909,7 @@ class CandidateGenerator:
             logger.error(f"Error generating candidates: {e}")
             return {"candidates": [], "metrics": metrics}
 
-    async def get_variantid_to_sku_map(self, csv_upload_id: str) -> Dict[str, str]:
+    async def get_variantid_to_display_sku_map(self, csv_upload_id: str) -> Dict[str, str]:
         """Build an identity mapping from variant_id to variant_id (uniform join key).
 
         NOTE: This function name is legacy. It now returns variant_id → variant_id
@@ -926,7 +936,7 @@ class CandidateGenerator:
             logger.warning(f"Error building variant_id map: {e}")
             return {}
     
-    async def get_valid_skus_for_csv(self, csv_upload_id: str) -> Set[str]:
+    async def get_valid_variant_ids_for_csv(self, csv_upload_id: str) -> Set[str]:
         """Get all valid variant_ids for the given CSV upload ID.
 
         NOTE: This function name is legacy. It now returns variant_ids (uniform join key), not SKUs.
@@ -973,7 +983,7 @@ class CandidateGenerator:
             else:
                 order_lines = await storage.get_order_lines(csv_upload_id)
 
-            order_sku_map: Dict[str, Set[str]] = defaultdict(set)
+            order_variant_map: Dict[str, Set[str]] = defaultdict(set)
             for line in order_lines:
                 order_id = getattr(line, "order_id", None)
                 sku = getattr(line, "sku", None)
@@ -995,9 +1005,9 @@ class CandidateGenerator:
                 # Only filter GraphQL IDs which are internal Shopify references
                 if identifier.startswith("gid://"):
                     continue
-                order_sku_map[order_id].add(identifier)
+                order_variant_map[order_id].add(identifier)
 
-            transactions = [skus for skus in order_sku_map.values() if len(skus) >= 2]
+            transactions = [skus for skus in order_variant_map.values() if len(skus) >= 2]
 
         transaction_count = len(transactions)
         if transaction_count == 0:
@@ -1051,28 +1061,28 @@ class CandidateGenerator:
         )
         return candidates
     
-    def filter_candidates_by_valid_skus(
+    def filter_candidates_by_valid_variant_ids(
         self,
         candidates: List[Dict[str, Any]],
-        valid_skus: Set[str],
-        varid_to_sku: Dict[str, str],
+        valid_variant_ids: Set[str],
+        varid_to_display_sku: Dict[str, str],
         csv_upload_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Filter out candidates containing invalid products.
-        Accept either SKU directly or variant_id that can be mapped to a SKU via varid_to_sku.
+        Accept either SKU directly or variant_id that can be mapped to a SKU via varid_to_display_sku.
         """
-        if not valid_skus:
+        if not valid_variant_ids:
             logger.warning("No valid SKUs available for filtering")
             return candidates
         
         filtered_candidates = []
         scope = csv_upload_id or "unknown_upload"
-        small_store = len(valid_skus) <= self.small_store_relax_threshold
+        small_store = len(valid_variant_ids) <= self.small_store_relax_threshold
         if small_store:
             logger.info(
-                "[%s] Small catalog detected (valid_skus=%d). Relaxed candidate filtering enabled.",
+                "[%s] Small catalog detected (valid_variant_ids=%d). Relaxed candidate filtering enabled.",
                 scope,
-                len(valid_skus),
+                len(valid_variant_ids),
             )
         filtered_reason_counts: Dict[str, int] = defaultdict(int)
         relaxed_reason_counts: Dict[str, int] = defaultdict(int)
@@ -1102,18 +1112,18 @@ class CandidateGenerator:
                         failure_product = p
                         break
 
-                    if p_str in valid_skus:
+                    if p_str in valid_variant_ids:
                         normalized.append(p_str)
                         continue
 
-                    mapped = varid_to_sku.get(p_str)
-                    if mapped and mapped in valid_skus:
+                    mapped = varid_to_display_sku.get(p_str)
+                    if mapped and mapped in valid_variant_ids:
                         normalized.append(mapped)
                         continue
 
                     all_valid = False
                     failure_product = p_str
-                    if mapped and mapped not in valid_skus:
+                    if mapped and mapped not in valid_variant_ids:
                         failure_reason = f"variant resolved to SKU {mapped} not present in catalog"
                     else:
                         failure_reason = "unmapped product (not SKU or variant)"
@@ -1144,10 +1154,10 @@ class CandidateGenerator:
                     fallback_products = []
                     for original in products:
                         original_str = str(original).strip() if original else ""
-                        if original_str in valid_skus:
+                        if original_str in valid_variant_ids:
                             fallback_products.append(original_str)
                         else:
-                            mapped = varid_to_sku.get(original_str)
+                            mapped = varid_to_display_sku.get(original_str)
                             fallback_products.append(mapped if mapped else original_str or original)
                     try:
                         candidate["products"] = fallback_products
