@@ -1110,9 +1110,12 @@ class CandidateGenerator:
         - Buy 5+, get 15% off
 
         Selection criteria:
-        1. High sales velocity (variant_id_frequency)
+        1. High sales velocity (variant_id_frequency) - if available
         2. Valid price (> 0)
-        3. Sufficient inventory (available_total > 5)
+        3. Sufficient inventory (available_total > 5) - if available
+
+        FALLBACK: When context data is missing, fetches catalog data directly
+        and generates VOLUME bundles from catalog products (catalog-driven mode).
 
         Returns single-product candidates (NOT pairs like FBT).
 
@@ -1130,9 +1133,64 @@ class CandidateGenerator:
         catalog_map = context.catalog_products if context else {}
         valid_variant_ids = context.valid_variant_ids if context else set()
 
-        if not variant_id_frequency and not catalog_map:
-            logger.warning(f"[{csv_upload_id}] VOLUME candidates: No frequency or catalog data available")
+        # CATALOG FALLBACK: When context data is missing, fetch catalog directly
+        # This ensures VOLUME bundles are ALWAYS generated (catalog-driven mode)
+        if not catalog_map or not valid_variant_ids:
+            logger.info(f"[{csv_upload_id}] VOLUME candidates: Context missing, fetching catalog directly (fallback mode)")
+            try:
+                run_id = await storage.get_run_id_for_upload(csv_upload_id)
+                if run_id:
+                    catalog_entries = await storage.get_catalog_snapshots_by_run(run_id)
+                else:
+                    catalog_entries = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
+
+                # Build catalog_map and valid_variant_ids from catalog entries
+                catalog_map = {}
+                valid_variant_ids = set()
+                for entry in catalog_entries:
+                    vid = getattr(entry, 'variant_id', None)
+                    if not vid:
+                        continue
+                    vid_str = str(vid).strip()
+                    if not vid_str:
+                        continue
+
+                    # Extract product data from catalog entry
+                    price = getattr(entry, 'price', 0)
+                    try:
+                        price = float(price) if price else 0
+                    except (TypeError, ValueError):
+                        price = 0
+
+                    # Skip products without valid price
+                    if price <= 0:
+                        continue
+
+                    valid_variant_ids.add(vid_str)
+                    catalog_map[vid_str] = {
+                        "variant_id": vid_str,
+                        "title": getattr(entry, 'title', '') or getattr(entry, 'product_title', '') or '',
+                        "price": price,
+                        "available_total": getattr(entry, 'available_total', 0) or getattr(entry, 'inventory_quantity', 0) or 0,
+                        "sku": getattr(entry, 'sku', '') or '',
+                        "product_gid": getattr(entry, 'product_gid', '') or '',
+                    }
+
+                logger.info(
+                    f"[{csv_upload_id}] VOLUME fallback: Loaded {len(catalog_map)} products from catalog "
+                    f"(valid_variant_ids={len(valid_variant_ids)})"
+                )
+            except Exception as e:
+                logger.warning(f"[{csv_upload_id}] VOLUME fallback: Failed to load catalog: {e}")
+                # Return empty but don't fail - other bundle types may still work
+                return []
+
+        if not catalog_map and not valid_variant_ids:
+            logger.warning(f"[{csv_upload_id}] VOLUME candidates: No catalog data available even after fallback")
             return []
+
+        # Determine if we're in catalog-driven mode (no sales data)
+        is_catalog_driven = not variant_id_frequency or sum(variant_id_frequency.values()) == 0
 
         # Build scored list of products for VOLUME bundles
         scored_products: List[tuple] = []
@@ -1158,9 +1216,15 @@ class CandidateGenerator:
             except (TypeError, ValueError):
                 available = 0
 
-            # Score: prioritize high frequency (sales), then inventory
-            # Products with more sales are better candidates for volume discounts
-            score = frequency * 10 + available * 0.1
+            # Score calculation differs based on mode:
+            # - Data-driven: prioritize high frequency (sales), then inventory
+            # - Catalog-driven: prioritize price (higher priced items benefit more from volume discounts)
+            if is_catalog_driven:
+                # Catalog-driven: price is key factor (normalized to 0-100 range)
+                score = min(100, price / 10.0) + available * 0.01
+            else:
+                # Data-driven: sales frequency is key factor
+                score = frequency * 10 + available * 0.1
 
             scored_products.append((variant_id, score, frequency, available, price, product))
 
@@ -1179,28 +1243,41 @@ class CandidateGenerator:
         total_frequency = sum(variant_id_frequency.values()) or 1
 
         for variant_id, score, frequency, available, price, product in top_products:
+            # Confidence calculation:
+            # - Data-driven: 0.3 baseline + up to 0.5 based on sales velocity
+            # - Catalog-driven: 0.4 baseline (reasonable starting point for volume bundles)
+            if is_catalog_driven:
+                # Catalog-driven: flat confidence based on price tier
+                confidence = min(0.6, 0.4 + min(0.2, price / 1000.0))
+                generation_method = "volume_catalog_fallback"
+            else:
+                # Data-driven: confidence based on sales velocity
+                confidence = min(0.8, 0.3 + (frequency / max(1, max_frequency) * 0.5))
+                generation_method = "volume_top_sellers"
+
             candidate = {
                 "products": [variant_id],  # Single product for VOLUME
                 "bundle_type": "VOLUME",
-                "generation_method": "volume_top_sellers",
-                "generation_sources": ["volume_top_sellers"],
-                # Confidence based on sales velocity (normalized)
-                "confidence": min(0.8, 0.3 + (frequency / max(1, max_frequency) * 0.5)),
+                "generation_method": generation_method,
+                "generation_sources": [generation_method],
+                "confidence": confidence,
                 "lift": 1.15,  # Volume discounts typically have modest lift
-                "support": min(0.5, frequency / total_frequency * 10),
+                "support": min(0.5, frequency / total_frequency * 10) if not is_catalog_driven else 0.1,
                 "volume_metadata": {
                     "sales_frequency": frequency,
                     "available_inventory": available,
                     "unit_price": price,
                     "product_title": product.get("title", ""),
+                    "catalog_driven": is_catalog_driven,
                 },
             }
             candidates.append(candidate)
 
         elapsed_ms = (time.time() - start_time) * 1000
+        mode_label = "CATALOG-DRIVEN" if is_catalog_driven else "DATA-DRIVEN"
         logger.info(
             f"[{csv_upload_id}] VOLUME candidate generation - COMPLETED in {elapsed_ms:.0f}ms | "
-            f"scored_products={len(scored_products)} returned={len(candidates)}"
+            f"mode={mode_label} scored_products={len(scored_products)} returned={len(candidates)}"
         )
 
         return candidates
@@ -1233,14 +1310,18 @@ class CandidateGenerator:
         relaxed_candidates = 0
         for candidate in candidates:
             products = candidate.get("products", [])
+            bundle_type = candidate.get("bundle_type", "")
             failure_reason = None
             failure_product = None
             normalized: List[str] = []
             all_valid = True
 
-            if not isinstance(products, list) or len(products) < 2:
+            # VOLUME bundles are single-product with quantity tiers, others need 2+ products
+            min_products_required = 1 if bundle_type == "VOLUME" else 2
+
+            if not isinstance(products, list) or len(products) < min_products_required:
                 all_valid = False
-                failure_reason = "insufficient products"
+                failure_reason = f"insufficient products (need {min_products_required}, got {len(products) if isinstance(products, list) else 0})"
             else:
                 for p in products:
                     if p is None:
@@ -1273,7 +1354,7 @@ class CandidateGenerator:
                         failure_reason = "unmapped product (not SKU or variant)"
                     break
 
-            if all_valid and len(normalized) >= 2:
+            if all_valid and len(normalized) >= min_products_required:
                 try:
                     candidate["products"] = normalized
                 except (TypeError, AttributeError) as e:
