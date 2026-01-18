@@ -531,17 +531,18 @@ class DataMapper:
         effective_catalog_upload_id = catalog_upload_id or csv_upload_id
         effective_inventory_upload_id = inventory_upload_id or csv_upload_id
 
-        if scope not in self._variant_map_by_scope or scope not in self._variant_id_map_by_scope:
+        # Check if data is missing OR empty (not just missing) - fixes bug where cached empty dicts prevent refetch
+        if not self._variant_map_by_scope.get(scope) or not self._variant_id_map_by_scope.get(scope):
             tasks["variant_maps"] = asyncio.create_task(
                 storage.get_variant_maps_by_run(run_id) if run_id and not variants_upload_id else storage.get_variant_maps(effective_variants_upload_id)
             )
 
-        if scope not in self._inventory_map_by_scope:
+        if not self._inventory_map_by_scope.get(scope):
             tasks["inventory_map"] = asyncio.create_task(
                 storage.get_inventory_levels_map_by_run(run_id) if run_id and not inventory_upload_id else storage.get_inventory_levels_map(effective_inventory_upload_id)
             )
 
-        if scope not in self._catalog_map_by_scope:
+        if not self._catalog_map_by_scope.get(scope):
             tasks["catalog_map"] = asyncio.create_task(
                 storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
                 if run_id and not catalog_upload_id
