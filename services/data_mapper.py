@@ -531,6 +531,19 @@ class DataMapper:
         effective_catalog_upload_id = catalog_upload_id or csv_upload_id
         effective_inventory_upload_id = inventory_upload_id or csv_upload_id
 
+        # Debug logging to diagnose prefetch cache issues
+        logger.info(
+            "DataMapper prefetch cache check | scope=%s variant_map_exists=%s variant_id_map_exists=%s "
+            "variant_map_len=%d variant_id_map_len=%d catalog_map_len=%d run_id=%s",
+            scope,
+            scope in self._variant_map_by_scope,
+            scope in self._variant_id_map_by_scope,
+            len(self._variant_map_by_scope.get(scope, {})),
+            len(self._variant_id_map_by_scope.get(scope, {})),
+            len(self._catalog_map_by_scope.get(scope, {})),
+            run_id,
+        )
+
         # Check if data is missing OR empty (not just missing) - fixes bug where cached empty dicts prevent refetch
         # ALWAYS prefer run_id approach when available - this uses JOIN on CsvUpload.run_id which correctly
         # finds data across separate uploads (Quickstart mode). The direct csv_upload_id approach fails when
@@ -551,6 +564,12 @@ class DataMapper:
                 if run_id
                 else storage.get_catalog_snapshots_map_by_variant(effective_catalog_upload_id)
             )
+
+        logger.info(
+            "DataMapper prefetch tasks created | scope=%s tasks=%s",
+            scope,
+            list(tasks.keys()) if tasks else "NONE",
+        )
 
         if tasks:
             results = await asyncio.gather(*tasks.values(), return_exceptions=True)
