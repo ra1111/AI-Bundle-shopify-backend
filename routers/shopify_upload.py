@@ -431,10 +431,28 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
     frontend_status = upload.status
     if upload.status in {"bundle_generation_completed"}:
         frontend_status = "completed"
-    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
-        frontend_status = "processing"
+    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async", "generating_bundles"}:
+        frontend_status = "generating_bundles"
     elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
         frontend_status = "failed"
+    elif upload.status == "completed" and bundle_count is None:
+        # CSV processing completed but no bundles yet - check if bundle generation is pending
+        # This handles the race condition where CSV finishes before auto-trigger kicks in
+        try:
+            progress_stmt = select(GenerationProgress).where(
+                GenerationProgress.upload_id == upload.id
+            )
+            progress_result = await db.execute(progress_stmt)
+            progress_record = progress_result.scalar_one_or_none()
+            if progress_record and progress_record.status == "in_progress":
+                # Bundle generation is actually in progress - don't say "completed"
+                frontend_status = "generating_bundles"
+                logger.info(
+                    f"📊 STATUS OVERRIDE: upload_id={upload_id} csv_status=completed but "
+                    f"progress shows in_progress at step={progress_record.step} - returning generating_bundles"
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to check generation progress for {upload_id}: {exc}")
 
     logger.info(
         f"📊 STATUS RESPONSE: upload_id={upload_id} "
