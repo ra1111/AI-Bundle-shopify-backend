@@ -686,6 +686,24 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         scope,
                         current_status,
                     )
+                    # Still emit finalization progress so frontend knows generation is complete
+                    try:
+                        actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+                        generation_time = time.time() - start_time
+                        await update_generation_progress(
+                            csv_upload_id,
+                            step="finalization",
+                            progress=100,
+                            status="failed" if "failed" in current_status else "completed",
+                            message=f"Generation ended with status: {current_status}",
+                            bundle_count=actual_bundle_count,
+                            metadata={
+                                "terminal_status": current_status,
+                                "generation_time_seconds": round(generation_time, 2),
+                            },
+                        )
+                    except Exception as progress_exc:
+                        logger.warning(f"Failed to emit terminal status progress: {progress_exc}")
                 else:
                     logger.info(
                         f"Bundle generation {scope}: attempting status transition to bundle_generation_completed"
@@ -711,6 +729,44 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                                 scope,
                                 completion_update["error"],
                             )
+
+                    # CRITICAL: Always emit finalization progress AFTER DB commit
+                    # This ensures frontend receives the completion signal with accurate bundle count
+                    try:
+                        # Get actual bundle count from DB for accurate reporting
+                        actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
+                        generation_time = time.time() - start_time
+
+                        # Determine final status based on bundle count
+                        final_status = "completed" if actual_bundle_count > 0 else "failed"
+                        final_message = (
+                            f"Bundle generation complete: {actual_bundle_count} bundles in {generation_time:.1f}s"
+                            if actual_bundle_count > 0
+                            else "No bundle patterns detected in your data"
+                        )
+
+                        await update_generation_progress(
+                            csv_upload_id,
+                            step="finalization",
+                            progress=100,
+                            status=final_status,
+                            message=final_message,
+                            bundle_count=actual_bundle_count,
+                            metadata={
+                                "generation_time_seconds": round(generation_time, 2),
+                                "bundles_in_db": actual_bundle_count,
+                                "pipeline": "v2_full",
+                            },
+                        )
+                        logger.info(
+                            f"Bundle generation {scope}: emitted finalization progress | "
+                            f"status={final_status} bundle_count={actual_bundle_count}"
+                        )
+                    except Exception as progress_exc:
+                        # Don't fail the generation if progress update fails
+                        logger.warning(
+                            f"Bundle generation {scope}: failed to emit finalization progress: {progress_exc}"
+                        )
                 
             except Exception as e:
                 # Bundle generation failed - update status atomically
