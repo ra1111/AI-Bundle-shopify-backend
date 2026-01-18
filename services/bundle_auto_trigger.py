@@ -8,7 +8,6 @@ bundle recommendations router.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, Optional, Set
@@ -239,40 +238,20 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
         )
 
     logger.info(
-        "Auto-bundle: scheduling bundle generation for orders upload %s (run %s) -> coroutine queued",
+        "Auto-bundle: starting bundle generation for orders upload %s (run %s) SYNCHRONOUSLY",
         orders_upload_id,
         run_id,
     )
     _pending_runs.add(orders_upload_id)
 
-    async def _run_generation(upload_id: str) -> None:
-        try:
-            from routers.bundle_recommendations import generate_bundles_background
-
-            logger.info(
-                "Auto-bundle: background coroutine starting for upload %s",
-                upload_id,
-            )
-            await generate_bundles_background(upload_id)
-        except Exception:
-            logger.exception(
-                "Auto-bundle: bundle generation task failed for upload %s",
-                upload_id,
-            )
-        finally:
-            _pending_runs.discard(upload_id)
-
-    asyncio.create_task(_run_generation(orders_upload_id))
-
-    # IMMEDIATE PROGRESS UPDATE: Give user instant feedback that task is scheduled
-    # This reduces perceived latency even if Cloud Run cold start delays actual execution
+    # IMMEDIATE PROGRESS UPDATE: Give user instant feedback that task is starting
     try:
         await update_generation_progress(
             orders_upload_id,
             step="task_scheduled",
             progress=10,
             status="in_progress",
-            message="Bundle generation scheduled, starting AI analysis...",
+            message="Bundle generation starting...",
         )
         logger.info(
             "Auto-bundle: ✓ Immediate progress update sent for %s",
@@ -286,8 +265,31 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
             progress_exc,
         )
 
+    # RUN SYNCHRONOUSLY: Don't use asyncio.create_task() on Cloud Run!
+    # Cloud Run can kill instances after HTTP response, killing background tasks.
+    # Running synchronously ensures the task completes before the request ends.
+    try:
+        from routers.bundle_recommendations import generate_bundles_background
+
+        logger.info(
+            "Auto-bundle: ▶ STARTING SYNCHRONOUS bundle generation for upload %s",
+            orders_upload_id,
+        )
+        await generate_bundles_background(orders_upload_id)
+        logger.info(
+            "Auto-bundle: ✓ COMPLETED bundle generation for upload %s",
+            orders_upload_id,
+        )
+    except Exception:
+        logger.exception(
+            "Auto-bundle: ❌ bundle generation FAILED for upload %s",
+            orders_upload_id,
+        )
+    finally:
+        _pending_runs.discard(orders_upload_id)
+
     logger.info(
-        "Auto-bundle: ✓ BACKGROUND TASK CREATED for orders upload %s (run %s) - bundle generation will start shortly",
+        "Auto-bundle: ✓ FINISHED processing orders upload %s (run %s)",
         orders_upload_id,
         run_id,
     )

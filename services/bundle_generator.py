@@ -1926,12 +1926,25 @@ class BundleGenerator:
 
                     # Generate AI copy for Tier 3 bundles (same quality as Tier 1)
                     if bayesian_bundles:
-                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {len(bayesian_bundles)} Bayesian bundles...")
+                        total_bundles = len(bayesian_bundles)
+                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {total_bundles} Bayesian bundles...")
                         ai_copy_start = time.time()
                         successful_ai_copy = 0
+                        AI_COPY_TIMEOUT_SECONDS = 15  # Timeout per bundle AI call
 
-                        for bundle in bayesian_bundles:
+                        for idx, bundle in enumerate(bayesian_bundles, start=1):
                             try:
+                                # Update progress incrementally during AI copy loop
+                                # Progress goes from 65 (ai_descriptions start) to 82 (before staged_publish at 85)
+                                loop_progress = 65 + int((idx / total_bundles) * 17)
+                                await update_generation_progress(
+                                    csv_upload_id,
+                                    step="ai_descriptions",
+                                    progress=loop_progress,
+                                    status="in_progress",
+                                    message=f"Generating AI copy for bundle {idx}/{total_bundles}...",
+                                )
+
                                 # Extract products from bundle structure
                                 products_data = bundle.get("products", {})
                                 if isinstance(products_data, dict):
@@ -1939,15 +1952,24 @@ class BundleGenerator:
                                 else:
                                     items = products_data if isinstance(products_data, list) else []
 
-                                # Generate AI copy
+                                # Generate AI copy with timeout
                                 bundle_type = bundle.get("bundle_type", "FBT")
                                 context = f"Objective: {bundle.get('objective', 'cross_sell')}. Bayesian inference from sparse data."
 
-                                ai_copy = await self.ai_generator.generate_bundle_copy(
-                                    items,
-                                    bundle_type,
-                                    context=context,
-                                )
+                                try:
+                                    ai_copy = await asyncio.wait_for(
+                                        self.ai_generator.generate_bundle_copy(
+                                            items,
+                                            bundle_type,
+                                            context=context,
+                                        ),
+                                        timeout=AI_COPY_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        f"[{csv_upload_id}] AI copy timeout for bundle {idx}/{total_bundles} after {AI_COPY_TIMEOUT_SECONDS}s. Using fallback."
+                                    )
+                                    ai_copy = self.ai_generator.generate_fallback_copy(items, bundle_type)
 
                                 # Merge AI copy with existing features metadata
                                 existing_features = bundle.get("ai_copy", {}).get("features", {})
@@ -1960,13 +1982,13 @@ class BundleGenerator:
 
                             except Exception as exc:
                                 logger.warning(
-                                    f"[{csv_upload_id}] Failed to generate AI copy for Bayesian bundle: {exc}. Keeping template copy."
+                                    f"[{csv_upload_id}] Failed to generate AI copy for Bayesian bundle {idx}: {exc}. Keeping template copy."
                                 )
                                 # Template copy already exists from _build_bayesian_bundles
 
                         ai_copy_duration = (time.time() - ai_copy_start) * 1000
                         logger.info(
-                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{len(bayesian_bundles)} bundles "
+                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{total_bundles} bundles "
                             f"in {ai_copy_duration:.0f}ms"
                         )
 
@@ -2074,12 +2096,25 @@ class BundleGenerator:
 
                     # Generate AI copy for Tier 4 bundles (volume bundles)
                     if catalog_bundles:
-                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {len(catalog_bundles)} volume bundles...")
+                        total_bundles = len(catalog_bundles)
+                        logger.info(f"[{csv_upload_id}] 🤖 Generating AI copy for {total_bundles} volume bundles...")
                         ai_copy_start = time.time()
                         successful_ai_copy = 0
+                        AI_COPY_TIMEOUT_SECONDS = 15  # Timeout per bundle AI call
 
-                        for bundle in catalog_bundles:
+                        for idx, bundle in enumerate(catalog_bundles, start=1):
                             try:
+                                # Update progress incrementally during AI copy loop
+                                # Progress goes from 65 (ai_descriptions start) to 82 (before staged_publish at 85)
+                                loop_progress = 65 + int((idx / total_bundles) * 17)
+                                await update_generation_progress(
+                                    csv_upload_id,
+                                    step="ai_descriptions",
+                                    progress=loop_progress,
+                                    status="in_progress",
+                                    message=f"Generating AI copy for bundle {idx}/{total_bundles}...",
+                                )
+
                                 # Extract products from bundle structure
                                 products_data = bundle.get("products", {})
                                 if isinstance(products_data, dict):
@@ -2087,15 +2122,24 @@ class BundleGenerator:
                                 else:
                                     items = products_data if isinstance(products_data, list) else []
 
-                                # Generate AI copy
+                                # Generate AI copy with timeout
                                 bundle_type = bundle.get("bundle_type", "VOLUME")
                                 context = f"Objective: {bundle.get('objective', 'increase_aov')}. Volume discount bundle."
 
-                                ai_copy = await self.ai_generator.generate_bundle_copy(
-                                    items,
-                                    bundle_type,
-                                    context=context,
-                                )
+                                try:
+                                    ai_copy = await asyncio.wait_for(
+                                        self.ai_generator.generate_bundle_copy(
+                                            items,
+                                            bundle_type,
+                                            context=context,
+                                        ),
+                                        timeout=AI_COPY_TIMEOUT_SECONDS
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning(
+                                        f"[{csv_upload_id}] AI copy timeout for bundle {idx}/{total_bundles} after {AI_COPY_TIMEOUT_SECONDS}s. Using fallback."
+                                    )
+                                    ai_copy = self.ai_generator.generate_fallback_copy(items, bundle_type)
 
                                 # Merge AI copy with existing features metadata
                                 existing_features = bundle.get("ai_copy", {}).get("features", {})
@@ -2108,13 +2152,13 @@ class BundleGenerator:
 
                             except Exception as exc:
                                 logger.warning(
-                                    f"[{csv_upload_id}] Failed to generate AI copy for volume bundle: {exc}. Keeping template copy."
+                                    f"[{csv_upload_id}] Failed to generate AI copy for volume bundle {idx}: {exc}. Keeping template copy."
                                 )
                                 # Template copy already exists from _build_catalog_fallback_bundles
 
                         ai_copy_duration = (time.time() - ai_copy_start) * 1000
                         logger.info(
-                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{len(catalog_bundles)} bundles "
+                            f"[{csv_upload_id}] ✅ AI copy generated for {successful_ai_copy}/{total_bundles} bundles "
                             f"in {ai_copy_duration:.0f}ms"
                         )
 
