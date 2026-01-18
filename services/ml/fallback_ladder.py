@@ -55,17 +55,28 @@ class TransactionStats:
         
         order_lines_dict = []
         for line in order_lines:
+            # Use variant_id as primary identifier, SKU for display only
+            variant_id = getattr(line, 'variant_id', None)
+            sku = getattr(line, 'sku', None)
+            # Skip synthetic no-sku-* placeholders - they're not real products
+            if sku and str(sku).startswith('no-sku-'):
+                sku = None
             order_lines_dict.append({
                 'order_id': line.order_id,
-                'sku': line.sku,
+                'variant_id': variant_id,  # PRIMARY identifier
+                'sku': sku,  # Display only
                 'quantity': line.quantity,
                 'price': line.price
             })
         
         products_dict = []
         for product in products:
+            # Use variant_id as primary identifier
+            variant_id = getattr(product, 'variant_id', None)
+            sku = getattr(product, 'sku', None)
             products_dict.append({
-                'sku': product.sku,
+                'variant_id': variant_id,  # PRIMARY identifier
+                'sku': sku,  # Display only
                 'name': product.name,
                 'brand': product.brand,
                 'category': product.category,
@@ -81,23 +92,25 @@ class TransactionStats:
         stats.products = products_dict
         stats.total_orders = len(orders_dict)
         
-        # Group order lines by order
+        # Group order lines by order using variant_id (primary identifier)
         orders_by_id = {order['order_id']: order for order in orders_dict}
         transactions = defaultdict(list)
-        
+
         for line in order_lines_dict:
             order_id = line['order_id']
-            if order_id in orders_by_id:
-                transactions[order_id].append(line['sku'])
-        
+            variant_id = line.get('variant_id')
+            # Only use variant_id as identifier (skip lines without variant_id)
+            if order_id in orders_by_id and variant_id:
+                transactions[order_id].append(variant_id)
+
         # Build transaction list
         recent_cutoff = datetime.now() - timedelta(days=recent_days)
-        
-        for order_id, skus in transactions.items():
+
+        for order_id, variant_ids in transactions.items():
             order = orders_by_id[order_id]
             transaction = {
                 'order_id': order_id,
-                'skus': list(set(skus)),  # Remove duplicates
+                'variant_ids': list(set(variant_ids)),  # Remove duplicates, use variant_id
                 'created_at': order.get('created_at'),
                 'total': order.get('total', 0)
             }
@@ -107,22 +120,22 @@ class TransactionStats:
             if order.get('created_at') and order['created_at'] >= recent_cutoff:
                 stats.recent_orders.append(transaction)
         
-        # Compute item counts
+        # Compute item counts (keyed by variant_id)
         for transaction in stats.transactions:
-            for sku in transaction['skus']:
-                stats.item_counts[sku] = stats.item_counts.get(sku, 0) + 1
-        
+            for vid in transaction['variant_ids']:
+                stats.item_counts[vid] = stats.item_counts.get(vid, 0) + 1
+
         # Compute pair counts (limit to items with minimum frequency to bound complexity)
         min_item_count = max(2, math.ceil(0.005 * stats.total_orders))  # 0.5% threshold
-        frequent_items = [sku for sku, count in stats.item_counts.items() if count >= min_item_count]
-        
+        frequent_items = [vid for vid, count in stats.item_counts.items() if count >= min_item_count]
+
         for transaction in stats.transactions:
-            transaction_skus = [sku for sku in transaction['skus'] if sku in frequent_items]
+            transaction_vids = [vid for vid in transaction['variant_ids'] if vid in frequent_items]
             # Generate pairs
-            for i, sku_a in enumerate(transaction_skus):
-                for sku_b in transaction_skus[i+1:]:
-                    if sku_a and sku_b and sku_a != sku_b:  # Ensure valid, different SKUs
-                        pair = (min(sku_a, sku_b), max(sku_a, sku_b))  # Create ordered pair
+            for i, vid_a in enumerate(transaction_vids):
+                for vid_b in transaction_vids[i+1:]:
+                    if vid_a and vid_b and vid_a != vid_b:  # Ensure valid, different variant_ids
+                        pair = (min(vid_a, vid_b), max(vid_a, vid_b))  # Create ordered pair
                         stats.pair_counts[pair] = stats.pair_counts.get(pair, 0) + 1
         
         logger.info(f"Built TransactionStats: {stats.total_orders} orders, {len(stats.item_counts)} items, {len(stats.pair_counts)} pairs")
@@ -452,15 +465,15 @@ class FallbackLadder:
             # Performance guard: Early exit if we have enough candidates
             if len(candidates) >= 8:
                 break
-                
+
             # Performance guard: Limit iterations per product
-            if i > 20:  # Process max 20 products 
+            if i > 20:  # Process max 20 products
                 break
-                
-            sku = product.get('sku')
+
+            vid = product.get('variant_id')  # Use variant_id as primary identifier
             search_text = product.get('_search_text', '')
             price = product.get('price', 0)
-            
+
             # Find complements by category
             for base_cat, complement_cats in complement_rules.items():
                 if base_cat in search_text:
@@ -470,19 +483,19 @@ class FallbackLadder:
                         for comp_product in products_by_category['all'][:10]:  # Limit to first 10 products
                             if matches >= 2:  # Max 2 matches per complement category
                                 break
-                                
-                            comp_sku = comp_product.get('sku')
+
+                            comp_vid = comp_product.get('variant_id')  # Use variant_id
                             comp_search_text = comp_product.get('_search_text', '')
                             comp_price = comp_product.get('price', 0)
-                            
-                            if comp_sku and sku and comp_sku != sku and comp_cat in comp_search_text:
+
+                            if comp_vid and vid and comp_vid != vid and comp_cat in comp_search_text:
                                 # Price compatibility (within 3x range)
                                 if price > 0 and comp_price > 0:
                                     price_ratio = max(price, comp_price) / min(price, comp_price)
                                     if price_ratio <= 3.0:
                                         candidate = FallbackCandidate(
                                             bundle_type="MIX_MATCH",
-                                            products=[sku, comp_sku],
+                                            products=[vid, comp_vid],  # Use variant_ids
                                             pricing={"discount_percent": 10},
                                             features={
                                                 "heuristic_match": 1.0,
@@ -511,8 +524,8 @@ class FallbackLadder:
         # Recent popularity (last 30 days)
         recent_counts = Counter()
         for transaction in self.stats.recent_orders:
-            for sku in transaction['skus']:
-                recent_counts[sku] += 1
+            for vid in transaction['variant_ids']:
+                recent_counts[vid] += 1
         
         recent_items = sorted(recent_counts.items(), key=lambda x: x[1], reverse=True)
         
@@ -562,41 +575,41 @@ class FallbackLadder:
             return candidates
         
         for product in self.stats.products:
-            sku = product.get('sku')
+            vid = product.get('variant_id')  # Use variant_id as primary identifier
             category = product.get('category', '')
             brand = product.get('brand', '')
             price = product.get('price', 0)
-            
+
             # Find similar products by attributes
             for other_product in self.stats.products:
-                other_sku = other_product.get('sku')
-                if other_sku == sku:
+                other_vid = other_product.get('variant_id')  # Use variant_id
+                if other_vid == vid:
                     continue
-                
+
                 other_category = other_product.get('category', '')
                 other_brand = other_product.get('brand', '')
                 other_price = other_product.get('price', 0)
-                
+
                 attr_sim = 0.0
-                
+
                 # Same category bonus
                 if category and category == other_category:
                     attr_sim += 0.5
-                
+
                 # Same brand bonus
                 if brand and brand == other_brand:
                     attr_sim += 0.3
-                
+
                 # Price similarity (normalized difference)
                 if price > 0 and other_price > 0:
                     price_diff = abs(price - other_price) / max(price, other_price)
                     price_sim = max(0, 1 - price_diff)  # 1 = same price, 0 = very different
                     attr_sim += 0.2 * price_sim
-                
-                if attr_sim > 0.4 and sku and other_sku:  # Minimum similarity threshold and valid SKUs
+
+                if attr_sim > 0.4 and vid and other_vid:  # Minimum similarity threshold and valid variant_ids
                     candidate = FallbackCandidate(
                         bundle_type="FIXED",
-                        products=[sku, other_sku],
+                        products=[vid, other_vid],  # Use variant_ids
                         pricing={"discount_percent": 8},
                         features={
                             "attr_similarity": attr_sim,
@@ -606,5 +619,5 @@ class FallbackLadder:
                         explanation=f"Attribute similarity: {category}/{brand}"
                     )
                     candidates.append(candidate)
-        
+
         return candidates[:5]
