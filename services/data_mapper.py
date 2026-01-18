@@ -532,20 +532,23 @@ class DataMapper:
         effective_inventory_upload_id = inventory_upload_id or csv_upload_id
 
         # Check if data is missing OR empty (not just missing) - fixes bug where cached empty dicts prevent refetch
+        # ALWAYS prefer run_id approach when available - this uses JOIN on CsvUpload.run_id which correctly
+        # finds data across separate uploads (Quickstart mode). The direct csv_upload_id approach fails when
+        # variants/catalog are in different uploads than orders.
         if not self._variant_map_by_scope.get(scope) or not self._variant_id_map_by_scope.get(scope):
             tasks["variant_maps"] = asyncio.create_task(
-                storage.get_variant_maps_by_run(run_id) if run_id and not variants_upload_id else storage.get_variant_maps(effective_variants_upload_id)
+                storage.get_variant_maps_by_run(run_id) if run_id else storage.get_variant_maps(effective_variants_upload_id)
             )
 
         if not self._inventory_map_by_scope.get(scope):
             tasks["inventory_map"] = asyncio.create_task(
-                storage.get_inventory_levels_map_by_run(run_id) if run_id and not inventory_upload_id else storage.get_inventory_levels_map(effective_inventory_upload_id)
+                storage.get_inventory_levels_map_by_run(run_id) if run_id else storage.get_inventory_levels_map(effective_inventory_upload_id)
             )
 
         if not self._catalog_map_by_scope.get(scope):
             tasks["catalog_map"] = asyncio.create_task(
                 storage.get_catalog_snapshots_map_by_variant_and_run(run_id)
-                if run_id and not catalog_upload_id
+                if run_id
                 else storage.get_catalog_snapshots_map_by_variant(effective_catalog_upload_id)
             )
 
