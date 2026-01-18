@@ -224,8 +224,8 @@ class ContinuousObjectiveScorer:
                 f"n_transactions={n_transactions}, n_skus={n_skus}, n_order_lines={n_order_lines}"
             )
 
-            # Product-level metrics
-            sku_to_product = {p.get('sku'): p for p in catalog if p.get('sku')}
+            # Product-level metrics - use variant_id as primary key
+            variant_to_product = {p.get('variant_id'): p for p in catalog if p.get('variant_id')}
 
             # Margin statistics
             margins = []
@@ -241,15 +241,15 @@ class ContinuousObjectiveScorer:
             margin_iqr = float(stats.iqr(margins)) if len(margins) > 2 else 0
             pct_high_margin = high_margin_count / max(n_skus, 1)
 
-            # Velocity / slow mover analysis
-            sku_sales = {}
+            # Velocity / slow mover analysis - use variant_id as primary key
+            variant_sales = {}
             for line in order_lines:
-                sku = line.get('sku')
-                if sku:
-                    sku_sales[sku] = sku_sales.get(sku, 0) + line.get('quantity', 1)
+                vid = line.get('variant_id')
+                if vid:
+                    variant_sales[vid] = variant_sales.get(vid, 0) + line.get('quantity', 1)
 
-            if sku_sales:
-                velocities = list(sku_sales.values())
+            if variant_sales:
+                velocities = list(variant_sales.values())
                 velocity_median = float(np.median(velocities))
                 slow_movers = sum(1 for v in velocities if v < velocity_median * 0.5)
                 pct_slow_movers = slow_movers / max(len(velocities), 1)

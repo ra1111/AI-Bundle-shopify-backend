@@ -782,23 +782,24 @@ class LLMEmbeddingEngine:
                 self.RELAX_FILTER_ORDERS,
             )
         for p in head:
-            sku = p.get("sku")
-            if not sku or sku not in embeddings:
-                if not sku:
+            # Use variant_id as PRIMARY identifier (not SKU)
+            vid = p.get("variant_id")
+            if not vid or vid not in embeddings:
+                if not vid:
                     anchors_missing_variant_id += 1
                 else:
                     anchors_missing_embedding += 1
                 continue
             neigh = await self.find_similar_products(
-                target_variant_id=sku,
+                target_variant_id=vid,
                 catalog=catalog,
                 embeddings=embeddings,
                 top_k=10,
                 min_similarity=0.0 if relax_filters else fbt_floor,
                 csv_upload_id=csv_upload_id,
             )
-            for s_sku, sim in neigh[:5]:
-                logger.debug("LLM_CANDIDATE_SIM sku=%s candidate=%s sim=%.3f", sku, s_sku, sim)
+            for neighbor_vid, sim in neigh[:5]:
+                logger.debug("LLM_CANDIDATE_SIM variant_id=%s candidate=%s sim=%.3f", vid, neighbor_vid, sim)
                 neighbors_total += 1
                 if not relax_filters and sim > too_sim_threshold:
                     if logger.isEnabledFor(logging.DEBUG):
@@ -806,19 +807,19 @@ class LLMEmbeddingEngine:
                         logger.debug(
                             "[%s] SIM near-duplicate filtered | target=%s candidate=%s sim=%.3f limit=%.3f delta=%.3f",
                             scope,
-                            sku,
-                            s_sku,
+                            vid,
+                            neighbor_vid,
                             sim,
                             too_sim_threshold,
                             delta,
                         )
                     neighbors_too_similar += 1
                     continue  # skip near-duplicates
-                anchor_meta = catalog_lookup.get(sku)
-                candidate_meta = catalog_lookup.get(s_sku)
+                anchor_meta = catalog_lookup.get(vid)
+                candidate_meta = catalog_lookup.get(neighbor_vid)
                 if not self._passes_prefilter(anchor_meta, candidate_meta):
                     continue
-                out.append({"products": [sku, s_sku], "llm_similarity": sim, "source": "llm_fbt"})
+                out.append({"products": [vid, neighbor_vid], "llm_similarity": sim, "source": "llm_fbt"})
                 neighbors_added += 1
                 if len(out) >= n:
                     logger.info(
@@ -875,12 +876,13 @@ class LLMEmbeddingEngine:
                 self.RELAX_FILTER_ORDERS,
             )
             for p in head:
-                sku = p.get("sku")
-                if not sku or sku not in embeddings:
+                # Use variant_id as PRIMARY identifier (not SKU)
+                vid = p.get("variant_id")
+                if not vid or vid not in embeddings:
                     anchors_missing += 1
                     continue
                 neigh = await self.find_similar_products(
-                    target_variant_id=sku,
+                    target_variant_id=vid,
                     catalog=catalog,
                     embeddings=embeddings,
                     top_k=5,
@@ -888,19 +890,19 @@ class LLMEmbeddingEngine:
                     csv_upload_id=csv_upload_id,
                 )
                 if len(neigh) >= 2:
-                    skus = [s for s, _ in neigh[:3]]
+                    neighbor_vids = [v for v, _ in neigh[:3]]
                     neighbors_total += len(neigh[:3])
-                    anchor_meta = catalog_lookup.get(sku)
-                    filtered_skus = []
+                    anchor_meta = catalog_lookup.get(vid)
+                    filtered_vids = []
                     sims_subset = []
-                    for candidate_sku, sim in neigh[:3]:
-                        if self._passes_prefilter(anchor_meta, catalog_lookup.get(candidate_sku)):
-                            filtered_skus.append(candidate_sku)
+                    for candidate_vid, sim in neigh[:3]:
+                        if self._passes_prefilter(anchor_meta, catalog_lookup.get(candidate_vid)):
+                            filtered_vids.append(candidate_vid)
                             sims_subset.append(sim)
-                    if not filtered_skus:
+                    if not filtered_vids:
                         continue
                     avg_sim = float(np.mean(sims_subset))
-                    out.append({"products": [sku] + filtered_skus, "llm_similarity": avg_sim, "source": "llm_volume"})
+                    out.append({"products": [vid] + filtered_vids, "llm_similarity": avg_sim, "source": "llm_volume"})
                     neighbors_added += 1
                     if len(out) >= n:
                         logger.info(

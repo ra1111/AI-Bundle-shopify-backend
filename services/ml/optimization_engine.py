@@ -631,14 +631,15 @@ class EnterpriseOptimizationEngine:
             logger.warning(f"Error evaluating constraint {constraint.constraint_type}: {e}")
             return True  # Assume satisfied on error
     
-    async def _check_inventory_constraint(self, candidate: Dict[str, Any], 
+    async def _check_inventory_constraint(self, candidate: Dict[str, Any],
                                         constraint: OptimizationConstraint,
                                         csv_upload_id: str) -> bool:
         """Check inventory availability constraint"""
-        products = candidate.get("products", [])
+        products = candidate.get("products", [])  # List of variant_ids
         min_inventory = constraint.value
-        
-        catalog_items = await storage.get_catalog_snapshots_by_skus(products, csv_upload_id)
+
+        # Use variant_id-based lookup (products list contains variant_ids)
+        catalog_items = await storage.get_catalog_snapshots_by_variants(products, csv_upload_id)
         
         for item in catalog_items:
             if constraint.operator == ">=" and item.available_total < min_inventory:
@@ -648,14 +649,15 @@ class EnterpriseOptimizationEngine:
         
         return True
     
-    async def _check_budget_constraint(self, candidate: Dict[str, Any], 
+    async def _check_budget_constraint(self, candidate: Dict[str, Any],
                                      constraint: OptimizationConstraint,
                                      csv_upload_id: str) -> bool:
         """Check budget/pricing constraint"""
-        products = candidate.get("products", [])
+        products = candidate.get("products", [])  # List of variant_ids
         max_budget = Decimal(str(constraint.value))
-        
-        catalog_items = await storage.get_catalog_snapshots_by_skus(products, csv_upload_id)
+
+        # Use variant_id-based lookup (products list contains variant_ids)
+        catalog_items = await storage.get_catalog_snapshots_by_variants(products, csv_upload_id)
         total_price = sum(item.price for item in catalog_items if item.price)
         
         if constraint.operator == "<=" and total_price > max_budget:
@@ -687,14 +689,15 @@ class EnterpriseOptimizationEngine:
         
         return True
     
-    async def _check_category_mix_constraint(self, candidate: Dict[str, Any], 
+    async def _check_category_mix_constraint(self, candidate: Dict[str, Any],
                                            constraint: OptimizationConstraint,
                                            csv_upload_id: str) -> bool:
         """Check category diversity constraint"""
-        products = candidate.get("products", [])
+        products = candidate.get("products", [])  # List of variant_ids
         required_categories = constraint.value  # Expected to be a number or list
-        
-        catalog_items = await storage.get_catalog_snapshots_by_skus(products, csv_upload_id)
+
+        # Use variant_id-based lookup (products list contains variant_ids)
+        catalog_items = await storage.get_catalog_snapshots_by_variants(products, csv_upload_id)
         categories = set()
         for item in catalog_items:
             if hasattr(item, 'product_type') and item.product_type:
