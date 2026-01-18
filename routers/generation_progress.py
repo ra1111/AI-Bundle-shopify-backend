@@ -9,11 +9,11 @@ from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from starlette.responses import JSONResponse
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import ProgrammingError, OperationalError
 
-from database import GenerationProgress, CsvUpload, get_db
+from database import GenerationProgress, CsvUpload, BundleRecommendation, get_db
 
 router = APIRouter()
 
@@ -197,6 +197,25 @@ async def get_generation_progress(
 
     # Extract bundle_count from metadata for top-level response (frontend expects this)
     bundle_count = metadata.get("bundle_count") if isinstance(metadata, dict) else None
+
+    # If status is completed or near completion, also query actual bundle count from DB
+    # This ensures accurate count even if metadata wasn't updated in time
+    if (status == "completed" or record.progress >= 80) and bundle_count is None:
+        try:
+            # The upload_id in progress table is the orders upload ID
+            orders_upload_id = record.upload_id
+            stmt = select(func.count(BundleRecommendation.id)).where(
+                BundleRecommendation.csv_upload_id == orders_upload_id
+            )
+            result = await db.execute(stmt)
+            actual_count = result.scalar() or 0
+            if actual_count > 0:
+                bundle_count = actual_count
+                logger.info(
+                    f"Progress endpoint: queried actual bundle_count={actual_count} for upload {orders_upload_id}"
+                )
+        except Exception as exc:
+            logger.warning(f"Failed to query bundle count for {record.upload_id}: {exc}")
 
     response: Dict[str, Any] = {
         "upload_id": record.upload_id,
