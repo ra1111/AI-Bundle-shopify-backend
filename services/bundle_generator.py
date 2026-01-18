@@ -1854,13 +1854,9 @@ class BundleGenerator:
                 logger.info(f"[{csv_upload_id}] 📦 PHASE 2: Loading catalog for fallback generation...")
                 catalog_phase_start = time.time()
                 try:
-                    # Use separate catalog_upload_id if provided (Quickstart mode fix)
-                    effective_catalog_id = catalog_upload_id or csv_upload_id
-                    if catalog_upload_id:
-                        logger.info(
-                            f"[{csv_upload_id}] Using separate catalog upload ID: {catalog_upload_id}"
-                        )
-                    catalog_snaps = await storage.get_catalog_snapshots_by_upload(effective_catalog_id)
+                    # IMPORTANT: Always use csv_upload_id (orders upload ID) for catalog lookup
+                    # because catalog data is stored under the canonical orders upload ID during ingestion
+                    catalog_snaps = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
                     catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
                     catalog = {k: v for k, v in catalog.items() if k}
                     logger.info(
