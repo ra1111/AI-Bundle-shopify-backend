@@ -1880,6 +1880,15 @@ class BundleGenerator:
                         f"[{csv_upload_id}] 🧮 TIER 3: BAYESIAN MODE ({multi_item_count} multi-item orders)"
                     )
 
+                    # Send scoring step (simplified for Quick Mode)
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="scoring",
+                        progress=30,
+                        status="in_progress",
+                        message="Scoring product pairs using Bayesian inference...",
+                    )
+
                     await update_generation_progress(
                         csv_upload_id,
                         step="ml_generation",
@@ -1895,6 +1904,24 @@ class BundleGenerator:
                         product_scores=product_scores,
                         multi_item_count=multi_item_count,
                         max_bundles=10
+                    )
+
+                    # Send optimization step (simplified for Quick Mode)
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="optimization",
+                        progress=60,
+                        status="in_progress",
+                        message=f"Optimizing {len(bayesian_bundles)} bundle candidates...",
+                    )
+
+                    # Send ai_descriptions step before AI copy generation
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ai_descriptions",
+                        progress=70,
+                        status="in_progress",
+                        message="Generating AI-powered bundle titles and descriptions...",
                     )
 
                     # Generate AI copy for Tier 3 bundles (same quality as Tier 1)
@@ -2003,6 +2030,15 @@ class BundleGenerator:
                         f"[{csv_upload_id}] 📋 TIER 4: CATALOG FALLBACK MODE ({multi_item_count} multi-item orders)"
                     )
 
+                    # Send scoring step for Tier 4
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="scoring",
+                        progress=30,
+                        status="in_progress",
+                        message="Scoring products by catalog attributes...",
+                    )
+
                     await update_generation_progress(
                         csv_upload_id,
                         step="ml_generation",
@@ -2016,6 +2052,24 @@ class BundleGenerator:
                         catalog=catalog,
                         product_scores=product_scores,
                         max_bundles=10
+                    )
+
+                    # Send optimization step for Tier 4
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="optimization",
+                        progress=60,
+                        status="in_progress",
+                        message=f"Optimizing {len(catalog_bundles)} bundle candidates...",
+                    )
+
+                    # Send ai_descriptions step before AI copy generation
+                    await update_generation_progress(
+                        csv_upload_id,
+                        step="ai_descriptions",
+                        progress=70,
+                        status="in_progress",
+                        message="Generating AI-powered bundle titles and descriptions...",
                     )
 
                     # Generate AI copy for Tier 4 bundles (volume bundles)
