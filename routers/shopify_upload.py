@@ -418,8 +418,9 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
 
     if upload.status in completed_statuses or upload.status == "processing":
         # Always check for existing bundles
+        # Use upload.id (resolved orders upload ID) not upload_id (might be run_id)
         stmt = select(func.count(BundleRecommendation.id)).where(
-            BundleRecommendation.csv_upload_id == upload_id
+            BundleRecommendation.csv_upload_id == upload.id
         )
         result = await db.execute(stmt)
         count = result.scalar() or 0
