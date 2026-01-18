@@ -1860,7 +1860,7 @@ class BundleGenerator:
                         logger.info(
                             f"[{csv_upload_id}] Using separate catalog upload ID: {catalog_upload_id}"
                         )
-                    catalog_snaps = await storage.get_catalog_snapshot(effective_catalog_id)
+                    catalog_snaps = await storage.get_catalog_snapshots_by_upload(effective_catalog_id)
                     catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
                     catalog = {k: v for k, v in catalog.items() if k}
                     logger.info(
@@ -2161,7 +2161,7 @@ class BundleGenerator:
 
                 # Load catalog for volume bundle generation
                 try:
-                    catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
+                    catalog_snaps = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
                     catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
                     catalog = {k: v for k, v in catalog.items() if k}
                 except Exception as e:
@@ -3033,7 +3033,7 @@ class BundleGenerator:
 
                     try:
                         # Load catalog for fallback generation
-                        catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
+                        catalog_snaps = await storage.get_catalog_snapshots_by_upload(csv_upload_id)
                         catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
                         catalog = {k: v for k, v in catalog.items() if k}
 
