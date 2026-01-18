@@ -264,6 +264,28 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
 
     asyncio.create_task(_run_generation(orders_upload_id))
 
+    # IMMEDIATE PROGRESS UPDATE: Give user instant feedback that task is scheduled
+    # This reduces perceived latency even if Cloud Run cold start delays actual execution
+    try:
+        await update_generation_progress(
+            orders_upload_id,
+            step="task_scheduled",
+            progress=10,
+            status="in_progress",
+            message="Bundle generation scheduled, starting AI analysis...",
+        )
+        logger.info(
+            "Auto-bundle: ✓ Immediate progress update sent for %s",
+            orders_upload_id,
+        )
+    except Exception as progress_exc:
+        # Don't fail the trigger if progress update fails
+        logger.warning(
+            "Auto-bundle: Failed to send immediate progress update for %s: %s",
+            orders_upload_id,
+            progress_exc,
+        )
+
     logger.info(
         "Auto-bundle: ✓ BACKGROUND TASK CREATED for orders upload %s (run %s) - bundle generation will start shortly",
         orders_upload_id,

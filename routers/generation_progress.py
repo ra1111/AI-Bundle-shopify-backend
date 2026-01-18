@@ -101,6 +101,8 @@ async def get_generation_progress(
         "message": "Uploading data and preparing AI analysis...",
         "metadata": {},
         "updated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        # Poll quickly during initial queueing to catch when task starts
+        "recommended_poll_interval_ms": 2000,
     }
     try:
         result = await db.execute(stmt)
@@ -173,6 +175,26 @@ async def get_generation_progress(
     elif metadata.get("staged"):
         staged_payload = metadata
 
+    # ADAPTIVE POLLING: Recommend faster polling during active steps, slower when waiting
+    # This reduces perceived latency without hammering the server
+    step = record.step or ""
+    status = record.status or ""
+    if status == "completed" or status == "failed":
+        # Final state - no need to poll anymore
+        recommended_poll_ms = 0
+    elif step in ("task_scheduled", "queueing", "initializing"):
+        # Task just scheduled - poll quickly to catch when it starts
+        recommended_poll_ms = 2000
+    elif step in ("ml_generation", "optimization", "enrichment"):
+        # Active processing - medium polling
+        recommended_poll_ms = 3000
+    elif step in ("finalization", "staged_publish"):
+        # Almost done - poll quickly
+        recommended_poll_ms = 2000
+    else:
+        # Default - standard polling
+        recommended_poll_ms = 5000
+
     response: Dict[str, Any] = {
         "upload_id": record.upload_id,
         "shop_domain": record.shop_domain,
@@ -182,6 +204,8 @@ async def get_generation_progress(
         "message": record.message,
         "metadata": metadata,
         "updated_at": updated_at.isoformat().replace("+00:00", "Z"),
+        # Hint for frontend to adjust polling interval dynamically
+        "recommended_poll_interval_ms": recommended_poll_ms,
     }
     if staged_payload:
         response["staged"] = staged_payload.get("staged", True)
