@@ -386,11 +386,13 @@ async def _ensure_data_ready(orders_upload_id: str, run_id: Optional[str], db: A
     missing_variant_ids = sorted(vid for vid in order_variant_ids if vid not in variant_ids)
     missing_catalog_ids = sorted(vid for vid in order_variant_ids if vid not in catalog_map)
 
+    # Log variant gaps but don't block - some variants may have been deleted from Shopify
+    # but still appear in historical orders. Bundle generation can proceed with available data.
     if missing_variant_ids:
         sample = ", ".join(missing_variant_ids[:5])
-        raise HTTPException(
-            status_code=400,
-            detail=f"Variants missing for variant IDs: {sample} (total {len(missing_variant_ids)})"
+        logger.warning(
+            f"[_ensure_data_ready] Variant gaps detected for {len(missing_variant_ids)} variant IDs: {sample}... "
+            f"(bundle generation will proceed with available data, missing variants excluded)"
         )
 
     # Log catalog gaps but don't block - catalog data may have different csv_upload_id
