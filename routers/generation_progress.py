@@ -195,6 +195,9 @@ async def get_generation_progress(
         # Default - standard polling
         recommended_poll_ms = 5000
 
+    # Extract bundle_count from metadata for top-level response (frontend expects this)
+    bundle_count = metadata.get("bundle_count") if isinstance(metadata, dict) else None
+
     response: Dict[str, Any] = {
         "upload_id": record.upload_id,
         "shop_domain": record.shop_domain,
@@ -207,6 +210,11 @@ async def get_generation_progress(
         # Hint for frontend to adjust polling interval dynamically
         "recommended_poll_interval_ms": recommended_poll_ms,
     }
+
+    # Add bundle_count at top level for frontend compatibility
+    if bundle_count is not None:
+        response["bundle_count"] = bundle_count
+
     if staged_payload:
         response["staged"] = staged_payload.get("staged", True)
         response["staged_state"] = staged_payload

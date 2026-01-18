@@ -1884,7 +1884,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="scoring",
-                        progress=30,
+                        progress=20,
                         status="in_progress",
                         message="Scoring product pairs using Bayesian inference...",
                     )
@@ -1892,7 +1892,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="ml_generation",
-                        progress=50,
+                        progress=40,
                         status="in_progress",
                         message="Analyzing sparse order patterns with Bayesian inference...",
                     )
@@ -1910,7 +1910,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="optimization",
-                        progress=60,
+                        progress=55,
                         status="in_progress",
                         message=f"Optimizing {len(bayesian_bundles)} bundle candidates...",
                     )
@@ -1919,7 +1919,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="ai_descriptions",
-                        progress=70,
+                        progress=65,
                         status="in_progress",
                         message="Generating AI-powered bundle titles and descriptions...",
                     )
@@ -1972,10 +1972,10 @@ class BundleGenerator:
 
                     await update_generation_progress(
                         csv_upload_id,
-                        step="finalization",
-                        progress=90,
+                        step="staged_publish",
+                        progress=85,
                         status="in_progress",
-                        message=f"Saving {len(bayesian_bundles)} probabilistic bundles...",
+                        message=f"Preparing {len(bayesian_bundles)} bundles for publishing...",
                     )
 
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
@@ -1984,10 +1984,10 @@ class BundleGenerator:
                         await storage.create_bundle_recommendations(bayesian_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(bayesian_bundles)} Bayesian bundles to DB")
 
-                    # Add staged_publish step after save
+                    # Add finalization step after save
                     await update_generation_progress(
                         csv_upload_id,
-                        step="staged_publish",
+                        step="finalization",
                         progress=95,
                         status="in_progress",
                         message="Bundles saved, verifying count...",
@@ -2034,7 +2034,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="scoring",
-                        progress=30,
+                        progress=20,
                         status="in_progress",
                         message="Scoring products by catalog attributes...",
                     )
@@ -2042,7 +2042,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="ml_generation",
-                        progress=50,
+                        progress=40,
                         status="in_progress",
                         message="Creating volume bundles from catalog data...",
                     )
@@ -2058,7 +2058,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="optimization",
-                        progress=60,
+                        progress=55,
                         status="in_progress",
                         message=f"Optimizing {len(catalog_bundles)} bundle candidates...",
                     )
@@ -2067,7 +2067,7 @@ class BundleGenerator:
                     await update_generation_progress(
                         csv_upload_id,
                         step="ai_descriptions",
-                        progress=70,
+                        progress=65,
                         status="in_progress",
                         message="Generating AI-powered bundle titles and descriptions...",
                     )
@@ -2120,10 +2120,10 @@ class BundleGenerator:
 
                     await update_generation_progress(
                         csv_upload_id,
-                        step="finalization",
-                        progress=90,
+                        step="staged_publish",
+                        progress=85,
                         status="in_progress",
-                        message=f"Saving {len(catalog_bundles)} starter bundles...",
+                        message=f"Preparing {len(catalog_bundles)} bundles for publishing...",
                     )
 
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
@@ -2132,10 +2132,10 @@ class BundleGenerator:
                         await storage.create_bundle_recommendations(catalog_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(catalog_bundles)} catalog fallback bundles to DB")
 
-                    # Add staged_publish step after save
+                    # Add finalization step after save
                     await update_generation_progress(
                         csv_upload_id,
-                        step="staged_publish",
+                        step="finalization",
                         progress=95,
                         status="in_progress",
                         message="Bundles saved, verifying count...",
