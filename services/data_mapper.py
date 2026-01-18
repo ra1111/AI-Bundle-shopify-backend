@@ -587,10 +587,29 @@ class DataMapper:
                     by_sku, by_id = result
                     self._variant_map_by_scope[scope] = by_sku
                     self._variant_id_map_by_scope[scope] = by_id
+                    logger.info(
+                        "DataMapper prefetch variant_maps result | scope=%s by_sku=%d by_id=%d run_id=%s",
+                        scope,
+                        len(by_sku),
+                        len(by_id),
+                        run_id,
+                    )
                 elif key == "inventory_map":
                     self._inventory_map_by_scope[scope] = self._build_inventory_data_map(result)
+                    logger.info(
+                        "DataMapper prefetch inventory_map result | scope=%s count=%d run_id=%s",
+                        scope,
+                        len(result),
+                        run_id,
+                    )
                 elif key == "catalog_map":
                     self._catalog_map_by_scope[scope] = result
+                    logger.info(
+                        "DataMapper prefetch catalog_map result | scope=%s count=%d run_id=%s",
+                        scope,
+                        len(result),
+                        run_id,
+                    )
 
         logger.info(
             "DataMapper prefetch summary | scope=%s variants_by_id=%d variants_by_sku=%d inventory=%d catalog=%d tasks_started=%d",

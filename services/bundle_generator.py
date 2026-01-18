@@ -807,10 +807,11 @@ class BundleGenerator:
             'subscription_push': ['VOLUME'],               # Subscription: Volume discounts
         }
 
-        # Early termination thresholds
+        # Early termination thresholds (ML skip, NOT bundle skip - we always generate bundles)
         self.min_transactions_for_ml = 10  # Skip ML phase if < 10 transactions
         self.min_products_for_ml = 5       # Skip ML phase if < 5 unique products
         self.min_transactions_for_llm_only = int(os.getenv("MIN_TXNS_FOR_LLM_ONLY", "1"))
+        # NOTE: Even with sparse data, we ALWAYS generate bundles using catalog fallback (Tier 4)
         
         # Bundle generation thresholds
         self.base_min_support = 0.05
@@ -3006,28 +3007,87 @@ class BundleGenerator:
             else:
                 candidate_context = await self.candidate_generator.prepare_context(csv_upload_id)
 
+                # Track sparse data but NEVER terminate early - always generate bundles
+                product_count = len(candidate_context.valid_variant_ids) if candidate_context and candidate_context.valid_variant_ids else 0
+                is_sparse_data = product_count < 5
+                if is_sparse_data:
+                    logger.info(
+                        f"[{csv_upload_id}] SPARSE DATA MODE: {product_count} unique product(s). "
+                        f"Will prioritize VOLUME/BOGO bundles and use catalog fallback."
+                    )
+                    metrics["sparse_data_mode"] = True
+                    metrics["product_count"] = product_count
+                    # Mark context for sparse data handling
+                    if candidate_context:
+                        candidate_context.sparse_data_mode = True
+
                 # Early termination check
                 should_skip, skip_reason = self._should_skip_ml_phase(candidate_context, csv_upload_id)
                 if should_skip:
                     logger.warning(f"[{csv_upload_id}] Phase 3: ML Candidate Generation - SKIPPED | reason={skip_reason}")
+
+                    # CRITICAL: Even when ML is skipped, generate VOLUME bundles from catalog
+                    # Use the same catalog fallback as Quick Mode Tier 4
+                    logger.info(f"[{csv_upload_id}] Generating catalog-based fallback bundles (same as Tier 4)...")
+                    fallback_start = time.time()
+
+                    try:
+                        # Load catalog for fallback generation
+                        catalog_snaps = await storage.get_catalog_snapshot(csv_upload_id)
+                        catalog = {getattr(snap, 'variant_id', None): snap for snap in catalog_snaps}
+                        catalog = {k: v for k, v in catalog.items() if k}
+
+                        # Compute simple product scores based on price
+                        product_scores = {}
+                        for variant_id, snap in catalog.items():
+                            price = float(getattr(snap, 'price', 0) or 0)
+                            product_scores[variant_id] = min(1.0, price / 100.0)
+
+                        # Use existing catalog fallback function (same as Tier 4)
+                        catalog_bundles = _build_catalog_fallback_bundles(
+                            csv_upload_id=csv_upload_id,
+                            catalog=catalog,
+                            product_scores=product_scores,
+                            max_bundles=5,
+                        )
+
+                        all_recommendations.extend(catalog_bundles)
+
+                        fallback_duration = int((time.time() - fallback_start) * 1000)
+                        logger.info(
+                            f"[{csv_upload_id}] Catalog fallback (Tier 4) complete in {fallback_duration}ms | "
+                            f"bundles={len(catalog_bundles)}"
+                        )
+                        metrics["catalog_fallback"] = {
+                            "enabled": True,
+                            "tier": 4,
+                            "volume_bundles": len(catalog_bundles),
+                            "duration_ms": fallback_duration,
+                        }
+                    except Exception as fallback_exc:
+                        logger.warning(f"[{csv_upload_id}] Catalog fallback failed: {fallback_exc}", exc_info=True)
+                        metrics["catalog_fallback"] = {"enabled": True, "error": str(fallback_exc)}
+
                     metrics["ml_candidates"] = {
                         "enabled": False,
                         "skipped": True,
                         "skip_reason": skip_reason,
-                        "duration_ms": 0
+                        "duration_ms": 0,
+                        "fallback_used": True,
                     }
                     metrics["phase_timings"]["phase_3_ml_candidates"] = 0
                     checkpoint = await self._record_checkpoint(
                         csv_upload_id,
                         "phase_3_candidates_skipped",
-                        metadata={"skip_reason": skip_reason},
+                        metadata={"skip_reason": skip_reason, "fallback_bundles": len(all_recommendations)},
                     )
                     await update_generation_progress(
                         csv_upload_id,
                         step="ml_generation",
                         progress=70,
                         status="in_progress",
-                        message=f"ML generation skipped: {skip_reason}",
+                        message=f"Using catalog fallback ({len(all_recommendations)} bundles)",
+                        bundle_count=len(all_recommendations),
                         metadata={"checkpoint": checkpoint},
                     )
                 else:
@@ -3910,7 +3970,9 @@ class BundleGenerator:
             for candidate in candidates:
                 # Check for duplicate SKU combinations
                 product_set = frozenset(candidate.get("products", []))
-                if len(product_set) < 2:  # Skip single-product or empty bundles
+                # VOLUME bundles are single-product with quantity tiers, others need 2+ products
+                min_products = 1 if bundle_type == "VOLUME" else 2
+                if len(product_set) < min_products:  # Skip bundles with insufficient products
                     continue
                     
                 sku_combo_key = f"{objective_type_key}:{hash(product_set)}"
@@ -3967,9 +4029,11 @@ class BundleGenerator:
                     
                     if invalid_skus:
                         logger.warning(f"Filtered invalid SKUs from pricing: {invalid_skus}")
-                    
+
                     # Only proceed with pricing if we have valid SKUs
-                    if len(valid_products) >= 2:  # Need at least 2 products for bundle
+                    # VOLUME bundles are single-product with quantity tiers, others need 2+ products
+                    min_products_required = 1 if bundle_type == "VOLUME" else 2
+                    if len(valid_products) >= min_products_required:
                         recommendation["products"] = valid_products  # Update with only valid SKUs
                         try:
                             pricing_result = await self.pricing_engine.compute_bundle_pricing(
@@ -4006,7 +4070,7 @@ class BundleGenerator:
                         
                     else:
                         # Skip this recommendation if insufficient valid SKUs
-                        logger.warning(f"Insufficient valid SKUs for bundle, skipping: valid={len(valid_products)}, invalid={len(invalid_skus)}")
+                        logger.warning(f"Insufficient valid SKUs for {bundle_type} bundle, skipping: valid={len(valid_products)}, required={min_products_required}, invalid={len(invalid_skus)}")
                         self.generation_stats['failed_attempts'] += 1
                         # Still mark as seen to prevent retry
                         self.seen_sku_combinations.add(sku_combo_key)

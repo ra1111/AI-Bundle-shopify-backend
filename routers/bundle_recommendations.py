@@ -291,55 +291,30 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                 )
 
             try:
-                # Check if this is a first-time installation and quick-start is enabled
+                # Check if shop has existing bundles to determine Quick Mode vs Full Pipeline
                 from services.bundle_generator import BundleGenerator
                 generator = BundleGenerator()
 
-                is_first_install = False
-                preflight_info = None
+                should_use_quick_mode = False
+                existing_bundle_count = 0
 
-                if QUICK_START_ENABLED and not resume_only:
+                if not resume_only:
                     preflight_start = time.time()
-                    logger.info(f"[{csv_upload_id}] 🔍 Step: Pre-flight check STARTING...")
+                    logger.info(f"[{csv_upload_id}] 🔍 Step: Checking existing bundles for shop_id={shop_id}...")
                     try:
-                        # OPTIMIZATION: Use consolidated pre-flight query (single DB round-trip)
-                        preflight_info = await storage.get_quick_start_preflight_info(csv_upload_id, shop_id)
-                        is_first_install = preflight_info["is_first_time_install"]
+                        # Check if shop has ANY existing bundles (shop-level, not upload-specific)
+                        existing_bundle_count = await storage.get_bundle_count_for_shop(shop_id)
+                        # Quick Mode runs when shop has NO existing bundles
+                        should_use_quick_mode = existing_bundle_count == 0
                         preflight_duration = (time.time() - preflight_start) * 1000
 
                         logger.info(
                             f"[{csv_upload_id}] ✅ Pre-flight check COMPLETE in {preflight_duration:.0f}ms:\n"
-                            f"  First-time install: {is_first_install}\n"
-                            f"  Existing quick-start bundles: {preflight_info['quick_start_bundle_count']}\n"
-                            f"  Upload status: {preflight_info['csv_upload_status']}"
+                            f"  Shop: {shop_id}\n"
+                            f"  Existing bundles for shop: {existing_bundle_count}\n"
+                            f"  Should use Quick Mode: {should_use_quick_mode}"
                         )
 
-                        # Skip quick-start if bundles already exist - return early
-                        if preflight_info["has_existing_quick_start"]:
-                            bundle_count = preflight_info['quick_start_bundle_count']
-                            logger.info(
-                                f"[{csv_upload_id}] ✅ Bundle recommendations already exist\n"
-                                f"  Existing bundles: {bundle_count}\n"
-                                f"  Skipping quick-start generation\n"
-                                f"  Upload status: {preflight_info['csv_upload_status']}"
-                            )
-
-                            # Mark upload as completed if not already
-                            if preflight_info['csv_upload_status'] != 'completed':
-                                await storage.safe_mark_upload_completed(csv_upload_id)
-                                logger.info(f"[{csv_upload_id}] Marked upload as completed")
-
-                            # Update progress to show completion
-                            await update_generation_progress(
-                                csv_upload_id,
-                                step="finalization",
-                                progress=100,
-                                status="completed",
-                                message=f"Bundle recommendations already exist ({bundle_count} bundles)",
-                            )
-
-                            # Return early - no need to regenerate
-                            return
                     except Exception as e:
                         preflight_duration = (time.time() - preflight_start) * 1000
                         logger.error(
@@ -348,25 +323,17 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                             f"  Error message: {str(e)}\n"
                             f"  Traceback:\n{traceback.format_exc()}"
                         )
-                        # Fall back to individual check
-                        try:
-                            logger.info(f"[{csv_upload_id}] 🔄 Attempting fallback first-time install check...")
-                            is_first_install = await storage.is_first_time_install(shop_id)
-                            logger.info(f"[{csv_upload_id}] ✅ Fallback check succeeded: is_first_install={is_first_install}")
-                        except Exception as fallback_e:
-                            logger.error(
-                                f"[{csv_upload_id}] ❌ Fallback first-time install check ALSO FAILED!\n"
-                                f"  Error type: {type(fallback_e).__name__}\n"
-                                f"  Error message: {str(fallback_e)}\n"
-                                f"  Traceback:\n{traceback.format_exc()}"
-                            )
+                        # Default to Quick Mode on error (safer for new shops)
+                        should_use_quick_mode = True
+                        logger.info(f"[{csv_upload_id}] Defaulting to Quick Mode due to preflight error")
 
-                # FAST PATH: Quick-start mode for first-time installations
-                if is_first_install and QUICK_START_ENABLED:
+                # FAST PATH: Quick-start mode when shop has NO existing bundles
+                if should_use_quick_mode:
                     quick_start_overall_start = time.time()
                     logger.info(
-                        f"[{csv_upload_id}] 🚀 QUICK-START MODE ACTIVATED for first-time install\n"
+                        f"[{csv_upload_id}] 🚀 QUICK-START MODE ACTIVATED (no existing bundles)\n"
                         f"  Shop: {shop_id}\n"
+                        f"  Existing bundles: {existing_bundle_count}\n"
                         f"  Max products: {QUICK_START_MAX_PRODUCTS}\n"
                         f"  Max bundles: {QUICK_START_MAX_BUNDLES}\n"
                         f"  Timeout: {QUICK_START_TIMEOUT_SECONDS}s\n"
@@ -452,10 +419,10 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         )
                         # Fall through to normal generation
 
-                # NORMAL PATH: Full generation for regular users or if quick-start failed
+                # NORMAL PATH: Full V2 pipeline (shop has existing bundles or quick-start failed)
                 logger.info(
-                    f"Bundle generation {scope}: using {'FULL PIPELINE' if is_first_install else 'NORMAL MODE'} "
-                    f"(first_install={is_first_install}, quick_start_enabled={QUICK_START_ENABLED})"
+                    f"Bundle generation {scope}: using FULL V2 PIPELINE "
+                    f"(existing_bundles={existing_bundle_count}, quick_mode_skipped={not should_use_quick_mode})"
                 )
 
                 # Soft watchdog task setup (only used when hard timeout is disabled)

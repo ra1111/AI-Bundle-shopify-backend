@@ -1061,6 +1061,30 @@ class StorageService:
             count = result.scalar_one_or_none() or 0
             return int(count)
 
+    async def get_bundle_count_for_shop(self, shop_id: str) -> int:
+        """Get the total count of bundle recommendations for a shop.
+
+        Used to determine if Quick Mode should run (no existing bundles = Quick Mode).
+        """
+        normalized_shop_id = sanitize_shop_id(shop_id)
+        if not normalized_shop_id:
+            return 0
+
+        async with self.get_session() as session:
+            query = (
+                select(func.count())
+                .select_from(BundleRecommendation)
+                .where(BundleRecommendation.shop_id == normalized_shop_id)
+            )
+            result = await session.execute(query)
+            count = result.scalar_one_or_none() or 0
+            logger.info(
+                "get_bundle_count_for_shop | shop_id=%s count=%d",
+                normalized_shop_id,
+                count,
+            )
+            return int(count)
+
     # Bundle operations
     async def create_bundle(self, bundle_data: Dict[str, Any]) -> Bundle:
         """Create new bundle"""
@@ -1491,15 +1515,24 @@ class StorageService:
     async def get_variants_for_run(self, run_id: str) -> List[Variant]:
         """Get variants associated with all uploads in a run."""
         if not run_id:
+            logger.warning("get_variants_for_run called with empty run_id")
             return []
         async with self.get_session() as session:
+            # Use explicit select_from to match count query pattern and ensure correct JOIN
             query = (
                 select(Variant)
+                .select_from(Variant)
                 .join(CsvUpload, Variant.csv_upload_id == CsvUpload.id)
                 .where(CsvUpload.run_id == run_id)
             )
             result = await session.execute(query)
-            return list(result.scalars().all())
+            variants = list(result.scalars().all())
+            logger.info(
+                "get_variants_for_run | run_id=%s count=%d",
+                run_id,
+                len(variants),
+            )
+            return variants
 
     async def get_variant_maps_by_run(self, run_id: str) -> Tuple[Dict[str, Variant], Dict[str, Variant]]:
         """Return variants keyed by SKU and variant_id for a run."""
@@ -1617,15 +1650,24 @@ class StorageService:
     async def get_inventory_levels_for_run(self, run_id: str) -> List[InventoryLevel]:
         """Get inventory levels associated with all uploads in a run."""
         if not run_id:
+            logger.warning("get_inventory_levels_for_run called with empty run_id")
             return []
         async with self.get_session() as session:
+            # Use explicit select_from to match count query pattern and ensure correct JOIN
             query = (
                 select(InventoryLevel)
+                .select_from(InventoryLevel)
                 .join(CsvUpload, InventoryLevel.csv_upload_id == CsvUpload.id)
                 .where(CsvUpload.run_id == run_id)
             )
             result = await session.execute(query)
-            return list(result.scalars().all())
+            levels = list(result.scalars().all())
+            logger.info(
+                "get_inventory_levels_for_run | run_id=%s count=%d",
+                run_id,
+                len(levels),
+            )
+            return levels
 
     async def get_inventory_levels_map_by_run(self, run_id: str) -> Dict[str, List[InventoryLevel]]:
         """Return inventory levels keyed by inventory_item_id for a run."""
@@ -2152,14 +2194,24 @@ class StorageService:
 
     async def get_catalog_snapshots_map_by_variant_and_run(self, run_id: str) -> Dict[str, CatalogSnapshot]:
         """Get catalog snapshots keyed by variant_id for a run."""
+        if not run_id:
+            logger.warning("get_catalog_snapshots_map_by_variant_and_run called with empty run_id")
+            return {}
         async with self.get_session() as session:
+            # Use explicit select_from to match count query pattern and ensure correct JOIN
             query = (
                 select(CatalogSnapshot)
+                .select_from(CatalogSnapshot)
                 .join(CsvUpload, CatalogSnapshot.csv_upload_id == CsvUpload.id)
                 .where(CsvUpload.run_id == run_id)
             )
             result = await session.execute(query)
             snapshots = list(result.scalars().all())
+            logger.info(
+                "get_catalog_snapshots_map_by_variant_and_run | run_id=%s count=%d",
+                run_id,
+                len(snapshots),
+            )
             return {snapshot.variant_id: snapshot for snapshot in snapshots if snapshot.variant_id}
 
     async def get_order_lines_by_run(self, run_id: str) -> List[OrderLine]:
