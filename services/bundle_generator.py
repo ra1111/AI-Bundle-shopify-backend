@@ -1954,7 +1954,7 @@ class BundleGenerator:
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
                     # This prevents race condition where frontend queries DB before bundles are saved
                     if bayesian_bundles:
-                        await storage.save_bundle_recommendations(bayesian_bundles)
+                        await storage.create_bundle_recommendations(bayesian_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(bayesian_bundles)} Bayesian bundles to DB")
 
                     # Add staged_publish step after save
@@ -2075,7 +2075,7 @@ class BundleGenerator:
                     # CRITICAL FIX: Save bundles BEFORE sending completion status
                     # This prevents race condition where frontend queries DB before bundles are saved
                     if catalog_bundles:
-                        await storage.save_bundle_recommendations(catalog_bundles)
+                        await storage.create_bundle_recommendations(catalog_bundles)
                         logger.info(f"[{csv_upload_id}] ✅ Saved {len(catalog_bundles)} catalog fallback bundles to DB")
 
                     # Add staged_publish step after save
@@ -2232,7 +2232,7 @@ class BundleGenerator:
                 # CRITICAL FIX: Save bundles BEFORE sending completion status
                 # This prevents race condition where frontend queries DB before bundles are saved
                 if single_product_bundles:
-                    await storage.save_bundle_recommendations(single_product_bundles)
+                    await storage.create_bundle_recommendations(single_product_bundles)
                     logger.info(f"[{csv_upload_id}] ✅ Saved {len(single_product_bundles)} single-product volume bundles to DB")
 
                 # Add staged_publish step after save
