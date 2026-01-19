@@ -54,4 +54,4 @@ USER appuser
 
 # Expose port
 EXPOSE $PORT
-CMD ["sh","-c","gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8080} --timeout 300 --graceful-timeout 30 --keep-alive 2 --access-logfile - --error-logfile - --log-level info"]
+CMD ["sh","-c","gunicorn main:app -w 1 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:${PORT:-8080} --timeout 600 --graceful-timeout 60 --keep-alive 5 --access-logfile - --error-logfile - --log-level info"]
