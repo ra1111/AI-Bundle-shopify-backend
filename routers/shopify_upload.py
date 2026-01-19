@@ -445,13 +445,41 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
             )
             progress_result = await db.execute(progress_stmt)
             progress_record = progress_result.scalar_one_or_none()
-            if progress_record and progress_record.status == "in_progress":
-                # Bundle generation is actually in progress - don't say "completed"
-                frontend_status = "generating_bundles"
-                logger.info(
-                    f"📊 STATUS OVERRIDE: upload_id={upload_id} csv_status=completed but "
-                    f"progress shows in_progress at step={progress_record.step} - returning generating_bundles"
-                )
+            if progress_record:
+                if progress_record.status == "in_progress":
+                    # Bundle generation is actually in progress - don't say "completed"
+                    frontend_status = "generating_bundles"
+                    logger.info(
+                        f"📊 STATUS OVERRIDE: upload_id={upload_id} csv_status=completed but "
+                        f"progress shows in_progress at step={progress_record.step} - returning generating_bundles"
+                    )
+                elif progress_record.status == "completed":
+                    # Bundle generation finished - keep as completed
+                    frontend_status = "completed"
+                # If status is "failed", keep as completed (user can retry)
+            else:
+                # NO progress record yet - check if upload is recent (Quick Start scenario)
+                # If CSV was just processed, bundle generation is about to start
+                from datetime import timezone
+                now = datetime.now(timezone.utc)
+                created_at = upload.created_at
+                if created_at and created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+
+                # If upload was created within last 5 minutes, assume bundle generation is pending
+                if created_at and (now - created_at).total_seconds() < 300:
+                    frontend_status = "generating_bundles"
+                    logger.info(
+                        f"📊 STATUS OVERRIDE: upload_id={upload_id} csv_status=completed, "
+                        f"no progress record, but upload is recent ({(now - created_at).total_seconds():.0f}s old) "
+                        f"- assuming bundle generation pending"
+                    )
+                else:
+                    # Old upload with no progress record and no bundles - keep as completed
+                    logger.info(
+                        f"📊 STATUS: upload_id={upload_id} csv_status=completed, "
+                        f"no progress record, upload is old - returning completed"
+                    )
         except Exception as exc:
             logger.warning(f"Failed to check generation progress for {upload_id}: {exc}")
 
