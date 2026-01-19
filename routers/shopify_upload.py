@@ -19,7 +19,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database import AsyncSessionLocal, BundleRecommendation, CsvUpload, GenerationProgress, get_db
-from routers.bundle_recommendations import generate_bundles_background
+# NOTE: generate_bundles_background removed - bundle generation is triggered
+# automatically by csv_processor.py via maybe_trigger_bundle_generation()
 from routers.uploads import (
     _ensure_data_ready,
     _resolve_orders_upload,
@@ -836,19 +837,16 @@ async def process_shopify_upload_background(
             )
             return
 
-    try:
-        target_upload_id = (
-            orders_upload_id if source_upload and source_upload.csv_type != "orders" else upload_id
-        )
-        await generate_bundles_background(target_upload_id)
-        logger.info(
-            "[process_shopify_upload] Pipeline completed for upload_id=%s",
-            target_upload_id,
-        )
-    except Exception:
-        logger.exception(
-            "[process_shopify_upload] Pipeline execution failed upload_id=%s", upload_id
-        )
+    # NOTE: Bundle generation is triggered automatically by csv_processor.py
+    # via maybe_trigger_bundle_generation() after CSV processing completes.
+    # DO NOT call generate_bundles_background() here - it causes duplicate runs!
+    target_upload_id = (
+        orders_upload_id if source_upload and source_upload.csv_type != "orders" else upload_id
+    )
+    logger.info(
+        "[process_shopify_upload] Pipeline completed for upload_id=%s (bundle generation triggered by csv_processor)",
+        target_upload_id,
+    )
 
 
 async def process_batch_upload_background(
@@ -946,17 +944,10 @@ async def process_batch_upload_background(
             )
             return
 
-    try:
-        logger.info(
-            "[process_batch_upload] Launching bundle generation for orders_upload_id=%s",
-            orders_upload_id,
-        )
-        await generate_bundles_background(orders_upload_id)
-        logger.info(
-            "[process_batch_upload] Pipeline completed for run_id=%s",
-            run_id,
-        )
-    except Exception:
-        logger.exception(
-            "[process_batch_upload] Pipeline execution failed run_id=%s", run_id
-        )
+    # NOTE: Bundle generation is triggered automatically by csv_processor.py
+    # via maybe_trigger_bundle_generation() after the last CSV completes.
+    # DO NOT call generate_bundles_background() here - it causes duplicate runs!
+    logger.info(
+        "[process_batch_upload] Pipeline completed for run_id=%s (bundle generation triggered by csv_processor)",
+        run_id,
+    )
