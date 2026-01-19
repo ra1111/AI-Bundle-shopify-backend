@@ -243,3 +243,48 @@ async def get_generation_progress(
         response["run_id"] = metadata["run_id"]
 
     return response
+
+
+@router.post("/force-reset/{upload_id}")
+async def force_reset_sync(
+    upload_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    Force-reset a stuck sync by marking its progress as failed.
+    This allows starting a new sync when one is stuck.
+    """
+    from sqlalchemy import update
+    from services.storage import storage
+
+    logger.info(f"Force-reset requested for upload {upload_id}")
+
+    # Update GenerationProgress to failed
+    try:
+        stmt = (
+            update(GenerationProgress)
+            .where(GenerationProgress.upload_id == upload_id)
+            .values(
+                status="failed",
+                message="Force-reset by user to allow new sync",
+                updated_at=datetime.now(timezone.utc),
+            )
+        )
+        await db.execute(stmt)
+        await db.commit()
+        logger.info(f"GenerationProgress reset for {upload_id}")
+    except Exception as exc:
+        logger.warning(f"Failed to reset GenerationProgress for {upload_id}: {exc}")
+
+    # Also reset the CSV upload status
+    try:
+        await storage.update_csv_upload(upload_id, {"status": "failed"})
+        logger.info(f"CsvUpload status reset for {upload_id}")
+    except Exception as exc:
+        logger.warning(f"Failed to reset CsvUpload for {upload_id}: {exc}")
+
+    return {
+        "success": True,
+        "message": f"Sync {upload_id} has been force-reset. You can now start a new sync.",
+        "upload_id": upload_id,
+    }

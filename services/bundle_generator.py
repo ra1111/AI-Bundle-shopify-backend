@@ -1958,27 +1958,45 @@ class BundleGenerator:
                         except Exception as e:
                             logger.warning(f"[{csv_upload_id}] ⚠️ Tier 3 LLM fallback failed: {e}")
 
-                    # Generate BOGO bundles targeting slow sellers (bottom 25% velocity)
+                    # Generate BXGY bundles using ML co-occurrence analysis (cross-product Buy X Get Y)
                     bogo_bundles = []
-                    if max_bogo_bundles > 0 and catalog:
+                    if max_bogo_bundles > 0 and order_lines:
                         try:
-                            bogo_bundles = _build_quick_start_bogo_bundles(
-                                csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
+                            # Try ML-based BXGY first (cross-product pairs from co-occurrence)
+                            bogo_bundles = _build_ml_bxgy_bundles(
+                                csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data
                             )
-                            logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} BOGO bundles")
+                            if bogo_bundles:
+                                logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} ML-BXGY bundles (cross-product)")
+                            else:
+                                # Fallback to same-product BOGO if no co-occurrence pairs
+                                logger.info(f"[{csv_upload_id}] ⚠️ No ML-BXGY pairs, falling back to same-product BOGO")
+                                bogo_bundles = _build_quick_start_bogo_bundles(
+                                    csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
+                                )
+                                logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} fallback BOGO bundles")
                         except Exception as e:
-                            logger.warning(f"[{csv_upload_id}] BOGO generation failed: {e}")
+                            logger.warning(f"[{csv_upload_id}] BXGY/BOGO generation failed: {e}", exc_info=True)
 
-                    # Generate Volume bundles targeting fast sellers (top 25% velocity)
+                    # Generate Volume bundles using ML quantity histogram analysis
                     volume_bundles = []
-                    if max_volume_bundles > 0 and variant_sales:
+                    if max_volume_bundles > 0 and order_lines:
                         try:
-                            volume_bundles = _build_quick_start_volume_bundles(
-                                csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
+                            # Try ML-based Volume first (data-driven tiers from purchase quantities)
+                            volume_bundles = _build_ml_volume_bundles(
+                                csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data
                             )
-                            logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} Volume bundles")
+                            if volume_bundles:
+                                logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} ML-Volume bundles (data-driven tiers)")
+                            else:
+                                # Fallback to hardcoded tiers if no quantity data
+                                logger.info(f"[{csv_upload_id}] ⚠️ No ML-Volume data, falling back to hardcoded tiers")
+                                volume_bundles = _build_quick_start_volume_bundles(
+                                    csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
+                                )
+                                logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} fallback Volume bundles")
                         except Exception as e:
-                            logger.warning(f"[{csv_upload_id}] Volume generation failed: {e}")
+                            logger.warning(f"[{csv_upload_id}] Volume generation failed: {e}", exc_info=True)
 
                     # Combine all bundle types
                     bayesian_bundles = bayesian_bundles + bogo_bundles + volume_bundles
@@ -2759,8 +2777,18 @@ class BundleGenerator:
                 return fbt_result
 
             async def generate_bogo():
-                """BOGO bundles in separate thread"""
-                if max_bogo_bundles > 0:
+                """BXGY bundles using ML co-occurrence (cross-product pairs)"""
+                if max_bogo_bundles > 0 and order_lines:
+                    # Try ML-based BXGY first
+                    result = await asyncio.to_thread(
+                        _build_ml_bxgy_bundles,
+                        csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data
+                    )
+                    if result:
+                        logger.info(f"[{csv_upload_id}] ✅ ML-BXGY generated {len(result)} cross-product bundles")
+                        return result
+                    # Fallback to same-product BOGO
+                    logger.info(f"[{csv_upload_id}] ⚠️ No ML-BXGY pairs, using same-product BOGO fallback")
                     return await asyncio.to_thread(
                         _build_quick_start_bogo_bundles,
                         csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
@@ -2768,8 +2796,18 @@ class BundleGenerator:
                 return []
 
             async def generate_volume():
-                """VOLUME bundles in separate thread"""
-                if max_volume_bundles > 0:
+                """VOLUME bundles using ML quantity histogram analysis"""
+                if max_volume_bundles > 0 and order_lines:
+                    # Try ML-based Volume first (data-driven tiers)
+                    result = await asyncio.to_thread(
+                        _build_ml_volume_bundles,
+                        csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data
+                    )
+                    if result:
+                        logger.info(f"[{csv_upload_id}] ✅ ML-Volume generated {len(result)} bundles with data-driven tiers")
+                        return result
+                    # Fallback to hardcoded tiers
+                    logger.info(f"[{csv_upload_id}] ⚠️ No ML-Volume data, using hardcoded tier fallback")
                     return await asyncio.to_thread(
                         _build_quick_start_volume_bundles,
                         csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
@@ -7312,6 +7350,616 @@ def _build_quick_start_volume_bundles(
     logger.info(f"[{csv_upload_id}]   Bundles created: {len(bundles)}")
 
     return bundles
+
+
+# ============================================================================
+# ML-BASED BXGY: Cross-product "Buy X Get Y" using co-occurrence analysis
+# ============================================================================
+
+def _build_ml_bxgy_bundles(
+    csv_upload_id: str,
+    order_lines: List[Any],
+    catalog: Dict[str, Any],
+    product_scores: Dict[str, float],
+    max_bundles: int,
+    velocity_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build BXGY bundles using ML/statistical co-occurrence analysis.
+
+    Unlike the hardcoded B2G1 same-product approach, this uses:
+    1. Co-occurrence matrix from actual order data
+    2. P(Y|X) Bayesian probability to find complementary products
+    3. X = popular anchor product (trigger)
+    4. Y = complementary product, preferring slow movers (reward - discounted/free)
+
+    Creates cross-product "Buy X, Get Y Free/Discounted" bundles.
+    """
+    from collections import defaultdict, Counter
+    import uuid
+
+    logger.info(f"[{csv_upload_id}] 🎯 ML-BXGY BUNDLE GENERATION - STARTED")
+    logger.info(f"[{csv_upload_id}]   Target: {max_bundles} cross-product BXGY bundles")
+
+    bundles = []
+
+    # Step 1: Build co-occurrence matrix from order data
+    order_groups = defaultdict(list)
+    variant_occurrence = Counter()
+
+    for line in order_lines:
+        order_id = getattr(line, 'order_id', None)
+        variant_id = getattr(line, 'variant_id', None)
+        if order_id and variant_id:
+            order_groups[order_id].append(variant_id)
+            variant_occurrence[variant_id] += 1
+
+    # Step 2: Compute pair co-occurrences
+    pair_cooccurrence = Counter()
+    for order_id, variants in order_groups.items():
+        unique_variants = list(set(variants))
+        if len(unique_variants) >= 2:
+            for i, v1 in enumerate(unique_variants):
+                for v2 in unique_variants[i + 1:]:
+                    # Store directionally: (trigger, reward)
+                    pair_cooccurrence[(v1, v2)] += 1
+                    pair_cooccurrence[(v2, v1)] += 1
+
+    logger.info(f"[{csv_upload_id}]   Co-occurrence pairs found: {len(pair_cooccurrence)}")
+
+    if not pair_cooccurrence:
+        logger.warning(f"[{csv_upload_id}] ⚠️ No co-occurrence data for ML-BXGY, falling back to catalog")
+        # Fallback: return empty, let caller handle
+        return []
+
+    # Step 3: Extract velocity data for smart pairing
+    slow_sellers = velocity_data.get("slow_sellers", set()) if velocity_data else set()
+    fast_sellers = velocity_data.get("fast_sellers", set()) if velocity_data else set()
+    velocities = velocity_data.get("velocities", {}) if velocity_data else {}
+
+    logger.info(f"[{csv_upload_id}]   Fast sellers (X candidates): {len(fast_sellers)}")
+    logger.info(f"[{csv_upload_id}]   Slow sellers (Y candidates): {len(slow_sellers)}")
+
+    # Step 4: Score all pairs with Bayesian P(Y|X) and preference for slow mover Y
+    total_products = len(catalog)
+    scored_pairs = []
+
+    for (trigger_id, reward_id), co_count in pair_cooccurrence.items():
+        # Skip same product
+        if trigger_id == reward_id:
+            continue
+
+        # Get catalog entries
+        trigger_snap = catalog.get(trigger_id)
+        reward_snap = catalog.get(reward_id)
+        if not trigger_snap or not reward_snap:
+            continue
+
+        # Get prices and stock
+        trigger_price = float(getattr(trigger_snap, 'price', 0) or 0)
+        reward_price = float(getattr(reward_snap, 'price', 0) or 0)
+        reward_stock = int(getattr(reward_snap, 'available_total', 0) or 0)
+
+        if trigger_price <= 0 or reward_price <= 0 or reward_stock <= 0:
+            continue
+
+        # PREFER: Fast-selling trigger (X) + Slow-selling reward (Y)
+        # This moves slow inventory when customers buy popular items
+        trigger_velocity = velocities.get(trigger_id, 0)
+        reward_velocity = velocities.get(reward_id, 0)
+
+        # Compute Bayesian score P(Y|X)
+        trigger_occurs = variant_occurrence.get(trigger_id, 0)
+        if trigger_occurs == 0:
+            continue
+
+        p_y_given_x = _bayesian_pair_score(
+            co_occurs=co_count,
+            occurs_a=trigger_occurs,
+            total_products=total_products,
+            alpha=1.0,
+            lambda_penalty=0.2
+        )
+
+        # Bonus for slow-mover reward (helps move stagnant inventory)
+        slow_mover_bonus = 0.3 if reward_id in slow_sellers else 0.0
+
+        # Bonus for fast-selling trigger (customers already buying it)
+        fast_trigger_bonus = 0.2 if trigger_id in fast_sellers else 0.0
+
+        # Price ratio bonus: prefer Y cheaper than X (realistic "get Y free" economics)
+        price_ratio = reward_price / trigger_price if trigger_price > 0 else 1.0
+        price_bonus = 0.2 if price_ratio < 0.5 else (0.1 if price_ratio < 1.0 else 0.0)
+
+        final_score = p_y_given_x + slow_mover_bonus + fast_trigger_bonus + price_bonus
+
+        scored_pairs.append({
+            "trigger_id": trigger_id,
+            "reward_id": reward_id,
+            "trigger_snap": trigger_snap,
+            "reward_snap": reward_snap,
+            "co_count": co_count,
+            "p_y_given_x": p_y_given_x,
+            "final_score": final_score,
+            "trigger_velocity": trigger_velocity,
+            "reward_velocity": reward_velocity,
+            "reward_is_slow_mover": reward_id in slow_sellers,
+        })
+
+    # Step 5: Sort by score and select top pairs (avoiding duplicate products)
+    scored_pairs.sort(key=lambda x: x["final_score"], reverse=True)
+
+    used_triggers = set()
+    used_rewards = set()
+
+    for pair in scored_pairs:
+        if len(bundles) >= max_bundles:
+            break
+
+        trigger_id = pair["trigger_id"]
+        reward_id = pair["reward_id"]
+
+        # Avoid using same product as both trigger and reward across bundles
+        if trigger_id in used_triggers or reward_id in used_rewards:
+            continue
+        # Avoid using a trigger as a reward in another bundle (and vice versa)
+        if trigger_id in used_rewards or reward_id in used_triggers:
+            continue
+
+        used_triggers.add(trigger_id)
+        used_rewards.add(reward_id)
+
+        trigger_snap = pair["trigger_snap"]
+        reward_snap = pair["reward_snap"]
+
+        # Extract product data
+        trigger_data = {
+            "variant_id": getattr(trigger_snap, 'variant_id', ''),
+            "variant_gid": f"gid://shopify/ProductVariant/{getattr(trigger_snap, 'variant_id', '')}",
+            "product_id": getattr(trigger_snap, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(trigger_snap, 'product_id', '')}",
+            "sku": getattr(trigger_snap, 'sku', ''),
+            "name": getattr(trigger_snap, 'title', '') or getattr(trigger_snap, 'product_title', ''),
+            "title": getattr(trigger_snap, 'title', '') or getattr(trigger_snap, 'product_title', ''),
+            "price": float(getattr(trigger_snap, 'price', 0) or 0),
+            "image_url": getattr(trigger_snap, 'image_url', None),
+        }
+        reward_data = {
+            "variant_id": getattr(reward_snap, 'variant_id', ''),
+            "variant_gid": f"gid://shopify/ProductVariant/{getattr(reward_snap, 'variant_id', '')}",
+            "product_id": getattr(reward_snap, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(reward_snap, 'product_id', '')}",
+            "sku": getattr(reward_snap, 'sku', ''),
+            "name": getattr(reward_snap, 'title', '') or getattr(reward_snap, 'product_title', ''),
+            "title": getattr(reward_snap, 'title', '') or getattr(reward_snap, 'product_title', ''),
+            "price": float(getattr(reward_snap, 'price', 0) or 0),
+            "image_url": getattr(reward_snap, 'image_url', None),
+        }
+
+        trigger_price = trigger_data["price"]
+        reward_price = reward_data["price"]
+
+        # Determine discount type based on co-occurrence strength and price ratio
+        # Strong co-occurrence + affordable reward = FREE
+        # Weaker co-occurrence or expensive reward = 50% off
+        if pair["p_y_given_x"] > 0.15 and reward_price < trigger_price * 0.5:
+            discount_type = "free"
+            discount_percent = 100
+        elif pair["p_y_given_x"] > 0.1 and reward_price < trigger_price:
+            discount_type = "percentage"
+            discount_percent = 50
+        else:
+            discount_type = "percentage"
+            discount_percent = 25
+
+        # Calculate pricing
+        original_total = trigger_price + reward_price
+        reward_discount = reward_price * (discount_percent / 100)
+        bundle_price = trigger_price + (reward_price - reward_discount)
+        effective_discount_pct = (reward_discount / original_total) * 100 if original_total > 0 else 0
+
+        trigger_name = trigger_data["name"] or "Product"
+        reward_name = reward_data["name"] or "Product"
+
+        # BXGY config
+        bxgy_config = {
+            "buy_qty": 1,
+            "get_qty": 1,
+            "discount_type": discount_type,
+            "discount_percent": discount_percent,
+            "same_product": False,  # CROSS-PRODUCT!
+            "mode": "cross_product_bxgy",
+            "trigger_variant_id": trigger_data["variant_id"],
+            "reward_variant_id": reward_data["variant_id"],
+        }
+
+        bundle_title = f"Buy {trigger_name[:30]}, Get {reward_name[:25]} {'FREE' if discount_type == 'free' else f'{discount_percent}% Off'}!"
+
+        bundles.append({
+            "id": str(uuid.uuid4()),
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": "BOGO",  # BOGO type but cross-product
+            "objective": "cross_sell_slow_movers" if pair["reward_is_slow_mover"] else "cross_sell",
+            "products": {
+                "items": [trigger_data, reward_data],
+                "trigger_product": {**trigger_data, "quantity": 1},
+                "qualifiers": [{**trigger_data, "quantity": 1}],
+                "rewards": [{
+                    **reward_data,
+                    "quantity": 1,
+                    "discount_type": discount_type,
+                    "discount_percent": discount_percent,
+                }],
+            },
+            "pricing": {
+                "original_total": original_total,
+                "bundle_price": bundle_price,
+                "discount_amount": reward_discount,
+                "discount_pct": f"{effective_discount_pct:.1f}%",
+                "discount_percentage": round(effective_discount_pct, 1),
+                "discount_type": "bogo",
+                "bogo_config": bxgy_config,
+            },
+            "ai_copy": {
+                "title": bundle_title,
+                "description": f"Get {reward_name} {'FREE' if discount_type == 'free' else f'at {discount_percent}% off'} when you buy {trigger_name}!",
+                "tagline": f"{'FREE' if discount_type == 'free' else f'{discount_percent}% OFF'} {reward_name}!",
+                "valueProposition": f"Save ${reward_discount:.2f} on this perfect pairing!",
+                "explanation": f"ML-detected: {pair['co_count']} customers bought these together. P(Y|X)={pair['p_y_given_x']:.3f}",
+                "is_active": True,
+                "show_on": ["product", "cart"],
+                "features": {
+                    "co_occurrence_count": pair["co_count"],
+                    "p_y_given_x": round(pair["p_y_given_x"], 4),
+                    "reward_is_slow_mover": pair["reward_is_slow_mover"],
+                    "generation_mode": "ml_bxgy",
+                },
+            },
+            "confidence": Decimal(str(min(0.9, pair["p_y_given_x"] + 0.3))),
+            "predicted_lift": Decimal("1.0"),
+            "ranking_score": Decimal(str(pair["final_score"])),
+            "support": Decimal(str(pair["co_count"] / len(order_groups) if order_groups else 0.1)),
+            "lift": Decimal(str(1 + pair["p_y_given_x"])),
+            "discount_reference": f"__ml_bxgy_{csv_upload_id}__",
+            "is_approved": False,
+            "created_at": datetime.utcnow(),
+        })
+
+        logger.info(
+            f"[{csv_upload_id}]   ✓ BXGY: Buy {trigger_name[:20]} → Get {reward_name[:20]} "
+            f"({'FREE' if discount_type == 'free' else f'{discount_percent}% off'}) | "
+            f"co-occur={pair['co_count']}, P(Y|X)={pair['p_y_given_x']:.3f}"
+        )
+
+    logger.info(f"[{csv_upload_id}] 🎉 ML-BXGY BUNDLE GENERATION - COMPLETED")
+    logger.info(f"[{csv_upload_id}]   Cross-product BXGY bundles created: {len(bundles)}")
+
+    return bundles
+
+
+# ============================================================================
+# ML-BASED VOLUME: Data-driven tier breakpoints from quantity histogram
+# ============================================================================
+
+def _build_ml_volume_bundles(
+    csv_upload_id: str,
+    order_lines: List[Any],
+    catalog: Dict[str, Any],
+    product_scores: Dict[str, float],
+    max_bundles: int,
+    velocity_data: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build VOLUME bundles using ML/statistical analysis of purchase quantities.
+
+    Unlike the hardcoded tiers (2→5%, 3→10%, 5→15%), this:
+    1. Analyzes actual quantity distribution per product
+    2. Determines optimal tier breakpoints from real purchase patterns
+    3. Sets data-driven discounts based on quantity percentiles
+
+    Creates volume discount bundles with ML-optimized tiers.
+    """
+    from collections import defaultdict, Counter
+    import uuid
+    import statistics
+
+    logger.info(f"[{csv_upload_id}] 📊 ML-VOLUME BUNDLE GENERATION - STARTED")
+    logger.info(f"[{csv_upload_id}]   Target: {max_bundles} ML-optimized volume bundles")
+
+    bundles = []
+
+    # Step 1: Build quantity histogram per product
+    # Track: for each variant, what quantities do customers typically buy?
+    variant_quantities = defaultdict(list)  # variant_id -> [qty1, qty2, qty3, ...]
+    variant_total_sold = Counter()
+
+    for line in order_lines:
+        variant_id = getattr(line, 'variant_id', None)
+        quantity = int(getattr(line, 'quantity', 1) or 1)
+        if variant_id and quantity > 0:
+            variant_quantities[variant_id].append(quantity)
+            variant_total_sold[variant_id] += quantity
+
+    logger.info(f"[{csv_upload_id}]   Products with quantity data: {len(variant_quantities)}")
+
+    # Step 2: Get fast sellers (best candidates for volume bundles)
+    fast_sellers = velocity_data.get("fast_sellers", set()) if velocity_data else set()
+    velocities = velocity_data.get("velocities", {}) if velocity_data else {}
+
+    # Step 3: Score and rank candidates
+    candidates = []
+
+    for variant_id, qty_list in variant_quantities.items():
+        snap = catalog.get(variant_id)
+        if not snap:
+            continue
+
+        price = float(getattr(snap, 'price', 0) or 0)
+        available = int(getattr(snap, 'available_total', 0) or 0)
+
+        if price <= 0 or available < 3:  # Need at least 3 units for volume
+            continue
+
+        total_sold = variant_total_sold[variant_id]
+        velocity = velocities.get(variant_id, 0)
+
+        # Analyze quantity distribution
+        qty_stats = _analyze_quantity_distribution(qty_list)
+
+        # Score: prefer fast sellers with evidence of bulk purchases
+        score = 0.0
+        if variant_id in fast_sellers:
+            score += 0.4
+        if qty_stats["max_qty"] >= 3:
+            score += 0.3  # Evidence of bulk buying
+        if qty_stats["pct_buying_2plus"] > 0.2:
+            score += 0.2  # >20% buy 2+
+        score += min(0.1, total_sold / 100)  # Volume bonus
+
+        candidates.append({
+            "variant_id": variant_id,
+            "snap": snap,
+            "price": price,
+            "available": available,
+            "total_sold": total_sold,
+            "velocity": velocity,
+            "qty_stats": qty_stats,
+            "score": score,
+        })
+
+    # Sort by score descending
+    candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    logger.info(f"[{csv_upload_id}]   Volume candidates after scoring: {len(candidates)}")
+
+    # Step 4: Create bundles with ML-optimized tiers
+    used_variants = set()
+
+    for cand in candidates:
+        if len(bundles) >= max_bundles:
+            break
+
+        variant_id = cand["variant_id"]
+        if variant_id in used_variants:
+            continue
+        used_variants.add(variant_id)
+
+        snap = cand["snap"]
+        price = cand["price"]
+        qty_stats = cand["qty_stats"]
+
+        # Build product data
+        product_data = {
+            "variant_id": variant_id,
+            "variant_gid": f"gid://shopify/ProductVariant/{variant_id}",
+            "product_id": getattr(snap, 'product_id', ''),
+            "product_gid": f"gid://shopify/Product/{getattr(snap, 'product_id', '')}",
+            "sku": getattr(snap, 'sku', ''),
+            "name": getattr(snap, 'title', '') or getattr(snap, 'product_title', ''),
+            "title": getattr(snap, 'title', '') or getattr(snap, 'product_title', ''),
+            "price": price,
+            "image_url": getattr(snap, 'image_url', None),
+        }
+
+        # Generate ML-optimized tiers
+        volume_tiers = _generate_ml_volume_tiers(qty_stats, cand["available"])
+
+        product_name = product_data["name"] or "Product"
+        bundle_title = f"{product_name[:40]} - Volume Savings"
+
+        bundles.append({
+            "id": str(uuid.uuid4()),
+            "csv_upload_id": csv_upload_id,
+            "bundle_type": "VOLUME",
+            "objective": "increase_aov",
+            "products": {
+                "items": [product_data],
+                "volume_tiers": volume_tiers,
+            },
+            "pricing": {
+                "original_total": price,
+                "bundle_price": price,
+                "discount_amount": 0,
+                "discount_pct": "0%",
+                "discount_type": "tiered",
+                "volume_tiers": volume_tiers,
+            },
+            "ai_copy": {
+                "title": bundle_title,
+                "description": f"Save more when you buy more {product_name}! Data-driven tiers based on customer behavior.",
+                "valueProposition": f"Up to {volume_tiers[-1]['discount_value']}% off when you buy {volume_tiers[-1]['min_qty']}+!",
+                "explanation": f"ML-optimized tiers: {qty_stats['pct_buying_2plus']*100:.0f}% of customers buy 2+, max observed qty={qty_stats['max_qty']}",
+                "is_active": True,
+                "show_on": ["product", "cart"],
+                "features": {
+                    "units_sold": cand["total_sold"],
+                    "available_inventory": cand["available"],
+                    "max_observed_qty": qty_stats["max_qty"],
+                    "pct_buying_2plus": round(qty_stats["pct_buying_2plus"], 3),
+                    "mean_qty": round(qty_stats["mean_qty"], 2),
+                    "generation_mode": "ml_volume",
+                },
+            },
+            "confidence": Decimal("0.7"),
+            "predicted_lift": Decimal("1.0"),
+            "ranking_score": Decimal(str(cand["score"])),
+            "support": Decimal("0.5"),
+            "lift": Decimal("1.15"),
+            "discount_reference": f"__ml_volume_{csv_upload_id}__",
+            "is_approved": False,
+            "created_at": datetime.utcnow(),
+        })
+
+        logger.info(
+            f"[{csv_upload_id}]   ✓ VOLUME: {product_name[:25]} | "
+            f"tiers={[t['min_qty'] for t in volume_tiers[1:]]} | "
+            f"max_obs_qty={qty_stats['max_qty']}, mean={qty_stats['mean_qty']:.1f}"
+        )
+
+    logger.info(f"[{csv_upload_id}] 🎉 ML-VOLUME BUNDLE GENERATION - COMPLETED")
+    logger.info(f"[{csv_upload_id}]   ML-optimized volume bundles created: {len(bundles)}")
+
+    return bundles
+
+
+def _analyze_quantity_distribution(qty_list: List[int]) -> Dict[str, Any]:
+    """
+    Analyze a list of purchase quantities for a product.
+
+    Returns statistics useful for volume tier optimization.
+    """
+    import statistics
+
+    if not qty_list:
+        return {
+            "count": 0,
+            "mean_qty": 1.0,
+            "median_qty": 1,
+            "max_qty": 1,
+            "p75_qty": 1,
+            "p90_qty": 1,
+            "pct_buying_2plus": 0.0,
+            "pct_buying_3plus": 0.0,
+            "pct_buying_5plus": 0.0,
+        }
+
+    count = len(qty_list)
+    mean_qty = statistics.mean(qty_list)
+    median_qty = statistics.median(qty_list)
+    max_qty = max(qty_list)
+
+    # Percentiles
+    sorted_qty = sorted(qty_list)
+    p75_idx = int(0.75 * count)
+    p90_idx = int(0.90 * count)
+    p75_qty = sorted_qty[min(p75_idx, count - 1)]
+    p90_qty = sorted_qty[min(p90_idx, count - 1)]
+
+    # What percentage buy 2+, 3+, 5+?
+    pct_buying_2plus = sum(1 for q in qty_list if q >= 2) / count
+    pct_buying_3plus = sum(1 for q in qty_list if q >= 3) / count
+    pct_buying_5plus = sum(1 for q in qty_list if q >= 5) / count
+
+    return {
+        "count": count,
+        "mean_qty": mean_qty,
+        "median_qty": median_qty,
+        "max_qty": max_qty,
+        "p75_qty": p75_qty,
+        "p90_qty": p90_qty,
+        "pct_buying_2plus": pct_buying_2plus,
+        "pct_buying_3plus": pct_buying_3plus,
+        "pct_buying_5plus": pct_buying_5plus,
+    }
+
+
+def _generate_ml_volume_tiers(qty_stats: Dict[str, Any], available_stock: int) -> List[Dict[str, Any]]:
+    """
+    Generate ML-optimized volume tiers based on quantity statistics.
+
+    Logic:
+    - Tier 1 (qty=1): No discount (baseline)
+    - Tier 2: At or just above median (where most bulk buyers are)
+    - Tier 3: At p75 or where ~25% of customers reach
+    - Tier 4: At p90 or max observed (reward power buyers)
+
+    Discounts scale with tier aggressiveness.
+    """
+    tiers = [
+        # Tier 0: qty=1, no discount (baseline)
+        {
+            "min_qty": 1,
+            "discount_type": "NONE",
+            "discount_value": 0,
+            "type": "percentage",
+            "value": 0,
+            "label": None,
+        }
+    ]
+
+    mean_qty = qty_stats.get("mean_qty", 1.0)
+    max_qty = qty_stats.get("max_qty", 1)
+    p75_qty = qty_stats.get("p75_qty", 1)
+    p90_qty = qty_stats.get("p90_qty", 1)
+    pct_2plus = qty_stats.get("pct_buying_2plus", 0)
+    pct_3plus = qty_stats.get("pct_buying_3plus", 0)
+    pct_5plus = qty_stats.get("pct_buying_5plus", 0)
+
+    # Determine tier breakpoints based on actual data
+    # Tier 2: Entry-level bulk (typically qty=2)
+    tier2_qty = 2
+    tier2_discount = 5
+    if pct_2plus > 0.3:
+        # Many customers already buy 2+, make tier 2 more attractive
+        tier2_discount = 8
+
+    tiers.append({
+        "min_qty": tier2_qty,
+        "discount_type": "PERCENTAGE",
+        "discount_value": tier2_discount,
+        "type": "percentage",
+        "value": tier2_discount,
+        "label": "Starter Pack",
+    })
+
+    # Tier 3: Mid-level bulk (qty=3 or where p75 lands)
+    tier3_qty = max(3, int(p75_qty)) if p75_qty > 2 else 3
+    tier3_qty = min(tier3_qty, available_stock // 2, 5)  # Cap at reasonable level
+
+    if tier3_qty > tier2_qty:
+        tier3_discount = 10 if pct_3plus > 0.15 else 12
+        tiers.append({
+            "min_qty": tier3_qty,
+            "discount_type": "PERCENTAGE",
+            "discount_value": tier3_discount,
+            "type": "percentage",
+            "value": tier3_discount,
+            "label": "Popular",
+        })
+
+    # Tier 4: Power buyer (qty=5+ or where p90/max lands)
+    tier4_qty = max(5, int(p90_qty)) if p90_qty > tier3_qty else max(5, tier3_qty + 2)
+    tier4_qty = min(tier4_qty, available_stock // 2, 10)  # Cap reasonably
+
+    if tier4_qty > tiers[-1]["min_qty"]:
+        # Scale discount based on how many actually buy this much
+        if pct_5plus > 0.1:
+            tier4_discount = 15  # Many power buyers, standard discount
+        elif max_qty >= 5:
+            tier4_discount = 18  # Few buy this much, make it attractive
+        else:
+            tier4_discount = 20  # Rare, make it very attractive
+
+        tiers.append({
+            "min_qty": tier4_qty,
+            "discount_type": "PERCENTAGE",
+            "discount_value": tier4_discount,
+            "type": "percentage",
+            "value": tier4_discount,
+            "label": "Best Value",
+        })
+
+    return tiers
 
 
 # ============================================================================
