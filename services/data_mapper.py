@@ -325,6 +325,62 @@ class DataMapper:
                 f"  Catalog: {len(prefetch_data.get('catalog_map', {}))}"
             )
 
+            # SELF-HEALING: If prefetch returned empty but DB has data, retry directly
+            # This handles cases where cache/async task issues caused empty results
+            prefetch_variants_count = len(prefetch_data.get('variants_by_id', {}))
+            prefetch_catalog_count = len(prefetch_data.get('catalog_map', {}))
+            if prefetch_variants_count == 0 or prefetch_catalog_count == 0:
+                # Check if DB actually has data
+                retry_counts = await storage.count_variant_and_catalog_records(csv_upload_id, run_id)
+                db_variant_count = retry_counts.get("variant_count", 0)
+                db_catalog_count = retry_counts.get("catalog_count", 0)
+
+                if db_variant_count > 0 and prefetch_variants_count == 0:
+                    logger.warning(
+                        f"[{csv_upload_id}] ⚠️ PREFETCH MISMATCH: DB has {db_variant_count} variants but prefetch returned 0. "
+                        f"Retrying fetch directly..."
+                    )
+                    # Retry variant fetch directly (bypass cache)
+                    try:
+                        retry_by_sku, retry_by_id = await storage.get_variant_maps_by_run(run_id) if run_id else await storage.get_variant_maps(csv_upload_id)
+                        if retry_by_id:
+                            prefetch_data['variants_by_id'] = retry_by_id
+                            prefetch_data['variants_by_sku'] = retry_by_sku
+                            # Update cache too
+                            scope = prefetch_data.get("scope", self._scope_key(csv_upload_id, run_id))
+                            self._variant_id_map_by_scope[scope] = retry_by_id
+                            self._variant_map_by_scope[scope] = retry_by_sku
+                            logger.info(
+                                f"[{csv_upload_id}] ✅ RETRY SUCCESS: Got {len(retry_by_id)} variants on retry"
+                            )
+                    except Exception as retry_exc:
+                        logger.error(f"[{csv_upload_id}] ❌ Variant retry failed: {retry_exc}")
+
+                if db_catalog_count > 0 and prefetch_catalog_count == 0:
+                    logger.warning(
+                        f"[{csv_upload_id}] ⚠️ PREFETCH MISMATCH: DB has {db_catalog_count} catalog entries but prefetch returned 0. "
+                        f"Retrying fetch directly..."
+                    )
+                    # Retry catalog fetch directly (bypass cache)
+                    try:
+                        retry_catalog = await storage.get_catalog_snapshots_map_by_variant_and_run(run_id) if run_id else await storage.get_catalog_snapshots_map_by_variant(csv_upload_id)
+                        if retry_catalog:
+                            prefetch_data['catalog_map'] = retry_catalog
+                            # Update cache too
+                            scope = prefetch_data.get("scope", self._scope_key(csv_upload_id, run_id))
+                            self._catalog_map_by_scope[scope] = retry_catalog
+                            logger.info(
+                                f"[{csv_upload_id}] ✅ RETRY SUCCESS: Got {len(retry_catalog)} catalog entries on retry"
+                            )
+                    except Exception as retry_exc:
+                        logger.error(f"[{csv_upload_id}] ❌ Catalog retry failed: {retry_exc}")
+
+                # Log final state after retry
+                logger.info(
+                    f"[{csv_upload_id}] 📊 Post-retry state: variants_by_id={len(prefetch_data.get('variants_by_id', {}))} "
+                    f"catalog={len(prefetch_data.get('catalog_map', {}))}"
+                )
+
             # Hard-stop if the upload/run has no variant or catalog rows. This indicates ingestion never ran.
             if feature_flags.get_flag("data_mapping.block_on_missing_variant_catalog", True):
                 counts = await storage.count_variant_and_catalog_records(csv_upload_id, run_id)
