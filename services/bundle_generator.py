@@ -1876,6 +1876,7 @@ class BundleGenerator:
                 if multi_item_count >= 2:
                     # TIER 3: Bayesian (2+ multi-item orders) - lowered from 3
                     # Bayesian inference works with as few as 2 multi-item baskets
+                    # Enhanced: Also generates BOGO and Volume bundles from catalog
                     logger.info(
                         f"[{csv_upload_id}] 🧮 TIER 3: BAYESIAN MODE ({multi_item_count} multi-item orders)"
                     )
@@ -1897,13 +1898,62 @@ class BundleGenerator:
                         message="Analyzing sparse order patterns with Bayesian inference...",
                     )
 
+                    # Compute variant sales for Volume bundles
+                    variant_sales: Dict[str, int] = {}
+                    for line in order_lines:
+                        vid = getattr(line, 'variant_id', None)
+                        qty = int(getattr(line, 'quantity', 1) or 1)
+                        if vid:
+                            variant_sales[vid] = variant_sales.get(vid, 0) + qty
+
+                    # Bundle allocation: FBT (5-6) + BOGO (2) + Volume (2) = 10 max
+                    max_fbt_bundles = 6
+                    max_bogo_bundles = 2
+                    max_volume_bundles = 2
+
+                    logger.info(
+                        f"[{csv_upload_id}] 📊 Tier 3 bundle targets - "
+                        f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
+                    )
+
+                    # Generate Bayesian FBT bundles from co-occurrence patterns
                     bayesian_bundles = _build_bayesian_bundles(
                         csv_upload_id=csv_upload_id,
                         order_lines=order_lines,
                         catalog=catalog,
                         product_scores=product_scores,
                         multi_item_count=multi_item_count,
-                        max_bundles=10
+                        max_bundles=max_fbt_bundles
+                    )
+
+                    # Generate BOGO bundles from catalog (same as Tier 1/2)
+                    bogo_bundles = []
+                    if max_bogo_bundles > 0 and catalog:
+                        try:
+                            bogo_bundles = _build_quick_start_bogo_bundles(
+                                csv_upload_id, catalog, product_scores, max_bogo_bundles
+                            )
+                            logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} BOGO bundles")
+                        except Exception as e:
+                            logger.warning(f"[{csv_upload_id}] BOGO generation failed: {e}")
+
+                    # Generate Volume bundles from sales data (same as Tier 1/2)
+                    volume_bundles = []
+                    if max_volume_bundles > 0 and variant_sales:
+                        try:
+                            volume_bundles = _build_quick_start_volume_bundles(
+                                csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles
+                            )
+                            logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} Volume bundles")
+                        except Exception as e:
+                            logger.warning(f"[{csv_upload_id}] Volume generation failed: {e}")
+
+                    # Combine all bundle types
+                    bayesian_bundles = bayesian_bundles + bogo_bundles + volume_bundles
+                    logger.info(
+                        f"[{csv_upload_id}] 📦 Total Tier 3 bundles: {len(bayesian_bundles)} "
+                        f"(FBT={len(bayesian_bundles) - len(bogo_bundles) - len(volume_bundles)}, "
+                        f"BOGO={len(bogo_bundles)}, VOLUME={len(volume_bundles)})"
                     )
 
                     # Send optimization step (simplified for Quick Mode)
@@ -2034,6 +2084,8 @@ class BundleGenerator:
                         },
                     )
 
+                    # Count bundle types for metrics (bogo_bundles and volume_bundles are still in scope)
+                    fbt_count = len(bayesian_bundles) - len(bogo_bundles) - len(volume_bundles)
                     return {
                         "recommendations": bayesian_bundles,
                         "metrics": {
@@ -2041,6 +2093,11 @@ class BundleGenerator:
                             "generation_mode": "bayesian",
                             "total_recommendations": len(bayesian_bundles),
                             "multi_item_orders": multi_item_count,
+                            "bundle_counts": {
+                                "FBT": fbt_count,
+                                "BOGO": len(bogo_bundles),
+                                "VOLUME": len(volume_bundles),
+                            },
                         },
                         "quick_start": True,
                         "csv_upload_id": csv_upload_id,
