@@ -1916,6 +1916,15 @@ class BundleGenerator:
                         f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
                     )
 
+                    # Compute velocity percentiles for intelligent BOGO/Volume selection
+                    # BOGO targets slow sellers (bottom 25%), Volume targets fast sellers (top 25%)
+                    velocity_data = _compute_velocity_percentiles(variant_sales, catalog)
+                    logger.info(
+                        f"[{csv_upload_id}] 📊 Tier 3 velocity analysis: "
+                        f"p25={velocity_data['p25']}, p50={velocity_data['p50']}, p75={velocity_data['p75']}, "
+                        f"slow_sellers={len(velocity_data['slow_sellers'])}, fast_sellers={len(velocity_data['fast_sellers'])}"
+                    )
+
                     # Generate Bayesian FBT bundles from co-occurrence patterns
                     bayesian_bundles = _build_bayesian_bundles(
                         csv_upload_id=csv_upload_id,
@@ -1926,23 +1935,39 @@ class BundleGenerator:
                         max_bundles=max_fbt_bundles
                     )
 
-                    # Generate BOGO bundles from catalog (same as Tier 1/2)
+                    # LLM fallback for Tier 3 (sparse data scenarios benefit most from semantic similarity)
+                    if len(bayesian_bundles) < max_fbt_bundles // 2:
+                        logger.info(
+                            f"[{csv_upload_id}] 🧠 TIER 3 COLD-START: Bayesian FBT sparse ({len(bayesian_bundles)}/{max_fbt_bundles}), "
+                            f"using LLM embeddings fallback..."
+                        )
+                        try:
+                            llm_bundles = await _generate_llm_fbt_fallback(
+                                csv_upload_id, catalog, max_fbt_bundles - len(bayesian_bundles)
+                            )
+                            if llm_bundles:
+                                logger.info(f"[{csv_upload_id}] ✅ LLM fallback generated {len(llm_bundles)} additional FBT bundles")
+                                bayesian_bundles.extend(llm_bundles)
+                        except Exception as e:
+                            logger.warning(f"[{csv_upload_id}] ⚠️ Tier 3 LLM fallback failed: {e}")
+
+                    # Generate BOGO bundles targeting slow sellers (bottom 25% velocity)
                     bogo_bundles = []
                     if max_bogo_bundles > 0 and catalog:
                         try:
                             bogo_bundles = _build_quick_start_bogo_bundles(
-                                csv_upload_id, catalog, product_scores, max_bogo_bundles
+                                csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
                             )
                             logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} BOGO bundles")
                         except Exception as e:
                             logger.warning(f"[{csv_upload_id}] BOGO generation failed: {e}")
 
-                    # Generate Volume bundles from sales data (same as Tier 1/2)
+                    # Generate Volume bundles targeting fast sellers (top 25% velocity)
                     volume_bundles = []
                     if max_volume_bundles > 0 and variant_sales:
                         try:
                             volume_bundles = _build_quick_start_volume_bundles(
-                                csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles
+                                csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
                             )
                             logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} Volume bundles")
                         except Exception as e:
@@ -2673,24 +2698,53 @@ class BundleGenerator:
                 f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
             )
 
+            # Compute velocity percentiles for intelligent BOGO/Volume selection
+            # BOGO targets slow sellers (bottom 25%), Volume targets fast sellers (top 25%)
+            velocity_data = _compute_velocity_percentiles(variant_sales, catalog)
+            logger.info(
+                f"[{csv_upload_id}] 📊 Velocity analysis: "
+                f"p25={velocity_data['p25']}, p50={velocity_data['p50']}, p75={velocity_data['p75']}, "
+                f"slow_sellers={len(velocity_data['slow_sellers'])}, fast_sellers={len(velocity_data['fast_sellers'])}"
+            )
+
             # ✅ OPTIMIZATION: Parallel bundle generation (FBT + BOGO + VOLUME)
             # Run all three bundle types concurrently using asyncio.gather()
             # This saves 2-4 seconds by running FBT, BOGO, VOLUME in parallel instead of sequentially
             # Note: asyncio is imported at module level (line 6)
 
             async def generate_fbt():
-                """FBT bundles in separate thread"""
-                return await asyncio.to_thread(
+                """FBT bundles with LLM fallback for cold-start scenarios"""
+                # Step 1: Try co-occurrence based FBT
+                fbt_result = await asyncio.to_thread(
                     _build_quick_start_fbt_bundles,
                     csv_upload_id, filtered_lines, catalog, product_scores, max_fbt_bundles, covis_vectors
                 )
+
+                # Step 2: If sparse result, use LLM embeddings as fallback (COLD-START HANDLING)
+                # Threshold: If we got less than half the target bundles, augment with LLM
+                if len(fbt_result) < max_fbt_bundles // 2:
+                    logger.info(
+                        f"[{csv_upload_id}] 🧠 COLD-START: FBT co-occurrence sparse ({len(fbt_result)}/{max_fbt_bundles}), "
+                        f"using LLM embeddings fallback..."
+                    )
+                    try:
+                        llm_bundles = await _generate_llm_fbt_fallback(
+                            csv_upload_id, catalog, max_fbt_bundles - len(fbt_result)
+                        )
+                        if llm_bundles:
+                            logger.info(f"[{csv_upload_id}] ✅ LLM fallback generated {len(llm_bundles)} additional FBT bundles")
+                            fbt_result.extend(llm_bundles)
+                    except Exception as e:
+                        logger.warning(f"[{csv_upload_id}] ⚠️ LLM fallback failed: {e}")
+
+                return fbt_result
 
             async def generate_bogo():
                 """BOGO bundles in separate thread"""
                 if max_bogo_bundles > 0:
                     return await asyncio.to_thread(
                         _build_quick_start_bogo_bundles,
-                        csv_upload_id, catalog, product_scores, max_bogo_bundles
+                        csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
                     )
                 return []
 
@@ -2699,7 +2753,7 @@ class BundleGenerator:
                 if max_volume_bundles > 0:
                     return await asyncio.to_thread(
                         _build_quick_start_volume_bundles,
-                        csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles
+                        csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
                     )
                 return []
 
@@ -6362,64 +6416,362 @@ def _build_quick_start_fbt_bundles(
     return recommendations
 
 
+def _compute_velocity_percentiles(
+    variant_sales: Dict[str, int],
+    catalog: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Compute velocity (units sold per product) and percentile thresholds.
+
+    Returns:
+        {
+            "velocities": {variant_id: units_sold},
+            "p25": 25th percentile velocity (slow seller threshold),
+            "p50": 50th percentile velocity (median),
+            "p75": 75th percentile velocity (fast seller threshold),
+            "slow_sellers": set of variant_ids below p25,
+            "fast_sellers": set of variant_ids above p75,
+        }
+    """
+    # Only include products that exist in catalog with valid price
+    valid_velocities = []
+    velocities = {}
+
+    for variant_id, units_sold in variant_sales.items():
+        snap = catalog.get(variant_id)
+        if not snap:
+            continue
+        price = float(getattr(snap, 'price', 0) or 0)
+        if price <= 0:
+            continue
+        velocities[variant_id] = units_sold
+        valid_velocities.append(units_sold)
+
+    if not valid_velocities:
+        # No data - return empty thresholds
+        return {
+            "velocities": {},
+            "p25": 0,
+            "p50": 0,
+            "p75": 0,
+            "slow_sellers": set(),
+            "fast_sellers": set(),
+        }
+
+    # Sort to compute percentiles
+    sorted_velocities = sorted(valid_velocities)
+    n = len(sorted_velocities)
+
+    # Compute percentiles
+    p25_idx = max(0, int(n * 0.25) - 1)
+    p50_idx = max(0, int(n * 0.50) - 1)
+    p75_idx = max(0, int(n * 0.75) - 1)
+
+    p25 = sorted_velocities[p25_idx]
+    p50 = sorted_velocities[p50_idx]
+    p75 = sorted_velocities[p75_idx]
+
+    # Classify products
+    slow_sellers = {vid for vid, vel in velocities.items() if vel <= p25}
+    fast_sellers = {vid for vid, vel in velocities.items() if vel >= p75}
+
+    logger.info(f"Velocity percentiles: p25={p25}, p50={p50}, p75={p75}")
+    logger.info(f"Slow sellers (<=p25): {len(slow_sellers)}, Fast sellers (>=p75): {len(fast_sellers)}")
+
+    return {
+        "velocities": velocities,
+        "p25": p25,
+        "p50": p50,
+        "p75": p75,
+        "slow_sellers": slow_sellers,
+        "fast_sellers": fast_sellers,
+    }
+
+
+async def _generate_llm_fbt_fallback(
+    csv_upload_id: str,
+    catalog: Dict[str, Any],
+    max_bundles: int,
+) -> List[Dict[str, Any]]:
+    """
+    Generate FBT bundles using LLM embeddings for COLD-START scenarios.
+
+    When co-occurrence data is sparse (new stores, limited order history),
+    this function uses semantic similarity from LLM embeddings to find
+    complementary products that would naturally go together.
+
+    Returns FBT bundle structures compatible with the main FBT generator.
+    """
+    from services.ml.llm_embeddings import llm_embedding_engine
+    from services.ml.llm_utils import should_use_llm
+
+    if llm_embedding_engine is None:
+        logger.warning(f"[{csv_upload_id}] LLM FBT fallback: engine not available")
+        return []
+
+    if not should_use_llm():
+        logger.info(f"[{csv_upload_id}] LLM FBT fallback: LLM features disabled (no API key)")
+        return []
+
+    logger.info(f"[{csv_upload_id}] 🧠 LLM FBT FALLBACK - Starting embedding generation...")
+
+    # Convert catalog snapshots to product dicts for embeddings
+    products_for_embedding = []
+    for variant_id, snap in catalog.items():
+        if not snap:
+            continue
+        price = float(getattr(snap, 'price', 0) or 0)
+        if price <= 0:
+            continue
+
+        product_dict = {
+            "variant_id": variant_id,
+            "title": getattr(snap, 'product_title', '') or getattr(snap, 'title', ''),
+            "product_type": getattr(snap, 'product_type', ''),
+            "vendor": getattr(snap, 'vendor', ''),
+            "tags": getattr(snap, 'tags', ''),
+            "price": price,
+            "sku": getattr(snap, 'sku', ''),
+            "product_id": getattr(snap, 'product_id', ''),
+        }
+        products_for_embedding.append(product_dict)
+
+    if len(products_for_embedding) < 2:
+        logger.warning(f"[{csv_upload_id}] LLM FBT fallback: insufficient products ({len(products_for_embedding)})")
+        return []
+
+    logger.info(f"[{csv_upload_id}]   Generating embeddings for {len(products_for_embedding)} products...")
+
+    try:
+        # Generate embeddings for all products
+        embeddings = await llm_embedding_engine.get_embeddings_batch(products_for_embedding)
+        logger.info(f"[{csv_upload_id}]   ✅ Generated {len(embeddings)} embeddings")
+
+        if len(embeddings) < 2:
+            logger.warning(f"[{csv_upload_id}] LLM FBT fallback: too few embeddings generated")
+            return []
+
+        # Generate FBT candidates using semantic similarity
+        candidates = await llm_embedding_engine.generate_candidates_by_similarity(
+            csv_upload_id=csv_upload_id,
+            bundle_type="FBT",
+            objective="increase_aov",
+            catalog=products_for_embedding,
+            embeddings=embeddings,
+            num_candidates=max_bundles * 2,  # Generate extra for filtering
+            orders_count=0,  # Cold-start indicator
+        )
+
+        logger.info(f"[{csv_upload_id}]   LLM candidates generated: {len(candidates)}")
+
+        if not candidates:
+            return []
+
+        # Convert LLM candidates to FBT bundle format
+        bundles: List[Dict[str, Any]] = []
+        for candidate in candidates[:max_bundles]:
+            product_ids = candidate.get("products", [])
+            if len(product_ids) < 2:
+                continue
+
+            variant_id_1, variant_id_2 = product_ids[0], product_ids[1]
+            p1 = catalog.get(variant_id_1)
+            p2 = catalog.get(variant_id_2)
+            if not p1 or not p2:
+                continue
+
+            price1 = float(getattr(p1, 'price', 0) or 0)
+            price2 = float(getattr(p2, 'price', 0) or 0)
+            if price1 <= 0 or price2 <= 0:
+                continue
+
+            total_price = price1 + price2
+            llm_similarity = candidate.get("llm_similarity", 0.5)
+
+            # Build bundle structure matching co-occurrence FBT format
+            product1_id = getattr(p1, 'product_id', '')
+            product2_id = getattr(p2, 'product_id', '')
+
+            bundle = {
+                "id": str(uuid.uuid4()),
+                "csv_upload_id": csv_upload_id,
+                "bundle_type": "FBT",
+                "objective": "increase_aov",
+                "products": {
+                    "items": [
+                        {
+                            "sku": getattr(p1, 'sku', ''),
+                            "name": getattr(p1, 'product_title', 'Product'),
+                            "title": getattr(p1, 'product_title', 'Product'),
+                            "price": price1,
+                            "variant_id": variant_id_1,
+                            "product_id": product1_id,
+                            "product_gid": _make_product_gid(product1_id),
+                            "variant_gid": _make_variant_gid(variant_id_1),
+                            "image_url": getattr(p1, 'image_url', None),
+                        },
+                        {
+                            "sku": getattr(p2, 'sku', ''),
+                            "name": getattr(p2, 'product_title', 'Product'),
+                            "title": getattr(p2, 'product_title', 'Product'),
+                            "price": price2,
+                            "variant_id": variant_id_2,
+                            "product_id": product2_id,
+                            "product_gid": _make_product_gid(product2_id),
+                            "variant_gid": _make_variant_gid(variant_id_2),
+                            "image_url": getattr(p2, 'image_url', None),
+                        },
+                    ],
+                },
+                "pricing": {
+                    "original_total": total_price,
+                    "bundle_price": total_price * 0.9,  # Default 10% discount
+                    "discount_amount": total_price * 0.1,
+                    "discount_pct": "10%",
+                },
+                "scores": {
+                    "llm_similarity": llm_similarity,
+                    "co_occurrence_count": 0,
+                    "blended_score": llm_similarity * 0.8,  # LLM-only score
+                },
+                "ai_copy": {
+                    "title": f"Perfect Match Bundle",
+                    "description": f"These products complement each other perfectly. Save 10% when you buy them together!",
+                    "valueProposition": "AI-recommended pairing based on product compatibility.",
+                    "explanation": "Recommended by AI based on semantic similarity and product attributes.",
+                    "source": "llm_cold_start_fallback",
+                    "features": {},
+                    "is_active": True,
+                    "show_on": ["product", "cart"],
+                },
+            }
+            bundles.append(bundle)
+
+        logger.info(f"[{csv_upload_id}] ✅ LLM FBT fallback complete: {len(bundles)} bundles generated")
+        return bundles
+
+    except Exception as e:
+        logger.error(f"[{csv_upload_id}] ❌ LLM FBT fallback failed: {e}", exc_info=True)
+        return []
+
+
 def _build_quick_start_bogo_bundles(
     csv_upload_id: str,
     catalog: Dict[str, Any],
     product_scores: Dict[str, float],
     max_bogo_bundles: int,
+    velocity_data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build simple BOGO bundles with fallback chain.
+    Build BOGO bundles targeting SLOW SELLERS (products that need help moving).
 
-    Selection priority:
-    1. Products marked as slow movers (is_slow_mover=True) with stock >5
-    2. Fallback: High inventory products (>20 units) - likely overstocked
-    3. Fallback: Any product with stock (>5 units) - last resort
+    Selection priority (velocity-based):
+    1. Products in bottom 25% velocity (slow sellers from order data)
+    2. Products marked as is_slow_mover=True (merchant flagged)
+    3. Fallback: Products with zero sales but in catalog (never sold)
+    4. Fallback: Any product with stock (last resort)
 
-    Buy 2, get 1 effectively 50% off (3 units for price of 2)
+    Buy 2, get 1 effectively 33% off (3 units for price of 2)
     """
     logger.info(f"[{csv_upload_id}] 🎁 BOGO BUNDLE GENERATION - STARTED")
     logger.info(f"[{csv_upload_id}]   Target: {max_bogo_bundles} BOGO bundles")
 
     candidates = []
-    fallback_source = "slow_mover"
+    fallback_source = "velocity_slow_sellers"
 
-    # PRIMARY: Products marked as slow movers
-    for key, snap in catalog.items():
+    # Extract slow sellers from velocity data (products in bottom 25% by sales)
+    slow_sellers_set = velocity_data.get("slow_sellers", set()) if velocity_data else set()
+    velocities = velocity_data.get("velocities", {}) if velocity_data else {}
+
+    logger.info(f"[{csv_upload_id}]   Velocity data: {len(slow_sellers_set)} slow sellers identified (p25 threshold)")
+
+    # PRIMARY: Products in bottom 25% velocity (slow sellers from order data)
+    # These are products that sell, but slowly - perfect for BOGO promotions
+    for variant_id in slow_sellers_set:
+        snap = catalog.get(variant_id)
+        if not snap:
+            continue
+
         try:
             available = int(getattr(snap, 'available_total', 0) or 0)
         except (TypeError, ValueError):
             available = 0
 
-        if getattr(snap, "is_slow_mover", False) and available > 5:
+        price = float(getattr(snap, 'price', 0) or 0)
+        if available > 0 and price > 0:
             sku = getattr(snap, 'sku', '')
-            candidates.append((sku, available, snap))
+            velocity = velocities.get(variant_id, 0)
+            # Store velocity for sorting (lower velocity = higher priority for BOGO)
+            candidates.append((sku, available, snap, velocity))
 
-    logger.info(f"[{csv_upload_id}]   Slow-mover candidates found: {len(candidates)}/{len(catalog)}")
+    # Sort by velocity ascending (slowest sellers first)
+    candidates.sort(key=lambda t: t[3])
+    # Convert back to 3-tuple format
+    candidates = [(c[0], c[1], c[2]) for c in candidates]
 
-    # FALLBACK 1: High inventory products (likely overstocked)
+    logger.info(f"[{csv_upload_id}]   Velocity-based slow seller candidates: {len(candidates)}")
+
+    # SECONDARY: Products marked as is_slow_mover by merchant (but not already in candidates)
     if len(candidates) < max_bogo_bundles:
-        fallback_source = "high_inventory"
+        fallback_source = "merchant_slow_mover"
         existing_variants = set(getattr(c[2], 'variant_id', '') for c in candidates)
 
-        high_inventory = []
+        merchant_slow_movers = []
         for key, snap in catalog.items():
             variant_id = getattr(snap, 'variant_id', '')
             if variant_id in existing_variants:
                 continue
+
+            if not getattr(snap, "is_slow_mover", False):
+                continue
+
             try:
                 available = int(getattr(snap, 'available_total', 0) or 0)
             except (TypeError, ValueError):
                 available = 0
 
-            if available > 20:  # High inventory threshold
+            price = float(getattr(snap, 'price', 0) or 0)
+            if available > 0 and price > 0:
                 sku = getattr(snap, 'sku', '')
-                high_inventory.append((sku, available, snap))
+                merchant_slow_movers.append((sku, available, snap))
 
-        # Sort by inventory desc and add to candidates
-        high_inventory.sort(key=lambda t: t[1], reverse=True)
-        candidates.extend(high_inventory[:max_bogo_bundles - len(candidates)])
-        logger.info(f"[{csv_upload_id}]   Added {len(high_inventory[:max_bogo_bundles - len(candidates)])} high-inventory fallbacks")
+        # Sort by inventory desc (higher inventory = more need for BOGO)
+        merchant_slow_movers.sort(key=lambda t: t[1], reverse=True)
+        added = merchant_slow_movers[:max_bogo_bundles - len(candidates)]
+        candidates.extend(added)
+        logger.info(f"[{csv_upload_id}]   Added {len(added)} merchant-flagged slow mover fallbacks")
+
+    # FALLBACK 1: Products with ZERO sales (in catalog but no order data - never sold)
+    # These are the ultimate slow movers - they need BOGO help most
+    if len(candidates) < max_bogo_bundles:
+        fallback_source = "zero_sales"
+        existing_variants = set(getattr(c[2], 'variant_id', '') for c in candidates)
+        products_with_sales = set(velocities.keys()) if velocities else set()
+
+        zero_sales = []
+        for key, snap in catalog.items():
+            variant_id = getattr(snap, 'variant_id', '')
+            if variant_id in existing_variants:
+                continue
+            # Skip products that have any sales
+            if variant_id in products_with_sales:
+                continue
+
+            try:
+                available = int(getattr(snap, 'available_total', 0) or 0)
+            except (TypeError, ValueError):
+                available = 0
+
+            price = float(getattr(snap, 'price', 0) or 0)
+            if available > 0 and price > 0:
+                sku = getattr(snap, 'sku', '')
+                zero_sales.append((sku, available, snap))
+
+        # Sort by inventory desc (higher inventory = more need for BOGO)
+        zero_sales.sort(key=lambda t: t[1], reverse=True)
+        added = zero_sales[:max_bogo_bundles - len(candidates)]
+        candidates.extend(added)
+        logger.info(f"[{csv_upload_id}]   Added {len(added)} zero-sales product fallbacks")
 
     # FALLBACK 2: Any product with stock (last resort)
     if len(candidates) < max_bogo_bundles:
@@ -6437,14 +6789,15 @@ def _build_quick_start_bogo_bundles(
                 available = 0
 
             price = float(getattr(snap, 'price', 0) or 0)
-            if available > 5 and price > 0:
+            if available > 0 and price > 0:
                 sku = getattr(snap, 'sku', '')
                 with_stock.append((sku, available, snap))
 
-        # Sort by inventory desc and add to candidates
+        # Sort by inventory desc
         with_stock.sort(key=lambda t: t[1], reverse=True)
-        candidates.extend(with_stock[:max_bogo_bundles - len(candidates)])
-        logger.info(f"[{csv_upload_id}]   Added {len(with_stock[:max_bogo_bundles - len(candidates)])} any-stock fallbacks")
+        added = with_stock[:max_bogo_bundles - len(candidates)]
+        candidates.extend(added)
+        logger.info(f"[{csv_upload_id}]   Added {len(added)} any-stock fallbacks")
 
     if not candidates:
         logger.warning(f"[{csv_upload_id}] ⚠️  No products found for BOGO (even with fallbacks)!")
@@ -6571,20 +6924,34 @@ def _build_quick_start_volume_bundles(
     catalog: Dict[str, Any],
     product_scores: Dict[str, float],
     max_volume_bundles: int,
+    velocity_data: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Build simple volume break bundles:
-    - Single anchor product (by variant_id)
-    - Tiers: 2+, 3+, 5+ with fixed discounts
-    Only for:
-    - Popular products (based on variant_sales)
-    - Sufficient stock (available_total > 20)
+    Build VOLUME bundles targeting FAST SELLERS (products people already buy frequently).
+
+    Selection priority (velocity-based):
+    1. Products in top 25% velocity (fast sellers - proven repeat purchase potential)
+    2. Products with high absolute sales volume (popular but may be new)
+    3. Fallback: Any product with valid price (last resort)
+
+    Volume bundles encourage bulk purchases with tiered discounts:
+    - Tiers: 2+, 3+, 5+ with 5%, 10%, 15% discounts
     """
     logger.info(f"[{csv_upload_id}] 📦 VOLUME BUNDLE GENERATION - STARTED")
     logger.info(f"[{csv_upload_id}]   Target: {max_volume_bundles} VOLUME bundles")
 
     candidates = []
-    for variant_id, units_sold in variant_sales.items():
+    fallback_source = "velocity_fast_sellers"
+
+    # Extract fast sellers from velocity data (products in top 25% by sales)
+    fast_sellers_set = velocity_data.get("fast_sellers", set()) if velocity_data else set()
+    velocities = velocity_data.get("velocities", {}) if velocity_data else {}
+
+    logger.info(f"[{csv_upload_id}]   Velocity data: {len(fast_sellers_set)} fast sellers identified (p75 threshold)")
+
+    # PRIMARY: Products in top 25% velocity (fast sellers from order data)
+    # These are products that sell well - perfect for volume discount encouragement
+    for variant_id in fast_sellers_set:
         snap = catalog.get(variant_id)
         if not snap:
             continue
@@ -6594,15 +6961,46 @@ def _build_quick_start_volume_bundles(
         except (TypeError, ValueError):
             available = 0
 
-        # Heuristic: high enough stock and at least some sales
-        # Lowered thresholds for quick-start: stock > 5, sales >= 2
-        if available > 5 and units_sold >= 2:
+        price = float(getattr(snap, 'price', 0) or 0)
+        units_sold = velocities.get(variant_id, 0)
+        if available > 0 and price > 0:
             candidates.append((variant_id, units_sold, available, snap))
 
-    logger.info(f"[{csv_upload_id}]   High-stock candidates found: {len(candidates)}/{len(variant_sales)}")
+    # Sort by velocity descending (fastest sellers first - best for volume bundles)
+    candidates.sort(key=lambda t: t[1], reverse=True)
 
+    logger.info(f"[{csv_upload_id}]   Velocity-based fast seller candidates: {len(candidates)}")
+
+    # SECONDARY: High absolute sales (not in fast_sellers but still popular)
+    if len(candidates) < max_volume_bundles:
+        fallback_source = "high_absolute_sales"
+        existing_variants = set(c[0] for c in candidates)
+
+        high_sales = []
+        for variant_id, units_sold in variant_sales.items():
+            if variant_id in existing_variants:
+                continue
+            snap = catalog.get(variant_id)
+            if not snap:
+                continue
+            try:
+                available = int(getattr(snap, 'available_total', 0) or 0)
+            except (TypeError, ValueError):
+                available = 0
+            price = float(getattr(snap, 'price', 0) or 0)
+            if available > 0 and price > 0:
+                high_sales.append((variant_id, units_sold, available, snap))
+
+        # Sort by sales desc
+        high_sales.sort(key=lambda t: t[1], reverse=True)
+        added = high_sales[:max_volume_bundles - len(candidates)]
+        candidates.extend(added)
+        logger.info(f"[{csv_upload_id}]   Added {len(added)} high-absolute-sales fallbacks")
+
+    # LAST RESORT: Any product with valid price (for stores with very limited data)
     if not candidates:
-        logger.warning(f"[{csv_upload_id}] ⚠️  No high-stock products found for VOLUME bundles!")
+        fallback_source = "any_with_price"
+        logger.warning(f"[{csv_upload_id}] ⚠️  No fast sellers found for VOLUME bundles!")
         # Fallback: pick top-N by sales (any stock, just need price > 0) to ensure we emit volume bundles.
         fallback_pool = []
         catalog_misses = 0
