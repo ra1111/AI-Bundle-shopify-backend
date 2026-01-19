@@ -1906,16 +1906,6 @@ class BundleGenerator:
                         if vid:
                             variant_sales[vid] = variant_sales.get(vid, 0) + qty
 
-                    # Bundle allocation: FBT (5-6) + BOGO (2) + Volume (2) = 10 max
-                    max_fbt_bundles = 6
-                    max_bogo_bundles = 2
-                    max_volume_bundles = 2
-
-                    logger.info(
-                        f"[{csv_upload_id}] 📊 Tier 3 bundle targets - "
-                        f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
-                    )
-
                     # Compute velocity percentiles for intelligent BOGO/Volume selection
                     # BOGO targets slow sellers (bottom 25%), Volume targets fast sellers (top 25%)
                     velocity_data = _compute_velocity_percentiles(variant_sales, catalog)
@@ -1923,6 +1913,23 @@ class BundleGenerator:
                         f"[{csv_upload_id}] 📊 Tier 3 velocity analysis: "
                         f"p25={velocity_data['p25']}, p50={velocity_data['p50']}, p75={velocity_data['p75']}, "
                         f"slow_sellers={len(velocity_data['slow_sellers'])}, fast_sellers={len(velocity_data['fast_sellers'])}"
+                    )
+
+                    # DATA-DRIVEN BUNDLE COUNT: Scale based on catalog size (min 10, max 20)
+                    dynamic_max_bundles = _compute_dynamic_max_bundles(len(catalog), csv_upload_id)
+
+                    # DATA-DRIVEN ALLOCATION: Decide bundle counts based on store characteristics
+                    # GUARANTEES: min 2 per type (FBT, BOGO, VOLUME all represented)
+                    allocation = _compute_bundle_allocation(
+                        velocity_data, multi_item_count, max_bundles=dynamic_max_bundles, csv_upload_id=csv_upload_id
+                    )
+                    max_fbt_bundles = allocation["FBT"]
+                    max_bogo_bundles = allocation["BOGO"]
+                    max_volume_bundles = allocation["VOLUME"]
+
+                    logger.info(
+                        f"[{csv_upload_id}] 📊 Tier 3 bundle targets (data-driven) - "
+                        f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
                     )
 
                     # Generate Bayesian FBT bundles from co-occurrence patterns
@@ -2151,11 +2158,14 @@ class BundleGenerator:
                         message="Creating volume bundles from catalog data...",
                     )
 
+                    # DATA-DRIVEN BUNDLE COUNT: Scale based on catalog size (min 10, max 20)
+                    dynamic_max_bundles = _compute_dynamic_max_bundles(len(catalog), csv_upload_id)
+
                     catalog_bundles = _build_catalog_fallback_bundles(
                         csv_upload_id=csv_upload_id,
                         catalog=catalog,
                         product_scores=product_scores,
-                        max_bundles=10
+                        max_bundles=dynamic_max_bundles
                     )
 
                     # Send optimization step for Tier 4
@@ -2685,18 +2695,10 @@ class BundleGenerator:
             phase3_start = time.time()
             bundle_creation_start = time.time()
 
-            # Decide how many of each type (respect overall max_bundles)
-            # Priority: FBT (3-5) > BOGO (2-3) > Volume (1-2)
-            max_fbt_bundles = max(3, min(5, max_bundles))
-            remaining = max(0, max_bundles - max_fbt_bundles)
-            max_bogo_bundles = min(3, remaining)
-            remaining -= max_bogo_bundles
-            max_volume_bundles = min(2, remaining)
-
-            logger.info(
-                f"[{csv_upload_id}] 📊 Bundle targets - "
-                f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
-            )
+            # DATA-DRIVEN BUNDLE COUNT: Scale based on catalog size
+            # - Minimum 10 bundles for all stores
+            # - Up to 20 for large catalogs (500+ products)
+            dynamic_max_bundles = _compute_dynamic_max_bundles(len(catalog), csv_upload_id)
 
             # Compute velocity percentiles for intelligent BOGO/Volume selection
             # BOGO targets slow sellers (bottom 25%), Volume targets fast sellers (top 25%)
@@ -2705,6 +2707,23 @@ class BundleGenerator:
                 f"[{csv_upload_id}] 📊 Velocity analysis: "
                 f"p25={velocity_data['p25']}, p50={velocity_data['p50']}, p75={velocity_data['p75']}, "
                 f"slow_sellers={len(velocity_data['slow_sellers'])}, fast_sellers={len(velocity_data['fast_sellers'])}"
+            )
+
+            # DATA-DRIVEN ALLOCATION: Decide bundle counts based on store characteristics
+            # - Inventory-heavy (slow sellers) → more BOGO
+            # - Fast-moving (fast sellers) → more Volume
+            # - Good basket data (multi-item orders) → more FBT
+            # GUARANTEES: min 2 per type (FBT, BOGO, VOLUME all represented)
+            allocation = _compute_bundle_allocation(
+                velocity_data, multi_item_count, dynamic_max_bundles, csv_upload_id
+            )
+            max_fbt_bundles = allocation["FBT"]
+            max_bogo_bundles = allocation["BOGO"]
+            max_volume_bundles = allocation["VOLUME"]
+
+            logger.info(
+                f"[{csv_upload_id}] 📊 Bundle targets (data-driven) - "
+                f"FBT={max_fbt_bundles}, BOGO={max_bogo_bundles}, VOLUME={max_volume_bundles}"
             )
 
             # ✅ OPTIMIZATION: Parallel bundle generation (FBT + BOGO + VOLUME)
@@ -6486,6 +6505,162 @@ def _compute_velocity_percentiles(
         "slow_sellers": slow_sellers,
         "fast_sellers": fast_sellers,
     }
+
+
+# Minimum bundles per type to ensure all 3 types are always represented
+MIN_BUNDLES_PER_TYPE = 2
+MIN_TOTAL_BUNDLES = 10
+
+
+def _compute_dynamic_max_bundles(
+    catalog_size: int,
+    csv_upload_id: str = "",
+) -> int:
+    """
+    Compute total bundle count based on catalog size.
+
+    Business logic:
+    - Small catalogs (< 50 products): 10 bundles (minimum)
+    - Medium catalogs (50-200 products): 12-15 bundles
+    - Large catalogs (200-500 products): 15-18 bundles
+    - Very large catalogs (500+ products): 20 bundles (maximum)
+
+    This ensures:
+    1. All stores get at least 10 bundles to display
+    2. Larger catalogs get more variety to cover their product range
+    3. Cap at 20 to keep generation fast and manageable
+
+    Args:
+        catalog_size: Number of products in catalog
+        csv_upload_id: For logging
+
+    Returns:
+        max_bundles: Total bundles to generate (10-20)
+    """
+    if catalog_size < 50:
+        max_bundles = MIN_TOTAL_BUNDLES  # 10
+    elif catalog_size < 100:
+        max_bundles = 12
+    elif catalog_size < 200:
+        max_bundles = 14
+    elif catalog_size < 500:
+        max_bundles = 16
+    elif catalog_size < 1000:
+        max_bundles = 18
+    else:
+        max_bundles = 20  # Cap for performance
+
+    logger.info(
+        f"[{csv_upload_id}] 📦 Dynamic max_bundles: {max_bundles} "
+        f"(catalog_size={catalog_size})"
+    )
+
+    return max_bundles
+
+
+def _compute_bundle_allocation(
+    velocity_data: Dict[str, Any],
+    multi_item_count: int,
+    max_bundles: int = 10,
+    csv_upload_id: str = "",
+) -> Dict[str, int]:
+    """
+    Data-driven bundle allocation based on store characteristics.
+
+    Analyzes velocity data to determine optimal FBT/BOGO/Volume split:
+    - Inventory-heavy stores (more slow sellers) → prioritize BOGO
+    - Fast-moving stores (more fast sellers) → prioritize Volume
+    - Balanced stores → default even split
+
+    GUARANTEES:
+    - Minimum 2 bundles per type (FBT, BOGO, VOLUME) - all 3 always represented
+    - Total equals max_bundles exactly
+
+    Args:
+        velocity_data: Output from _compute_velocity_percentiles
+        multi_item_count: Number of multi-item orders (for FBT confidence)
+        max_bundles: Total bundles to allocate (default 10)
+        csv_upload_id: For logging
+
+    Returns:
+        {"FBT": n, "BOGO": n, "VOLUME": n}
+    """
+    slow_count = len(velocity_data.get("slow_sellers", set()))
+    fast_count = len(velocity_data.get("fast_sellers", set()))
+    total_products = len(velocity_data.get("velocities", {}))
+
+    # Ensure max_bundles is at least MIN_TOTAL_BUNDLES
+    max_bundles = max(max_bundles, MIN_TOTAL_BUNDLES)
+
+    # Calculate remaining bundles after guaranteeing minimums
+    # 3 types × 2 minimum = 6 reserved, leaves (max_bundles - 6) to distribute
+    min_reserved = MIN_BUNDLES_PER_TYPE * 3  # 6
+    flexible_bundles = max_bundles - min_reserved  # e.g., 10-6=4, 20-6=14
+
+    # Default flexible allocation ratios (out of 10 for the profile)
+    # These represent the "extra" bundles beyond the minimums
+    # FBT: 5, BOGO: 3, VOLUME: 2 → extra beyond min(2): FBT+3, BOGO+1, VOLUME+0
+
+    # Adjust based on store characteristics
+    profile = "BALANCED"
+
+    if total_products == 0:
+        # No velocity data - use balanced distribution
+        profile = "DEFAULT"
+        # Balanced: distribute evenly
+        fbt_extra = flexible_bundles // 2
+        bogo_extra = (flexible_bundles - fbt_extra) // 2
+        volume_extra = flexible_bundles - fbt_extra - bogo_extra
+    elif slow_count > fast_count * 1.5:
+        # INVENTORY-HEAVY: Many slow sellers → prioritize BOGO to clear stock
+        profile = "INVENTORY_HEAVY"
+        # 40% FBT, 40% BOGO, 20% Volume of flexible
+        bogo_extra = int(flexible_bundles * 0.4)
+        fbt_extra = int(flexible_bundles * 0.4)
+        volume_extra = flexible_bundles - fbt_extra - bogo_extra
+    elif fast_count > slow_count * 1.5:
+        # FAST-MOVING: Many fast sellers → prioritize Volume discounts
+        profile = "FAST_MOVING"
+        # 40% FBT, 20% BOGO, 40% Volume of flexible
+        fbt_extra = int(flexible_bundles * 0.4)
+        volume_extra = int(flexible_bundles * 0.4)
+        bogo_extra = flexible_bundles - fbt_extra - volume_extra
+    elif multi_item_count >= 10:
+        # HIGH CO-OCCURRENCE: Good basket data → prioritize FBT
+        profile = "HIGH_COOCCURRENCE"
+        # 60% FBT, 20% BOGO, 20% Volume of flexible
+        fbt_extra = int(flexible_bundles * 0.6)
+        bogo_extra = int(flexible_bundles * 0.2)
+        volume_extra = flexible_bundles - fbt_extra - bogo_extra
+    else:
+        # BALANCED: Even distribution with slight FBT preference
+        profile = "BALANCED"
+        # 50% FBT, 30% BOGO, 20% Volume of flexible
+        fbt_extra = int(flexible_bundles * 0.5)
+        bogo_extra = int(flexible_bundles * 0.3)
+        volume_extra = flexible_bundles - fbt_extra - bogo_extra
+
+    # Build final allocation with minimums guaranteed
+    allocation = {
+        "FBT": MIN_BUNDLES_PER_TYPE + fbt_extra,
+        "BOGO": MIN_BUNDLES_PER_TYPE + bogo_extra,
+        "VOLUME": MIN_BUNDLES_PER_TYPE + volume_extra,
+    }
+
+    # Sanity check: ensure total equals max_bundles
+    total = sum(allocation.values())
+    if total != max_bundles:
+        # Adjust FBT (usually the largest) to hit exact target
+        allocation["FBT"] += (max_bundles - total)
+
+    logger.info(
+        f"[{csv_upload_id}] 📊 Bundle allocation: {profile} | "
+        f"slow_sellers={slow_count}, fast_sellers={fast_count}, multi_item={multi_item_count} | "
+        f"max_bundles={max_bundles} (min/type={MIN_BUNDLES_PER_TYPE}) | "
+        f"→ FBT={allocation['FBT']}, BOGO={allocation['BOGO']}, VOLUME={allocation['VOLUME']}"
+    )
+
+    return allocation
 
 
 async def _generate_llm_fbt_fallback(
