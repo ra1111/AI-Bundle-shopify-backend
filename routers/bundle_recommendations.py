@@ -737,12 +737,12 @@ async def generate_bundles_background(csv_upload_id: Optional[str], resume_only:
                         actual_bundle_count = await storage.get_bundle_count_for_upload(csv_upload_id)
                         generation_time = time.time() - start_time
 
-                        # Determine final status based on bundle count
-                        final_status = "completed" if actual_bundle_count > 0 else "failed"
+                        # Zero bundles is a valid outcome (not a failure) - always completed
+                        final_status = "completed"
                         final_message = (
                             f"Bundle generation complete: {actual_bundle_count} bundles in {generation_time:.1f}s"
                             if actual_bundle_count > 0
-                            else "No bundle patterns detected in your data"
+                            else "Analysis complete - no bundle patterns found in data"
                         )
 
                         await update_generation_progress(

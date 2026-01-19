@@ -2901,11 +2901,12 @@ class BundleGenerator:
 
             total_duration = (time.time() - pipeline_start) * 1000
 
-            # Safety check: Mark as failed if no bundles were generated
+            # Zero bundles is a valid outcome (not a failure) - mark as completed
+            # The user can retry if they want different results
             if actual_bundle_count == 0:
-                status = "failed"
-                message = "No bundle patterns detected"
-                logger.warning(f"[{csv_upload_id}] Quick-start completed with 0 bundles - marking as failed")
+                status = "completed"
+                message = "Analysis complete - no bundle patterns found in data"
+                logger.info(f"[{csv_upload_id}] Quick-start completed with 0 bundles (valid outcome)")
             else:
                 status = "completed"
                 message = f"Quick-start complete: {actual_bundle_count} bundles in {total_duration/1000:.1f}s"
@@ -4679,11 +4680,12 @@ class BundleGenerator:
             elif final_bundle_count == 0:
                 metrics["phase_timings"]["phase_9_storage"] = 0
 
-            # Safety check: Mark as failed if no bundles were generated
+            # Zero bundles is a valid outcome (not a failure) - mark as completed
+            # The user can retry if they want different results
             if final_bundle_count == 0:
-                status = "failed"
-                message = "No bundle patterns detected"
-                logger.warning(f"[{csv_upload_id}] Bundle generation completed with 0 bundles - marking as failed")
+                status = "completed"
+                message = "Analysis complete - no bundle patterns found in data"
+                logger.info(f"[{csv_upload_id}] Bundle generation completed with 0 bundles (valid outcome)")
             else:
                 status = "completed"
                 message = "Bundle generation complete."

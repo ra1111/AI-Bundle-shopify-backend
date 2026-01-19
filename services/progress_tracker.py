@@ -18,6 +18,64 @@ logger = logging.getLogger(__name__)
 
 ProgressStatus = Literal["in_progress", "completed", "failed"]
 
+# Define the valid ordering of progress steps (lower index = earlier step)
+# This prevents the state machine from going backwards
+STEP_ORDER = {
+    "queueing": 0,
+    "task_scheduled": 1,
+    "initializing": 2,
+    "enrichment": 3,
+    "scoring": 4,
+    "ml_generation": 5,
+    "optimization": 6,
+    "ai_descriptions": 7,
+    "staged_publish": 8,
+    "finalization": 9,
+}
+
+# Terminal statuses that lock the progress record
+TERMINAL_STATUSES = {"completed", "failed"}
+
+
+def _is_valid_transition(current_step: Optional[str], current_status: Optional[str], new_step: str, new_status: str) -> bool:
+    """
+    Check if transitioning from current state to new state is valid.
+
+    Rules:
+    1. Once in a terminal status (completed/failed), no further updates allowed
+    2. Steps can only move forward in the STEP_ORDER (no backwards transitions)
+    3. If same step, progress can only increase (enforced by progress value check)
+    4. finalization step can always be updated (for final status changes)
+    """
+    # Rule 1: Terminal status locks the record (except for initial insert)
+    if current_status in TERMINAL_STATUSES and current_step is not None:
+        # Exception: Allow same terminal status with finalization step (idempotent completion)
+        if new_step == "finalization" and new_status == current_status:
+            return True
+        logger.warning(
+            "Progress state machine: blocking update after terminal status | "
+            "current_step=%s current_status=%s new_step=%s new_status=%s",
+            current_step, current_status, new_step, new_status,
+        )
+        return False
+
+    # Rule 2: Steps can only move forward (or stay same)
+    current_order = STEP_ORDER.get(current_step, -1) if current_step else -1
+    new_order = STEP_ORDER.get(new_step, 999)  # Unknown steps get high order
+
+    if new_order < current_order:
+        # Exception: Allow finalization to always proceed (it's terminal)
+        if new_step == "finalization":
+            return True
+        logger.warning(
+            "Progress state machine: blocking backwards transition | "
+            "current_step=%s (%d) → new_step=%s (%d)",
+            current_step, current_order, new_step, new_order,
+        )
+        return False
+
+    return True
+
 
 async def _resolve_shop_domain(session, upload_id: str) -> Optional[str]:
     """Fetch the associated shop domain for an upload."""
@@ -49,6 +107,10 @@ async def update_generation_progress(
 ) -> None:
     """
     Upsert the latest generation progress snapshot for an upload.
+
+    Enforces state machine rules:
+    - Once terminal (completed/failed), no further updates allowed
+    - Steps can only move forward, not backwards
     """
     upload_id_str = str(upload_id)
     safe_progress = max(0, min(100, int(progress)))
@@ -65,6 +127,24 @@ async def update_generation_progress(
 
     async with AsyncSessionLocal() as session:
         try:
+            # STATE MACHINE GUARD: Check current state before updating
+            current_state = await session.execute(
+                select(GenerationProgress.step, GenerationProgress.status)
+                .where(GenerationProgress.upload_id == upload_id_str)
+            )
+            current_row = current_state.one_or_none()
+
+            if current_row:
+                current_step, current_status = current_row
+                if not _is_valid_transition(current_step, current_status, step, status):
+                    logger.info(
+                        "Progress update blocked by state machine | upload=%s current=(%s, %s) attempted=(%s, %s)",
+                        upload_id_str, current_step, current_status, step, status,
+                    )
+                    return  # Silently skip invalid transitions
+            else:
+                current_step, current_status = None, None
+
             shop_domain = await _resolve_shop_domain(session, upload_id_str)
 
             progress_table = GenerationProgress.__table__
