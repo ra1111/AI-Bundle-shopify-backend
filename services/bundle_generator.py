@@ -1958,18 +1958,20 @@ class BundleGenerator:
                         except Exception as e:
                             logger.warning(f"[{csv_upload_id}] ⚠️ Tier 3 LLM fallback failed: {e}")
 
+                    # PRE-COMPUTE: Build co-occurrence and quantity data ONCE (shared by BXGY and VOLUME)
+                    precomputed = _precompute_order_analytics(order_lines, csv_upload_id)
+
                     # Generate BXGY bundles using ML co-occurrence analysis (cross-product Buy X Get Y)
                     bogo_bundles = []
                     if max_bogo_bundles > 0 and order_lines:
                         try:
-                            # Try ML-based BXGY first (cross-product pairs from co-occurrence)
                             bogo_bundles = _build_ml_bxgy_bundles(
-                                csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data
+                                csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data,
+                                precomputed=precomputed  # Pass precomputed data
                             )
                             if bogo_bundles:
                                 logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} ML-BXGY bundles (cross-product)")
                             else:
-                                # Fallback to same-product BOGO if no co-occurrence pairs
                                 logger.info(f"[{csv_upload_id}] ⚠️ No ML-BXGY pairs, falling back to same-product BOGO")
                                 bogo_bundles = _build_quick_start_bogo_bundles(
                                     csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
@@ -1982,14 +1984,13 @@ class BundleGenerator:
                     volume_bundles = []
                     if max_volume_bundles > 0 and order_lines:
                         try:
-                            # Try ML-based Volume first (data-driven tiers from purchase quantities)
                             volume_bundles = _build_ml_volume_bundles(
-                                csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data
+                                csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data,
+                                precomputed=precomputed  # Pass precomputed data
                             )
                             if volume_bundles:
                                 logger.info(f"[{csv_upload_id}] ✅ Generated {len(volume_bundles)} ML-Volume bundles (data-driven tiers)")
                             else:
-                                # Fallback to hardcoded tiers if no quantity data
                                 logger.info(f"[{csv_upload_id}] ⚠️ No ML-Volume data, falling back to hardcoded tiers")
                                 volume_bundles = _build_quick_start_volume_bundles(
                                     csv_upload_id, variant_sales, catalog, product_scores, max_volume_bundles, velocity_data
@@ -2776,18 +2777,22 @@ class BundleGenerator:
 
                 return fbt_result
 
+            # PRE-COMPUTE: Build co-occurrence and quantity data ONCE (shared by FBT/BXGY/VOLUME)
+            precomputed = await asyncio.to_thread(
+                _precompute_order_analytics, order_lines, csv_upload_id
+            )
+
             async def generate_bogo():
                 """BXGY bundles using ML co-occurrence (cross-product pairs)"""
                 if max_bogo_bundles > 0 and order_lines:
-                    # Try ML-based BXGY first
                     result = await asyncio.to_thread(
                         _build_ml_bxgy_bundles,
-                        csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data
+                        csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data,
+                        precomputed  # Pass precomputed data
                     )
                     if result:
                         logger.info(f"[{csv_upload_id}] ✅ ML-BXGY generated {len(result)} cross-product bundles")
                         return result
-                    # Fallback to same-product BOGO
                     logger.info(f"[{csv_upload_id}] ⚠️ No ML-BXGY pairs, using same-product BOGO fallback")
                     return await asyncio.to_thread(
                         _build_quick_start_bogo_bundles,
@@ -2798,15 +2803,14 @@ class BundleGenerator:
             async def generate_volume():
                 """VOLUME bundles using ML quantity histogram analysis"""
                 if max_volume_bundles > 0 and order_lines:
-                    # Try ML-based Volume first (data-driven tiers)
                     result = await asyncio.to_thread(
                         _build_ml_volume_bundles,
-                        csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data
+                        csv_upload_id, order_lines, catalog, product_scores, max_volume_bundles, velocity_data,
+                        precomputed  # Pass precomputed data
                     )
                     if result:
                         logger.info(f"[{csv_upload_id}] ✅ ML-Volume generated {len(result)} bundles with data-driven tiers")
                         return result
-                    # Fallback to hardcoded tiers
                     logger.info(f"[{csv_upload_id}] ⚠️ No ML-Volume data, using hardcoded tier fallback")
                     return await asyncio.to_thread(
                         _build_quick_start_volume_bundles,
@@ -2814,7 +2818,7 @@ class BundleGenerator:
                     )
                 return []
 
-            logger.info(f"[{csv_upload_id}] ⚡ Running FBT, BOGO, VOLUME generation in parallel...")
+            logger.info(f"[{csv_upload_id}] ⚡ Running FBT, BOGO, VOLUME generation in parallel (precomputed analytics shared)...")
 
             # Execute all three in parallel
             fbt_bundles, bogo_bundles, volume_bundles = await asyncio.gather(
@@ -7353,6 +7357,82 @@ def _build_quick_start_volume_bundles(
 
 
 # ============================================================================
+# SHARED: Pre-compute co-occurrence and quantity data for all bundle types
+# ============================================================================
+
+def _precompute_order_analytics(
+    order_lines: List[Any],
+    csv_upload_id: str = "",
+) -> Dict[str, Any]:
+    """
+    Pre-compute co-occurrence matrix and quantity histogram from order data.
+
+    This is computed ONCE and shared across FBT, BXGY, and VOLUME generation
+    to avoid redundant computation.
+
+    Returns:
+        {
+            "pair_cooccurrence": Counter of (v1, v2) -> count,
+            "variant_occurrence": Counter of variant_id -> count,
+            "order_groups": Dict of order_id -> [variant_ids],
+            "variant_quantities": Dict of variant_id -> [qty1, qty2, ...],
+            "variant_total_sold": Counter of variant_id -> total_qty,
+        }
+    """
+    from collections import defaultdict, Counter
+
+    logger.info(f"[{csv_upload_id}] 📊 Pre-computing order analytics (shared for FBT/BXGY/VOLUME)...")
+
+    # Build order groups and variant occurrence
+    order_groups = defaultdict(list)
+    variant_occurrence = Counter()
+    variant_quantities = defaultdict(list)
+    variant_total_sold = Counter()
+
+    for line in order_lines:
+        order_id = getattr(line, 'order_id', None)
+        variant_id = getattr(line, 'variant_id', None)
+        quantity = int(getattr(line, 'quantity', 1) or 1)
+
+        if order_id and variant_id:
+            order_groups[order_id].append(variant_id)
+            variant_occurrence[variant_id] += 1
+
+        if variant_id and quantity > 0:
+            variant_quantities[variant_id].append(quantity)
+            variant_total_sold[variant_id] += quantity
+
+    # Compute pair co-occurrences
+    pair_cooccurrence = Counter()
+    multi_item_orders = 0
+
+    for order_id, variants in order_groups.items():
+        unique_variants = list(set(variants))
+        if len(unique_variants) >= 2:
+            multi_item_orders += 1
+            for i, v1 in enumerate(unique_variants):
+                for v2 in unique_variants[i + 1:]:
+                    # Store both directions for easy lookup
+                    pair_cooccurrence[(v1, v2)] += 1
+                    pair_cooccurrence[(v2, v1)] += 1
+
+    logger.info(
+        f"[{csv_upload_id}]   ✓ Analytics computed: "
+        f"{len(order_groups)} orders, {multi_item_orders} multi-item, "
+        f"{len(pair_cooccurrence)} pairs, {len(variant_quantities)} products with qty data"
+    )
+
+    return {
+        "pair_cooccurrence": pair_cooccurrence,
+        "variant_occurrence": variant_occurrence,
+        "order_groups": dict(order_groups),
+        "variant_quantities": dict(variant_quantities),
+        "variant_total_sold": variant_total_sold,
+        "multi_item_orders": multi_item_orders,
+    }
+
+
+# ============================================================================
 # ML-BASED BXGY: Cross-product "Buy X Get Y" using co-occurrence analysis
 # ============================================================================
 
@@ -7363,6 +7443,7 @@ def _build_ml_bxgy_bundles(
     product_scores: Dict[str, float],
     max_bundles: int,
     velocity_data: Optional[Dict[str, Any]] = None,
+    precomputed: Optional[Dict[str, Any]] = None,  # NEW: Accept pre-computed data
 ) -> List[Dict[str, Any]]:
     """
     Build BXGY bundles using ML/statistical co-occurrence analysis.
@@ -7374,6 +7455,9 @@ def _build_ml_bxgy_bundles(
     4. Y = complementary product, preferring slow movers (reward - discounted/free)
 
     Creates cross-product "Buy X, Get Y Free/Discounted" bundles.
+
+    Args:
+        precomputed: Optional pre-computed analytics from _precompute_order_analytics()
     """
     from collections import defaultdict, Counter
     import uuid
@@ -7383,36 +7467,40 @@ def _build_ml_bxgy_bundles(
 
     bundles = []
 
-    # Step 1: Build co-occurrence matrix from order data
-    order_groups = defaultdict(list)
-    variant_occurrence = Counter()
+    # Use precomputed data if available, otherwise compute
+    if precomputed:
+        pair_cooccurrence = precomputed["pair_cooccurrence"]
+        variant_occurrence = precomputed["variant_occurrence"]
+        order_groups = precomputed["order_groups"]
+        logger.info(f"[{csv_upload_id}]   Using precomputed co-occurrence ({len(pair_cooccurrence)} pairs)")
+    else:
+        # Fallback: compute if not precomputed
+        order_groups = defaultdict(list)
+        variant_occurrence = Counter()
 
-    for line in order_lines:
-        order_id = getattr(line, 'order_id', None)
-        variant_id = getattr(line, 'variant_id', None)
-        if order_id and variant_id:
-            order_groups[order_id].append(variant_id)
-            variant_occurrence[variant_id] += 1
+        for line in order_lines:
+            order_id = getattr(line, 'order_id', None)
+            variant_id = getattr(line, 'variant_id', None)
+            if order_id and variant_id:
+                order_groups[order_id].append(variant_id)
+                variant_occurrence[variant_id] += 1
 
-    # Step 2: Compute pair co-occurrences
-    pair_cooccurrence = Counter()
-    for order_id, variants in order_groups.items():
-        unique_variants = list(set(variants))
-        if len(unique_variants) >= 2:
-            for i, v1 in enumerate(unique_variants):
-                for v2 in unique_variants[i + 1:]:
-                    # Store directionally: (trigger, reward)
-                    pair_cooccurrence[(v1, v2)] += 1
-                    pair_cooccurrence[(v2, v1)] += 1
+        pair_cooccurrence = Counter()
+        for order_id, variants in order_groups.items():
+            unique_variants = list(set(variants))
+            if len(unique_variants) >= 2:
+                for i, v1 in enumerate(unique_variants):
+                    for v2 in unique_variants[i + 1:]:
+                        pair_cooccurrence[(v1, v2)] += 1
+                        pair_cooccurrence[(v2, v1)] += 1
 
-    logger.info(f"[{csv_upload_id}]   Co-occurrence pairs found: {len(pair_cooccurrence)}")
+        logger.info(f"[{csv_upload_id}]   Computed co-occurrence pairs: {len(pair_cooccurrence)}")
 
     if not pair_cooccurrence:
         logger.warning(f"[{csv_upload_id}] ⚠️ No co-occurrence data for ML-BXGY, falling back to catalog")
-        # Fallback: return empty, let caller handle
         return []
 
-    # Step 3: Extract velocity data for smart pairing
+    # Extract velocity data for smart pairing
     slow_sellers = velocity_data.get("slow_sellers", set()) if velocity_data else set()
     fast_sellers = velocity_data.get("fast_sellers", set()) if velocity_data else set()
     velocities = velocity_data.get("velocities", {}) if velocity_data else {}
@@ -7648,6 +7736,7 @@ def _build_ml_volume_bundles(
     product_scores: Dict[str, float],
     max_bundles: int,
     velocity_data: Optional[Dict[str, Any]] = None,
+    precomputed: Optional[Dict[str, Any]] = None,  # NEW: Accept pre-computed data
 ) -> List[Dict[str, Any]]:
     """
     Build VOLUME bundles using ML/statistical analysis of purchase quantities.
@@ -7658,6 +7747,9 @@ def _build_ml_volume_bundles(
     3. Sets data-driven discounts based on quantity percentiles
 
     Creates volume discount bundles with ML-optimized tiers.
+
+    Args:
+        precomputed: Optional pre-computed analytics from _precompute_order_analytics()
     """
     from collections import defaultdict, Counter
     import uuid
@@ -7668,19 +7760,24 @@ def _build_ml_volume_bundles(
 
     bundles = []
 
-    # Step 1: Build quantity histogram per product
-    # Track: for each variant, what quantities do customers typically buy?
-    variant_quantities = defaultdict(list)  # variant_id -> [qty1, qty2, qty3, ...]
-    variant_total_sold = Counter()
+    # Use precomputed data if available, otherwise compute
+    if precomputed:
+        variant_quantities = precomputed["variant_quantities"]
+        variant_total_sold = precomputed["variant_total_sold"]
+        logger.info(f"[{csv_upload_id}]   Using precomputed quantity data ({len(variant_quantities)} products)")
+    else:
+        # Fallback: compute if not precomputed
+        variant_quantities = defaultdict(list)
+        variant_total_sold = Counter()
 
-    for line in order_lines:
-        variant_id = getattr(line, 'variant_id', None)
-        quantity = int(getattr(line, 'quantity', 1) or 1)
-        if variant_id and quantity > 0:
-            variant_quantities[variant_id].append(quantity)
-            variant_total_sold[variant_id] += quantity
+        for line in order_lines:
+            variant_id = getattr(line, 'variant_id', None)
+            quantity = int(getattr(line, 'quantity', 1) or 1)
+            if variant_id and quantity > 0:
+                variant_quantities[variant_id].append(quantity)
+                variant_total_sold[variant_id] += quantity
 
-    logger.info(f"[{csv_upload_id}]   Products with quantity data: {len(variant_quantities)}")
+        logger.info(f"[{csv_upload_id}]   Computed quantity data for {len(variant_quantities)} products")
 
     # Step 2: Get fast sellers (best candidates for volume bundles)
     fast_sellers = velocity_data.get("fast_sellers", set()) if velocity_data else set()
