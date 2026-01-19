@@ -219,22 +219,28 @@ async def approve_recommendation(
         logger.error(f"Approve recommendation error: {e}")
         raise HTTPException(status_code=500, detail="Failed to update recommendation")
 
-async def generate_bundles_background(csv_upload_id: Optional[str], resume_only: bool = False):
-    """Background task to generate bundle recommendations with concurrency control and async deferrals."""
+async def generate_bundles_background(csv_upload_id: Optional[str], resume_only: bool = False, from_auto_trigger: bool = False):
+    """Background task to generate bundle recommendations with concurrency control and async deferrals.
+
+    Args:
+        csv_upload_id: The CSV upload ID to generate bundles for
+        resume_only: If True, resume an interrupted generation
+        from_auto_trigger: If True, skip initial progress updates (auto-trigger handles them)
+    """
     import traceback
     from services.concurrency_control import concurrency_controller
-    
+
     start_time = time.time()
     scope = f"for CSV upload {csv_upload_id}" if csv_upload_id else "overall"
     logger.info(f"{'Resuming' if resume_only else 'Starting'} bundle generation {scope}")
     logger.info(f"[{csv_upload_id}] ========== BUNDLE GENERATION BACKGROUND TASK STARTED ==========")
-    
+
     if not csv_upload_id:
         logger.error("Bundle generation requires a valid CSV upload ID")
         return
 
-    # Add queueing step at the very start
-    if not resume_only:
+    # Add queueing step at the very start (skip if called from auto-trigger which handles its own progress)
+    if not resume_only and not from_auto_trigger:
         await update_generation_progress(
             csv_upload_id,
             step="queueing",

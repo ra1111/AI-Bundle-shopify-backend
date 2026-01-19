@@ -275,7 +275,7 @@ async def maybe_trigger_bundle_generation(completed_upload_id: str) -> None:
             "Auto-bundle: ▶ STARTING SYNCHRONOUS bundle generation for upload %s",
             orders_upload_id,
         )
-        await generate_bundles_background(orders_upload_id)
+        await generate_bundles_background(orders_upload_id, from_auto_trigger=True)
         logger.info(
             "Auto-bundle: ✓ COMPLETED bundle generation for upload %s",
             orders_upload_id,
