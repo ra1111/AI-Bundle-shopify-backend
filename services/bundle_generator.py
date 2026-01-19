@@ -2619,7 +2619,7 @@ class BundleGenerator:
             # ✅ OPTIMIZATION: Parallel bundle generation (FBT + BOGO + VOLUME)
             # Run all three bundle types concurrently using asyncio.gather()
             # This saves 2-4 seconds by running FBT, BOGO, VOLUME in parallel instead of sequentially
-            import asyncio
+            # Note: asyncio is imported at module level (line 6)
 
             async def generate_fbt():
                 """FBT bundles in separate thread"""
