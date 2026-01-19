@@ -1009,3 +1009,78 @@ def _run_full_generation_after_quickstart(csv_upload_id: str, shop_id: str):
             # Don't fail hard - merchant already has preview bundles
 
     return _runner
+
+
+@router.post("/retry-bundle-generation/{upload_id}")
+async def retry_bundle_generation(
+    upload_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retry bundle generation for a stuck upload.
+
+    This endpoint resets an upload that's stuck in 'generating_bundles' status
+    (e.g., due to Cloud Run killing the async task) and re-triggers bundle generation.
+    """
+    from services.bundle_auto_trigger import maybe_trigger_bundle_generation
+
+    # First, resolve to the orders upload if needed
+    try:
+        orders_upload_id, run_id, source_upload = await _resolve_orders_upload(upload_id, db)
+    except Exception as e:
+        logger.error(f"Failed to resolve upload {upload_id}: {e}")
+        raise HTTPException(status_code=404, detail=f"Upload not found: {upload_id}")
+
+    # Get current status
+    current_upload = await storage.get_csv_upload(orders_upload_id)
+    if not current_upload:
+        raise HTTPException(status_code=404, detail=f"Upload not found: {orders_upload_id}")
+
+    current_status = getattr(current_upload, "status", None)
+    logger.info(f"Retry requested for upload {orders_upload_id}, current status: {current_status}")
+
+    # Only allow retry for stuck states
+    retriable_statuses = {"generating_bundles", "bundle_generation_failed", "bundle_generation_queued"}
+    if current_status not in retriable_statuses:
+        return {
+            "success": False,
+            "message": f"Upload status '{current_status}' is not retriable. Allowed: {retriable_statuses}",
+            "upload_id": orders_upload_id,
+            "current_status": current_status,
+        }
+
+    # Reset status to 'completed' so auto-trigger can fire
+    try:
+        await storage.update_csv_upload(orders_upload_id, {"status": "completed"})
+        logger.info(f"Reset upload {orders_upload_id} status from '{current_status}' to 'completed'")
+    except Exception as e:
+        logger.error(f"Failed to reset upload status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset upload status: {e}")
+
+    # Clear any existing progress record to start fresh
+    try:
+        await update_generation_progress(
+            orders_upload_id,
+            step="retry_requested",
+            progress=0,
+            status="in_progress",
+            message="Retrying bundle generation...",
+        )
+    except Exception as e:
+        logger.warning(f"Failed to reset progress record: {e}")
+
+    # Trigger bundle generation (this will run synchronously on Cloud Run)
+    try:
+        await maybe_trigger_bundle_generation(orders_upload_id)
+        logger.info(f"Re-triggered bundle generation for upload {orders_upload_id}")
+    except Exception as e:
+        logger.error(f"Failed to trigger bundle generation: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to trigger bundle generation: {e}")
+
+    return {
+        "success": True,
+        "message": "Bundle generation retry triggered successfully",
+        "upload_id": orders_upload_id,
+        "run_id": run_id,
+        "previous_status": current_status,
+    }
