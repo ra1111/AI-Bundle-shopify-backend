@@ -642,7 +642,15 @@ async def stream_progress(upload_id: str):
                             progress = 50  # In progress = mid-range
                         elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
                             frontend_status = "failed"
+                            step = "finalization"
+                            progress = 100  # Failed at end
                             message = upload.error_message or "Generation failed"
+                        elif upload.status == "completed" and bundle_count:
+                            # CSV completed AND bundles exist = truly done
+                            frontend_status = "completed"
+                            step = "finalization"
+                            progress = 100
+                            message = f"Bundle generation complete ({bundle_count} bundles)"
                         elif upload.status == "completed" and not bundle_count:
                             # RACE CONDITION FIX: CSV processing completed but no bundles yet
                             # Bundle generation hasn't started - don't say "completed"
