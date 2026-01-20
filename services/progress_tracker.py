@@ -37,14 +37,21 @@ STEP_ORDER = {
 TERMINAL_STATUSES = {"completed", "failed"}
 
 
-def _is_valid_transition(current_step: Optional[str], current_status: Optional[str], new_step: str, new_status: str) -> bool:
+def _is_valid_transition(
+    current_step: Optional[str],
+    current_status: Optional[str],
+    current_progress: Optional[int],
+    new_step: str,
+    new_status: str,
+    new_progress: int,
+) -> bool:
     """
     Check if transitioning from current state to new state is valid.
 
     Rules:
     1. Once in a terminal status (completed/failed), no further updates allowed
     2. Steps can only move forward in the STEP_ORDER (no backwards transitions)
-    3. If same step, progress can only increase (enforced by progress value check)
+    3. If same step, progress can only increase (no backwards progress)
     4. finalization step can always be updated (for final status changes)
     """
     # Rule 1: Terminal status locks the record (except for initial insert)
@@ -73,6 +80,16 @@ def _is_valid_transition(current_step: Optional[str], current_status: Optional[s
             current_step, current_order, new_step, new_order,
         )
         return False
+
+    # Rule 3: If same step, progress can only increase (no backwards progress)
+    if new_order == current_order and current_progress is not None:
+        if new_progress < current_progress:
+            logger.warning(
+                "Progress state machine: blocking backwards progress | "
+                "step=%s current_progress=%d → new_progress=%d",
+                new_step, current_progress, new_progress,
+            )
+            return False
 
     return True
 
@@ -129,21 +146,24 @@ async def update_generation_progress(
         try:
             # STATE MACHINE GUARD: Check current state before updating
             current_state = await session.execute(
-                select(GenerationProgress.step, GenerationProgress.status)
+                select(GenerationProgress.step, GenerationProgress.status, GenerationProgress.progress)
                 .where(GenerationProgress.upload_id == upload_id_str)
             )
             current_row = current_state.one_or_none()
 
             if current_row:
-                current_step, current_status = current_row
-                if not _is_valid_transition(current_step, current_status, step, status):
+                current_step, current_status, current_progress = current_row
+                if not _is_valid_transition(
+                    current_step, current_status, current_progress,
+                    step, status, safe_progress
+                ):
                     logger.info(
-                        "Progress update blocked by state machine | upload=%s current=(%s, %s) attempted=(%s, %s)",
-                        upload_id_str, current_step, current_status, step, status,
+                        "Progress update blocked by state machine | upload=%s current=(%s, %s, %d) attempted=(%s, %s, %d)",
+                        upload_id_str, current_step, current_status, current_progress or 0, step, status, safe_progress,
                     )
                     return  # Silently skip invalid transitions
             else:
-                current_step, current_status = None, None
+                current_step, current_status, current_progress = None, None, None
 
             shop_domain = await _resolve_shop_domain(session, upload_id_str)
 
