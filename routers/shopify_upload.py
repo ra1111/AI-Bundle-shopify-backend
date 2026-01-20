@@ -5,7 +5,7 @@ Accepts CSV payloads from the Remix embedded app and feeds the existing pipeline
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
