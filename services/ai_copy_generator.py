@@ -86,7 +86,13 @@ class AICopyGenerator:
                     messages=[
                         {
                             "role": "system",
-                            "content": "You are an expert e-commerce copywriter specializing in product bundles. Generate compelling, conversion-optimized marketing copy that highlights value and encourages purchase.",
+                            "content": (
+                                "You are a world-class e-commerce copywriter who has written for major brands like "
+                                "Apple, Nike, and Amazon. Your copy drives conversions because you understand "
+                                "customer psychology. You write punchy, benefit-focused copy that creates desire. "
+                                "You NEVER write generic copy like 'Get both X and Y together' - every line you "
+                                "write is crafted to persuade and convert. Return ONLY valid JSON, no markdown."
+                            ),
                         },
                         {
                             "role": "user",
@@ -177,57 +183,133 @@ class AICopyGenerator:
             return self.generate_fallback_copy(products, bundle_type)
     
     def create_bundle_prompt(
-        self, 
-        products: List[Dict[str, Any]], 
-        bundle_type: str, 
+        self,
+        products: List[Dict[str, Any]],
+        bundle_type: str,
         context: str
     ) -> str:
         """Create prompt for OpenAI bundle copy generation"""
-        
-        # Extract product information
-        product_names = [p.get("name", "Product") for p in products]
-        product_categories = list(set(p.get("category", "General") for p in products))
-        product_brands = list(set(p.get("brand", "Various") for p in products))
-        
-        # Bundle type descriptions
-        bundle_descriptions = {
-            "FBT": "frequently bought together items that complement each other perfectly",
-            "VOLUME_DISCOUNT": "volume discount bundle offering better value when buying more",
-            "MIX_MATCH": "mix and match bundle allowing customers to choose from different categories",
-            "BXGY": "buy X get Y promotional bundle with extra value",
-            "FIXED": "curated bundle at an attractive fixed price"
+
+        # Extract and clean product information
+        def clean_product_name(name: str) -> str:
+            """Convert slug-style names to human-readable format."""
+            if not name or name == "Product":
+                return "Product"
+            # Replace hyphens/underscores with spaces, title case
+            cleaned = name.replace("-", " ").replace("_", " ")
+            # Title case but preserve known acronyms
+            return " ".join(
+                word.upper() if word.upper() in ["USB", "LED", "HD", "4K", "XL", "XXL"]
+                else word.capitalize()
+                for word in cleaned.split()
+            )
+
+        product_names = [clean_product_name(p.get("name") or p.get("title", "Product")) for p in products]
+        product_categories = list(set(p.get("category", "") for p in products if p.get("category")))
+        product_brands = list(set(p.get("brand", "") for p in products if p.get("brand")))
+
+        # Extract pricing info if available
+        prices = [float(p.get("price", 0)) for p in products if p.get("price")]
+        total_price = sum(prices) if prices else None
+
+        # Extract descriptions and tags for richer context
+        product_descriptions = [p.get("description", "") for p in products if p.get("description")]
+        product_tags = []
+        for p in products:
+            tags = p.get("tags", "")
+            if tags:
+                # Tags might be comma-separated string or list
+                if isinstance(tags, str):
+                    product_tags.extend([t.strip() for t in tags.split(",") if t.strip()])
+                elif isinstance(tags, list):
+                    product_tags.extend(tags)
+        product_tags = list(set(product_tags))[:10]  # Dedupe and limit
+
+        # Bundle type descriptions with copywriting angles
+        bundle_angles = {
+            "FBT": {
+                "desc": "frequently bought together bundle",
+                "angle": "These products are often purchased together by customers who know what they need. Create copy that emphasizes the natural pairing and convenience.",
+            },
+            "VOLUME_DISCOUNT": {
+                "desc": "volume discount bundle",
+                "angle": "Customers get better value buying in bulk. Emphasize per-unit savings and the smart shopping decision.",
+            },
+            "BXGY": {
+                "desc": "buy one get one promotional bundle",
+                "angle": "This is a promotional deal - create excitement and urgency. Focus on the 'free' or heavily discounted item.",
+            },
+            "MIX_MATCH": {
+                "desc": "mix and match bundle",
+                "angle": "Customers can customize their selection. Highlight variety, choice, and personalization.",
+            },
+            "FIXED": {
+                "desc": "curated bundle",
+                "angle": "This is an expertly curated selection. Position it as a complete solution hand-picked for the customer.",
+            },
         }
-        
-        bundle_desc = bundle_descriptions.get(bundle_type, "product bundle")
-        
-        prompt = f"""
-Generate compelling marketing copy for a {bundle_desc} containing these products:
 
-Products: {', '.join(product_names[:5])}  # Limit to first 5 for readability
-Categories: {', '.join(product_categories[:3])}
-Brands: {', '.join(product_brands[:3])}
-Bundle Type: {bundle_type}
-Context: {context}
+        bundle_info = bundle_angles.get(bundle_type, {"desc": "product bundle", "angle": "Create compelling copy."})
 
-Please provide the response as JSON with exactly these fields:
+        # Build rich product details string
+        product_details_lines = []
+        for i, p in enumerate(products[:5]):
+            name = clean_product_name(p.get("name") or p.get("title", "Product"))
+            price = float(p.get("price", 0)) if p.get("price") else 0
+            desc = p.get("description", "")
+
+            line = f"  - {name}"
+            if price > 0:
+                line += f" (${price:.2f})"
+            if desc:
+                # Truncate long descriptions
+                short_desc = desc[:100] + "..." if len(desc) > 100 else desc
+                line += f"\n    Description: {short_desc}"
+            product_details_lines.append(line)
+
+        product_details = "\n".join(product_details_lines)
+
+        # Build optional context sections
+        tags_section = f"**PRODUCT TAGS:** {', '.join(product_tags)}" if product_tags else ""
+        descriptions_section = ""
+        if product_descriptions:
+            desc_text = " | ".join(d[:80] for d in product_descriptions[:2])
+            descriptions_section = f"**PRODUCT CONTEXT:** {desc_text}"
+
+        prompt = f"""You are a top-tier e-commerce copywriter. Write compelling marketing copy for this {bundle_info['desc']}.
+
+**PRODUCTS IN BUNDLE:**
+{product_details}
+
+**CATEGORIES:** {', '.join(product_categories[:3]) if product_categories else 'Mixed'}
+**BRANDS:** {', '.join(product_brands[:3]) if product_brands else 'Various'}
+{f"**APPROXIMATE VALUE:** ${total_price:.2f}" if total_price else ""}
+{tags_section}
+{descriptions_section}
+
+**COPYWRITING ANGLE:** {bundle_info['angle']}
+**BUSINESS CONTEXT:** {context}
+
+**REQUIREMENTS:**
+Write persuasive, conversion-focused copy that makes customers WANT to buy this bundle. Avoid generic phrases like "Get both X and Y together" - be creative!
+
+Return JSON with these exact fields:
 {{
-    "title": "Catchy bundle title (max 60 characters)",
-    "description": "Detailed description highlighting benefits and value (max 200 characters)", 
-    "valueProposition": "Clear value statement explaining why customers should buy this bundle (max 150 characters)",
-    "explanation": "Clear explanation of why this bundle is recommended based on data and business objectives (max 180 characters)",
-    "features": ["Key feature 1", "Key feature 2", "Key feature 3"],
-    "benefits": ["Customer benefit 1", "Customer benefit 2"]
+    "title": "Creative, benefit-driven title (max 50 chars). NOT just product names joined together.",
+    "description": "Compelling description that sells the value, not just lists products (max 180 chars)",
+    "valueProposition": "Clear, specific reason to buy NOW (max 120 chars)",
+    "explanation": "Data-driven reasoning for why this bundle makes sense (max 150 chars)",
+    "features": ["Specific feature 1", "Specific feature 2", "Specific feature 3"],
+    "benefits": ["Tangible benefit 1", "Tangible benefit 2"]
 }}
 
-Focus on:
-- Value and savings
-- Product synergy and complementarity  
-- Convenience and bundling benefits
-- Clear, actionable language
-- Urgency or scarcity if appropriate
-
-Make it compelling and conversion-focused while staying truthful.
-"""
+**COPYWRITING TIPS:**
+- Lead with benefits, not features
+- Use power words: exclusive, essential, complete, premium, smart
+- Create desire, not just awareness
+- Be specific about value (not just "save money")
+- Sound human, not robotic
+- NEVER use the exact product slugs/handles in the title"""
         return prompt
     
     def parse_text_response(self, content: str, bundle_type: str) -> Dict[str, str]:
@@ -274,59 +356,63 @@ Make it compelling and conversion-focused while staying truthful.
     
     def generate_fallback_copy(self, products: List[Dict[str, Any]], bundle_type: str) -> Dict[str, str]:
         """Generate fallback copy when AI is unavailable"""
-        
-        product_count = len(products)
-        
+
+        product_count = len(products) if products else 2
+
+        # Extract first product name for personalization (cleaned)
+        first_product = "Premium"
+        if products and len(products) > 0:
+            raw_name = products[0].get("name") or products[0].get("title", "")
+            if raw_name and raw_name != "Product":
+                # Clean slug-style names
+                cleaned = raw_name.replace("-", " ").replace("_", " ")
+                words = cleaned.split()[:3]  # Take first 3 words max
+                first_product = " ".join(w.capitalize() for w in words)
+
         bundle_templates = {
             "FBT": {
-                "title": f"Perfect Pair Bundle - {product_count} Items",
-                "description": f"These {product_count} products are frequently bought together for good reason. Save when you get them all!",
-                "valueProposition": "Get everything you need in one convenient bundle with instant savings.",
-                "explanation": "Recommended based on strong customer purchase patterns showing these items are frequently bought together.",
-                "features": ["Frequently bought together", "Perfect combination", "Instant savings"],
-                "benefits": ["Save time shopping", "Save money", "Get complete solution"]
+                "title": f"Complete {first_product} Kit",
+                "description": f"Everything you need in one smart bundle. Customers who buy these together love the results.",
+                "valueProposition": "One click for the complete solution - no guesswork needed.",
+                "explanation": "Popular pairing based on real customer behavior - these items work better together.",
+                "features": ["Proven combination", "Complete solution", "Bundle savings"],
+                "benefits": ["Skip the research", "Guaranteed compatibility", "Instant value"]
             },
             "VOLUME_DISCOUNT": {
-                "title": f"Volume Saver Bundle - {product_count} Products",
-                "description": f"Buy more, save more! Get {product_count} quality products at an unbeatable volume discount.",
-                "valueProposition": "The more you buy, the more you save with this volume discount bundle.",
-                "explanation": "Recommended to drive higher order values while providing customer savings through volume pricing.",
-                "features": ["Volume discount", "Multiple quantities", "Better unit pricing"],
-                "benefits": ["Maximum savings", "Stock up and save", "Better value"]
+                "title": f"Smart Stock-Up: {first_product}",
+                "description": f"Lock in savings now with this volume bundle. Perfect for regular users who know quality when they see it.",
+                "valueProposition": "Smart shoppers stock up and save - simple math, better value.",
+                "explanation": "Volume pricing optimized for value-conscious customers seeking the best per-unit cost.",
+                "features": ["Bulk pricing unlocked", "Per-unit savings", "Premium quality"],
+                "benefits": ["Lower cost per item", "Never run out", "Long-term value"]
             },
             "MIX_MATCH": {
-                "title": f"Mix & Match Bundle - {product_count} Choices",
-                "description": f"Choose from {product_count} great products and create your perfect combination with mix & match savings.",
-                "valueProposition": "Create your ideal combination and save with flexible mix & match pricing.",
-                "explanation": "Recommended based on cross-category purchase patterns to increase basket size and customer satisfaction.",
-                "features": ["Flexible choice", "Multiple options", "Mix and match savings"],
-                "benefits": ["Customize your order", "Save on combinations", "Perfect variety"]
+                "title": f"Your Choice: {first_product} Collection",
+                "description": f"Pick your favorites and watch the savings stack up. Your bundle, your way.",
+                "valueProposition": "Mix freely, save automatically - the more you add, the more you keep.",
+                "explanation": "Flexible bundle designed to reward customers who explore the collection.",
+                "features": ["Full flexibility", "Stackable savings", "No compromises"],
+                "benefits": ["Total control", "Discover new favorites", "Save on variety"]
             },
             "BXGY": {
-                "title": f"Buy & Get Bundle - Special Offer",
-                "description": f"Buy select items and get additional products at a huge discount in this limited-time bundle.",
-                "valueProposition": "Get more for less with this exclusive buy X get Y bundle offer.",
-                "explanation": "Recommended to move slow-moving inventory while rewarding customers with high-value primary purchases.",
-                "features": ["Buy and get deal", "Extra products", "Limited time offer"],
-                "benefits": ["Get more value", "Try new products", "Exclusive savings"]
+                "title": f"Today's Deal: {first_product} Bonus",
+                "description": f"This is the deal you've been waiting for. Buy your favorites and unlock bonus items at an incredible price.",
+                "valueProposition": "Your purchase unlocks exclusive bonus value - don't miss this limited offer.",
+                "explanation": "Strategic promotion designed to reward loyal customers while introducing them to new products.",
+                "features": ["Bonus unlocked", "Limited availability", "Premium selection"],
+                "benefits": ["More for your money", "Try before you commit", "VIP treatment"]
             },
             "FIXED": {
-                "title": f"Curated Bundle - {product_count} Products",
-                "description": f"Expertly curated {product_count}-product bundle at one attractive fixed price. No complicated pricing!",
-                "valueProposition": "Expertly selected products at one simple, attractive price.",
-                "explanation": "Recommended based on complementary product analysis and optimized for high-margin objectives.",
-                "features": ["Curated selection", "Fixed price", "No complicated pricing"],
-                "benefits": ["Expert selection", "Simple pricing", "Great value"]
+                "title": f"The Essential {first_product} Bundle",
+                "description": f"Hand-picked essentials at one unbeatable price. No math required - just pure value.",
+                "valueProposition": "One price, zero hassle - everything you need in a single click.",
+                "explanation": "Curated by experts based on what works best together - optimized for maximum satisfaction.",
+                "features": ["Expert curation", "One simple price", "Complete package"],
+                "benefits": ["Decision made easy", "Guaranteed fit", "Premium without premium pricing"]
             }
         }
-        
+
         template = bundle_templates.get(bundle_type, bundle_templates["FIXED"])
-        
-        # Customize with product information if available
-        if products:
-            product_names = [p.get("name", "") for p in products if p.get("name")]
-            if product_names:
-                first_product = product_names[0]
-                template["title"] = template["title"].replace("Bundle", f"{first_product} Bundle")
-        
-        return template
+
+        # Return a copy to avoid mutation issues
+        return {**template}

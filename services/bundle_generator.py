@@ -2852,6 +2852,95 @@ class BundleGenerator:
 
             phase3_duration = (time.time() - phase3_start) * 1000
 
+            # ====================================================================
+            # PHASE 3.5: AI Copy Generation (Quality Descriptions)
+            # ====================================================================
+            # Generate compelling AI-powered descriptions for Quick Start bundles
+            # This transforms basic templates into conversion-optimized copy
+            await update_generation_progress(
+                csv_upload_id,
+                step="ai_descriptions",
+                progress=75,
+                status="in_progress",
+                message="Generating AI-powered bundle descriptions...",
+            )
+
+            if recommendations:
+                total_bundles = len(recommendations)
+                logger.info(f"[{csv_upload_id}] 🤖 PHASE 3.5: Generating AI copy for {total_bundles} Quick Start bundles...")
+                ai_copy_start = time.time()
+                successful_ai_copy = 0
+                AI_COPY_TIMEOUT_SECONDS = 10  # Shorter timeout for Quick Start (speed matters)
+
+                for idx, bundle in enumerate(recommendations, start=1):
+                    try:
+                        # Update progress incrementally (75 → 88)
+                        loop_progress = 75 + int((idx / total_bundles) * 13)
+                        await update_generation_progress(
+                            csv_upload_id,
+                            step="ai_descriptions",
+                            progress=loop_progress,
+                            status="in_progress",
+                            message=f"Creating compelling copy for bundle {idx}/{total_bundles}...",
+                        )
+
+                        # Extract products from bundle structure
+                        products_data = bundle.get("products", {})
+                        if isinstance(products_data, dict):
+                            items = products_data.get("items", [])
+                        else:
+                            items = products_data if isinstance(products_data, list) else []
+
+                        if not items:
+                            logger.debug(f"[{csv_upload_id}] Skipping AI copy for bundle {idx}: no items")
+                            continue
+
+                        # Generate AI copy with timeout
+                        bundle_type = bundle.get("bundle_type", "FBT")
+                        context = f"Objective: {bundle.get('objective', 'cross_sell')}. Quick Start bundle for e-commerce store."
+
+                        try:
+                            ai_copy = await asyncio.wait_for(
+                                self.ai_generator.generate_bundle_copy(
+                                    items,
+                                    bundle_type,
+                                    context=context,
+                                ),
+                                timeout=AI_COPY_TIMEOUT_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[{csv_upload_id}] AI copy timeout for bundle {idx}/{total_bundles} after {AI_COPY_TIMEOUT_SECONDS}s. Using fallback."
+                            )
+                            ai_copy = self.ai_generator.generate_fallback_copy(items, bundle_type)
+
+                        # Preserve existing features/settings from template
+                        existing_ai_copy = bundle.get("ai_copy", {})
+                        existing_features = existing_ai_copy.get("features", {})
+
+                        # Merge AI copy with existing metadata
+                        ai_copy["features"] = existing_features
+                        ai_copy["is_active"] = existing_ai_copy.get("is_active", True)
+                        ai_copy["show_on"] = existing_ai_copy.get("show_on", ["product", "cart"])
+                        ai_copy["cta_text"] = existing_ai_copy.get("cta_text", "Add Bundle to Cart")
+                        ai_copy["savings_message"] = existing_ai_copy.get("savings_message", "")
+                        ai_copy["tagline"] = existing_ai_copy.get("tagline", ai_copy.get("valueProposition", ""))
+
+                        bundle["ai_copy"] = ai_copy
+                        successful_ai_copy += 1
+
+                    except Exception as exc:
+                        logger.warning(
+                            f"[{csv_upload_id}] Failed to generate AI copy for Quick Start bundle {idx}: {exc}. Keeping template copy."
+                        )
+                        # Template copy already exists from bundle generators
+
+                ai_copy_duration = (time.time() - ai_copy_start) * 1000
+                logger.info(
+                    f"[{csv_upload_id}] ✅ PHASE 3.5 complete: AI copy generated for {successful_ai_copy}/{total_bundles} bundles "
+                    f"in {ai_copy_duration:.0f}ms"
+                )
+
             await update_generation_progress(
                 csv_upload_id,
                 step="finalization",
@@ -6305,6 +6394,11 @@ def _build_quick_start_fbt_bundles(
             "product_gid": _make_product_gid(getattr(p1, 'product_id', '')),
             "variant_gid": _make_variant_gid(variant_id_1),
             "image_url": getattr(p1, 'image_url', None),
+            # Enrichment fields for AI copy generation
+            "category": getattr(p1, 'product_type', '') or '',
+            "brand": getattr(p1, 'vendor', '') or '',
+            "tags": getattr(p1, 'tags', '') or '',
+            "description": getattr(p1, 'description', '') or '',  # From metadata CSV if available
         }
         product2_data = {
             "sku": getattr(p2, 'sku', ''),
@@ -6316,13 +6410,36 @@ def _build_quick_start_fbt_bundles(
             "product_gid": _make_product_gid(getattr(p2, 'product_id', '')),
             "variant_gid": _make_variant_gid(variant_id_2),
             "image_url": getattr(p2, 'image_url', None),
+            # Enrichment fields for AI copy generation
+            "category": getattr(p2, 'product_type', '') or '',
+            "brand": getattr(p2, 'vendor', '') or '',
+            "tags": getattr(p2, 'tags', '') or '',
+            "description": getattr(p2, 'description', '') or '',  # From metadata CSV if available
         }
 
-        # Generate AI copy
+        # Generate initial copy (AI will enhance this later in Phase 3.5)
         p1_name = getattr(p1, 'product_title', 'Product')
         p2_name = getattr(p2, 'product_title', 'Product')
-        bundle_name = f"{p1_name} + {p2_name}"
-        bundle_description = f"Get both {p1_name} and {p2_name} together and save {discount_pct}%!"
+
+        # Clean discount percentage (remove trailing .0)
+        discount_display = int(discount_pct) if discount_pct == int(discount_pct) else discount_pct
+
+        # Clean product names (convert slugs to readable format)
+        def clean_name(name: str) -> str:
+            if not name or name == "Product":
+                return "Product"
+            # If name looks like a slug (contains hyphens), clean it
+            if "-" in name:
+                return " ".join(w.capitalize() for w in name.replace("-", " ").replace("_", " ").split()[:4])
+            return name
+
+        p1_clean = clean_name(p1_name)
+        p2_clean = clean_name(p2_name)
+
+        # Create compelling initial copy (AI Phase 3.5 will enhance this)
+        bundle_name = f"Complete {p1_clean} Bundle"
+        bundle_description = f"The smart choice: {p1_clean} pairs perfectly with {p2_clean}. Customers love this combination."
+        savings_amount = total_price - bundle_price
 
         recommendations.append({
             "id": str(uuid.uuid4()),
@@ -6341,8 +6458,8 @@ def _build_quick_start_fbt_bundles(
             "pricing": {
                 "original_total": total_price,
                 "bundle_price": bundle_price,
-                "discount_amount": total_price - bundle_price,
-                "discount_pct": f"{discount_pct}%",
+                "discount_amount": savings_amount,
+                "discount_pct": f"{discount_display}%",
                 "discount_percentage": float(discount_pct),
                 "discount_type": "percentage",
             },
@@ -6350,9 +6467,9 @@ def _build_quick_start_fbt_bundles(
             "ai_copy": {
                 "title": bundle_name,
                 "description": bundle_description,
-                "tagline": f"Save {discount_pct}% when bought together",
+                "tagline": f"Save {discount_display}% when bought together",
                 "cta_text": "Add Bundle to Cart",
-                "savings_message": f"Save ${total_price - bundle_price:.2f}!",
+                "savings_message": f"Save ${savings_amount:.2f}!",
                 # Bundle settings (stored in ai_copy since no metadata column)
                 "is_active": True,
                 "show_on": ["product", "cart"],
@@ -8276,6 +8393,11 @@ def _build_bayesian_bundles(
             "product_gid": _make_product_gid(getattr(p1, 'product_id', '')),
             "variant_gid": _make_variant_gid(v1),
             "image_url": getattr(p1, 'image_url', None),
+            # Enrichment fields for AI copy generation
+            "category": getattr(p1, 'product_type', '') or '',
+            "brand": getattr(p1, 'vendor', '') or '',
+            "tags": getattr(p1, 'tags', '') or '',
+            "description": getattr(p1, 'description', '') or '',
         }
 
         product2_data = {
@@ -8288,13 +8410,34 @@ def _build_bayesian_bundles(
             "product_gid": _make_product_gid(getattr(p2, 'product_id', '')),
             "variant_gid": _make_variant_gid(v2),
             "image_url": getattr(p2, 'image_url', None),
+            # Enrichment fields for AI copy generation
+            "category": getattr(p2, 'product_type', '') or '',
+            "brand": getattr(p2, 'vendor', '') or '',
+            "tags": getattr(p2, 'tags', '') or '',
+            "description": getattr(p2, 'description', '') or '',
         }
 
         p1_name = getattr(p1, 'product_title', 'Product')
         p2_name = getattr(p2, 'product_title', 'Product')
         savings_amount = total_price - bundle_price
-        bundle_name = f"{p1_name} + {p2_name}"
-        bundle_description = f"Get both {p1_name} and {p2_name} together and save {discount_pct}%!"
+
+        # Clean discount percentage (remove trailing .0)
+        discount_display = int(discount_pct) if discount_pct == int(discount_pct) else discount_pct
+
+        # Clean product names (convert slugs to readable format)
+        def clean_name(name: str) -> str:
+            if not name or name == "Product":
+                return "Product"
+            if "-" in name:
+                return " ".join(w.capitalize() for w in name.replace("-", " ").replace("_", " ").split()[:4])
+            return name
+
+        p1_clean = clean_name(p1_name)
+        p2_clean = clean_name(p2_name)
+
+        # Create compelling initial copy (AI will enhance this later)
+        bundle_name = f"Complete {p1_clean} Bundle"
+        bundle_description = f"Smart pairing: {p1_clean} and {p2_clean} work beautifully together. A proven combination."
 
         # EXACT SCHEMA MATCH with existing quick-start bundles
         bundles.append({
@@ -8313,7 +8456,7 @@ def _build_bayesian_bundles(
                 "original_total": total_price,
                 "bundle_price": bundle_price,
                 "discount_amount": savings_amount,
-                "discount_pct": f"{discount_pct}%",
+                "discount_pct": f"{discount_display}%",
                 "discount_percentage": float(discount_pct),
                 "discount_type": "percentage",
             },
@@ -8321,7 +8464,7 @@ def _build_bayesian_bundles(
             "ai_copy": {
                 "title": bundle_name,
                 "description": bundle_description,
-                "tagline": f"Save {discount_pct}% when bought together",
+                "tagline": f"Save {discount_display}% when bought together",
                 "cta_text": "Add Bundle to Cart",
                 "savings_message": f"Save ${savings_amount:.2f}!",
                 "is_active": True,
