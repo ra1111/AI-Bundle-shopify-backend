@@ -232,21 +232,36 @@ async def get_generation_progress(
         except Exception as exc:
             logger.warning(f"Failed to query bundle count for {record.upload_id}: {exc}")
 
-    # SAFEGUARD: If status is "completed" but there are 0 bundles AND the record is very fresh,
-    # this might be a stale/incorrect state. Log it for debugging.
+    # RACE CONDITION FIX: If status is "completed" but there are 0 bundles,
+    # this might be a stale/incorrect state. Check if the record is recent
+    # and return "in_progress" to prevent frontend from showing "More Data Needed".
     if status == "completed" and actual_db_count == 0 and bundle_count is None:
-        logger.warning(
-            f"generation-progress: SUSPICIOUS STATE - status=completed but 0 bundles | "
-            f"upload_id={record.upload_id} step={step} progress={record.progress} "
-            f"updated_at={updated_at.isoformat()}"
-        )
+        # Check if the upload is recent (within last 5 minutes)
+        now = datetime.now(timezone.utc)
+        age_seconds = (now - updated_at).total_seconds()
+
+        if age_seconds < 300:  # 5 minutes
+            logger.warning(
+                f"generation-progress: RACE CONDITION FIX - status=completed but 0 bundles, "
+                f"record is recent ({age_seconds:.0f}s old) | "
+                f"upload_id={record.upload_id} step={step} progress={record.progress} "
+                f"→ Returning in_progress instead of completed"
+            )
+            # Override status to prevent premature "More Data Needed" message
+            status = "in_progress"
+        else:
+            logger.warning(
+                f"generation-progress: SUSPICIOUS STATE - status=completed but 0 bundles | "
+                f"upload_id={record.upload_id} step={step} progress={record.progress} "
+                f"updated_at={updated_at.isoformat()} age={age_seconds:.0f}s"
+            )
 
     response: Dict[str, Any] = {
         "upload_id": record.upload_id,
         "shop_domain": record.shop_domain,
         "step": record.step,
         "progress": record.progress,
-        "status": record.status,
+        "status": status,  # Use potentially modified status (race condition fix)
         "message": record.message,
         "metadata": metadata,
         "updated_at": updated_at.isoformat().replace("+00:00", "Z"),
