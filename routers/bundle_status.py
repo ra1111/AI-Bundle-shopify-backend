@@ -129,6 +129,21 @@ async def get_bundle_status(
     }
 
     upload = await _load_upload(upload_id, db)
+
+    # If not found by upload_id, try looking up by run_id
+    if not upload:
+        run_id_stmt = (
+            select(CsvUpload)
+            .where(CsvUpload.run_id == upload_id)
+            .where(CsvUpload.csv_type == "orders")
+            .order_by(CsvUpload.created_at.desc())
+            .limit(1)
+        )
+        result = await db.execute(run_id_stmt)
+        upload = result.scalar_one_or_none()
+        if upload:
+            logger.info(f"bundle-status: Resolved run_id {upload_id} -> orders upload {upload.id}")
+
     if not upload:
         progress_payload = await _load_progress(upload_id, db)
         if progress_payload:
@@ -142,19 +157,51 @@ async def get_bundle_status(
             return pending_payload
         return pending_payload
 
+    # Use the resolved upload.id for bundle count (not the original upload_id which might be run_id)
     bundle_count = None
     if upload.status in COMPLETED_STATES or upload.status == "processing":
-        bundle_count = await _count_bundles(upload_id, db)
+        bundle_count = await _count_bundles(upload.id, db)
 
     status = upload.status
     if upload.status in {"bundle_generation_completed"}:
         status = "completed"
-    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+    elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async", "generating_bundles"}:
         status = "processing"
     elif upload.status in FAILED_STATES:
         status = "failed"
+    elif upload.status == "completed" and bundle_count is None:
+        # CSV processing completed but no bundles yet - check if bundle generation is pending
+        # This handles the race condition where CSV finishes before auto-trigger kicks in
+        progress_payload = await _load_progress(upload.id, db)
+        if progress_payload:
+            if progress_payload.get("status") == "in_progress":
+                # Bundle generation is actually in progress - don't say "completed"
+                status = "processing"
+                logger.info(
+                    f"bundle-status: STATUS OVERRIDE for {upload_id} - "
+                    f"csv_status=completed but progress shows in_progress at step={progress_payload.get('step')}"
+                )
+            elif progress_payload.get("status") == "completed":
+                # Bundle generation finished - keep as completed
+                status = "completed"
+            # If status is "failed", keep as completed (user can retry)
+        else:
+            # NO progress record yet - check if upload is recent (Quick Start scenario)
+            now = datetime.now(timezone.utc)
+            created_at = upload.created_at
+            if created_at and created_at.tzinfo is None:
+                created_at = created_at.replace(tzinfo=timezone.utc)
 
-    progress_payload = await _load_progress(upload_id, db)
+            # If upload was created within last 5 minutes, assume bundle generation is pending
+            if created_at and (now - created_at).total_seconds() < 300:
+                status = "processing"
+                logger.info(
+                    f"bundle-status: STATUS OVERRIDE for {upload_id} - "
+                    f"csv_status=completed, no progress record, but upload is recent "
+                    f"({(now - created_at).total_seconds():.0f}s old) - assuming bundle generation pending"
+                )
+
+    progress_payload = await _load_progress(upload.id, db)
 
     response: Dict[str, Any] = {
         "upload_id": upload.id,
