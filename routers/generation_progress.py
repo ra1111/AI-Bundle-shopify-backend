@@ -154,6 +154,20 @@ async def get_generation_progress(
             logger.warning(f"Failed to resolve run_id {upload_id}: {exc}")
 
     if not record:
+        # No progress record yet - check if CSV upload exists and is recent
+        # If so, bundle generation should start soon, keep showing "in_progress"
+        try:
+            csv_stmt = select(CsvUpload).where(CsvUpload.id == (orders_upload_id if 'orders_upload_id' in dir() and orders_upload_id else upload_id))
+            csv_result = await db.execute(csv_stmt)
+            csv_upload = csv_result.scalar_one_or_none()
+            if csv_upload:
+                # CSV exists but no progress - generation is pending
+                logger.info(
+                    f"generation-progress: No progress record for {upload_id}, "
+                    f"but CSV exists with status={csv_upload.status} - returning in_progress"
+                )
+        except Exception:
+            pass  # Ignore errors, just return pending_payload
         return JSONResponse(status_code=202, content=pending_payload)
 
     updated_at = record.updated_at
@@ -200,6 +214,7 @@ async def get_generation_progress(
 
     # If status is completed or near completion, also query actual bundle count from DB
     # This ensures accurate count even if metadata wasn't updated in time
+    actual_db_count = 0
     if (status == "completed" or record.progress >= 80) and bundle_count is None:
         try:
             # The upload_id in progress table is the orders upload ID
@@ -208,14 +223,23 @@ async def get_generation_progress(
                 BundleRecommendation.csv_upload_id == orders_upload_id
             )
             result = await db.execute(stmt)
-            actual_count = result.scalar() or 0
-            if actual_count > 0:
-                bundle_count = actual_count
+            actual_db_count = result.scalar() or 0
+            if actual_db_count > 0:
+                bundle_count = actual_db_count
                 logger.info(
-                    f"Progress endpoint: queried actual bundle_count={actual_count} for upload {orders_upload_id}"
+                    f"Progress endpoint: queried actual bundle_count={actual_db_count} for upload {orders_upload_id}"
                 )
         except Exception as exc:
             logger.warning(f"Failed to query bundle count for {record.upload_id}: {exc}")
+
+    # SAFEGUARD: If status is "completed" but there are 0 bundles AND the record is very fresh,
+    # this might be a stale/incorrect state. Log it for debugging.
+    if status == "completed" and actual_db_count == 0 and bundle_count is None:
+        logger.warning(
+            f"generation-progress: SUSPICIOUS STATE - status=completed but 0 bundles | "
+            f"upload_id={record.upload_id} step={step} progress={record.progress} "
+            f"updated_at={updated_at.isoformat()}"
+        )
 
     response: Dict[str, Any] = {
         "upload_id": record.upload_id,
