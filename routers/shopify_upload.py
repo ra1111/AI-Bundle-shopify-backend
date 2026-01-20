@@ -648,6 +648,7 @@ async def stream_progress(upload_id: str):
                             if created_at and (now - created_at).total_seconds() < 300:
                                 frontend_status = "processing"
                                 step = "queueing"
+                                progress = 5  # Reset to low progress for queueing step
                                 message = "Preparing bundle generation..."
                                 logger.info(
                                     f"[SSE] RACE CONDITION FIX: upload {upload_id} csv_status=completed "
