@@ -631,9 +631,15 @@ async def stream_progress(upload_id: str):
                             frontend_status = "completed"
                             step = "finalization"
                             progress = 100
-                        elif upload.status in {"bundle_generation_in_progress", "bundle_generation_queued", "bundle_generation_async"}:
+                        elif upload.status == "bundle_generation_queued":
+                            frontend_status = "processing"
+                            step = "queueing"
+                            progress = 5  # Queued = early stage
+                            message = "Bundle generation queued..."
+                        elif upload.status in {"bundle_generation_in_progress", "bundle_generation_async"}:
                             frontend_status = "processing"
                             step = "ml_generation"
+                            progress = 50  # In progress = mid-range
                         elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
                             frontend_status = "failed"
                             message = upload.error_message or "Generation failed"
