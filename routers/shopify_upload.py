@@ -637,6 +637,22 @@ async def stream_progress(upload_id: str):
                         elif upload.status in {"bundle_generation_failed", "bundle_generation_timed_out", "bundle_generation_cancelled"}:
                             frontend_status = "failed"
                             message = upload.error_message or "Generation failed"
+                        elif upload.status == "completed" and not bundle_count:
+                            # RACE CONDITION FIX: CSV processing completed but no bundles yet
+                            # Bundle generation hasn't started - don't say "completed"
+                            # Check if upload is recent (within 5 minutes)
+                            now = datetime.now(timezone.utc)
+                            created_at = upload.created_at
+                            if created_at and created_at.tzinfo is None:
+                                created_at = created_at.replace(tzinfo=timezone.utc)
+                            if created_at and (now - created_at).total_seconds() < 300:
+                                frontend_status = "processing"
+                                step = "queueing"
+                                message = "Preparing bundle generation..."
+                                logger.info(
+                                    f"[SSE] RACE CONDITION FIX: upload {upload_id} csv_status=completed "
+                                    f"but no bundles and no gen_progress - returning processing"
+                                )
 
                     # Only send event if something changed
                     if frontend_status != last_status or progress != last_progress:
