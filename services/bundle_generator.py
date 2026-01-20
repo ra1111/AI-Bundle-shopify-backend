@@ -2684,11 +2684,11 @@ class BundleGenerator:
 
             from services.ml.pseudo_item2vec import build_covis_vectors
 
-            # NOTE: filtered_lines already contains only top products, so no need for top_skus filter
-            # build_covis_vectors extracts SKUs from order_lines internally
+            # NOTE: filtered_lines already contains only top products, so no need for top_variant_ids filter
+            # build_covis_vectors extracts variant_ids from order_lines internally
             covis_vectors = build_covis_vectors(
                 order_lines=filtered_lines,
-                top_skus=None,  # No additional filtering needed - filtered_lines is already filtered
+                top_variant_ids=None,  # No additional filtering needed - filtered_lines is already filtered
                 min_co_visits=1,
                 max_neighbors=50,
                 weighting="lift",  # Lift weighting: down-weights ubiquitous products
