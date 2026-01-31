@@ -116,6 +116,7 @@ class BOGOPricingDict(TypedDict, total=False):
 
 class AICopyDict(TypedDict, total=False):
     """AI-generated marketing copy."""
+    badge: Optional[str]      # Short widget label (2-4 words, uppercase)
     title: str                # Bundle display title
     description: str          # Bundle description
     tagline: Optional[str]    # Short tagline
@@ -363,6 +364,7 @@ class AICopy:
     """AI-generated marketing copy."""
     title: str
     description: str
+    badge: Optional[str] = None
     tagline: Optional[str] = None
     cta_text: Optional[str] = None
     savings_message: Optional[str] = None
@@ -372,6 +374,7 @@ class AICopy:
 
     def to_dict(self) -> AICopyDict:
         return {
+            "badge": self.badge,
             "title": self.title,
             "description": self.description,
             "tagline": self.tagline,

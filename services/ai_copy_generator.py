@@ -295,8 +295,9 @@ Write persuasive, conversion-focused copy that makes customers WANT to buy this 
 
 Return JSON with these exact fields:
 {{
-    "title": "Creative, benefit-driven title (max 50 chars). NOT just product names joined together.",
-    "description": "Compelling description that sells the value, not just lists products (max 180 chars)",
+    "badge": "Short widget label, 2-4 words ONLY, ALL CAPS (e.g. BUNDLE & SAVE, BOUGHT TOGETHER, COMBO DEAL). This is NOT the title - it's a tiny category tag.",
+    "title": "Concise bundle name (max 40 chars, under 6 words). Should read like a product heading, NOT ad copy. Good: 'Complete Snowboard Kit', 'Winter Essentials Pack'. Bad: 'Unleash Your Winter Adventure Duo', 'Elevate Your Ride'.",
+    "description": "One concrete sentence about what's in the bundle and why it's a good deal (max 120 chars). Be specific about the products - no vague marketing fluff like 'elevate your experience'. Good: 'Two top-rated boards at 6% off. Perfect for sharing the slopes.' Bad: 'Designed for thrill-seekers who crave the ultimate ride.' NEVER use em dashes.",
     "valueProposition": "Clear, specific reason to buy NOW (max 120 chars)",
     "explanation": "Data-driven reasoning for why this bundle makes sense (max 150 chars)",
     "features": ["Specific feature 1", "Specific feature 2", "Specific feature 3"],
@@ -304,11 +305,12 @@ Return JSON with these exact fields:
 }}
 
 **COPYWRITING TIPS:**
-- Lead with benefits, not features
-- Use power words: exclusive, essential, complete, premium, smart
-- Create desire, not just awareness
-- Be specific about value (not just "save money")
+- Title should sound like a product label, NOT an ad headline. Keep it short and functional.
+- Description should mention the actual products and the concrete savings, not generic hype.
+- Be specific about value (not just "save money" - say how much)
+- NEVER use em dashes (—) anywhere in the output. Use periods or commas instead.
 - Sound human, not robotic
+- AVOID vague marketing phrases like "unleash", "elevate", "ultimate", "thrill-seekers", "adventure duo"
 - NEVER use the exact product slugs/handles in the title"""
         return prompt
     
@@ -317,6 +319,7 @@ Return JSON with these exact fields:
         try:
             lines = content.strip().split('\n')
             result = {
+                "badge": "BUNDLE & SAVE",
                 "title": "Great Bundle Deal",
                 "description": "Perfect combination of products at an unbeatable price.",
                 "valueProposition": "Save money while getting everything you need.",
@@ -371,6 +374,7 @@ Return JSON with these exact fields:
 
         bundle_templates = {
             "FBT": {
+                "badge": "BOUGHT TOGETHER",
                 "title": f"Complete {first_product} Kit",
                 "description": f"Everything you need in one smart bundle. Customers who buy these together love the results.",
                 "valueProposition": "One click for the complete solution - no guesswork needed.",
@@ -379,6 +383,7 @@ Return JSON with these exact fields:
                 "benefits": ["Skip the research", "Guaranteed compatibility", "Instant value"]
             },
             "VOLUME_DISCOUNT": {
+                "badge": "BUY MORE SAVE MORE",
                 "title": f"Smart Stock-Up: {first_product}",
                 "description": f"Lock in savings now with this volume bundle. Perfect for regular users who know quality when they see it.",
                 "valueProposition": "Smart shoppers stock up and save - simple math, better value.",
@@ -387,6 +392,7 @@ Return JSON with these exact fields:
                 "benefits": ["Lower cost per item", "Never run out", "Long-term value"]
             },
             "MIX_MATCH": {
+                "badge": "MIX & MATCH",
                 "title": f"Your Choice: {first_product} Collection",
                 "description": f"Pick your favorites and watch the savings stack up. Your bundle, your way.",
                 "valueProposition": "Mix freely, save automatically - the more you add, the more you keep.",
@@ -395,6 +401,7 @@ Return JSON with these exact fields:
                 "benefits": ["Total control", "Discover new favorites", "Save on variety"]
             },
             "BXGY": {
+                "badge": "BONUS DEAL",
                 "title": f"Today's Deal: {first_product} Bonus",
                 "description": f"This is the deal you've been waiting for. Buy your favorites and unlock bonus items at an incredible price.",
                 "valueProposition": "Your purchase unlocks exclusive bonus value - don't miss this limited offer.",
@@ -403,6 +410,7 @@ Return JSON with these exact fields:
                 "benefits": ["More for your money", "Try before you commit", "VIP treatment"]
             },
             "FIXED": {
+                "badge": "BUNDLE & SAVE",
                 "title": f"The Essential {first_product} Bundle",
                 "description": f"Hand-picked essentials at one unbeatable price. No math required - just pure value.",
                 "valueProposition": "One price, zero hassle - everything you need in a single click.",

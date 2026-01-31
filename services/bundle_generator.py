@@ -6465,6 +6465,7 @@ def _build_quick_start_fbt_bundles(
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
+                "badge": "BOUGHT TOGETHER",
                 "title": bundle_name,
                 "description": bundle_description,
                 "tagline": f"Save {discount_display}% when bought together",
@@ -6971,6 +6972,7 @@ async def _generate_llm_fbt_fallback(
                     "blended_score": llm_similarity * 0.8,  # LLM-only score
                 },
                 "ai_copy": {
+                    "badge": "BOUGHT TOGETHER",
                     "title": f"Perfect Match Bundle",
                     "description": f"These products complement each other perfectly. Save 10% when you buy them together!",
                     "valueProposition": "AI-recommended pairing based on product compatibility.",
@@ -7224,6 +7226,7 @@ def _build_quick_start_bogo_bundles(
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
+                "badge": "BONUS DEAL",
                 "title": bundle_name,
                 "description": bundle_description,
                 "tagline": "Buy 2, Get 1 FREE!",
@@ -7445,6 +7448,7 @@ def _build_quick_start_volume_bundles(
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
+                "badge": "BUY MORE SAVE MORE",
                 "title": bundle_name,
                 "description": bundle_description,
                 "tagline": "Buy More, Save More!",
@@ -7808,6 +7812,7 @@ def _build_ml_bxgy_bundles(
                 "bogo_config": bxgy_config,
             },
             "ai_copy": {
+                "badge": "BONUS DEAL",
                 "title": bundle_title,
                 "description": f"Get {reward_name} {'FREE' if discount_type == 'free' else f'at {discount_percent}% off'} when you buy {trigger_name}!",
                 "tagline": f"{'FREE' if discount_type == 'free' else f'{discount_percent}% OFF'} {reward_name}!",
@@ -8001,6 +8006,7 @@ def _build_ml_volume_bundles(
                 "volume_tiers": volume_tiers,
             },
             "ai_copy": {
+                "badge": "BUY MORE SAVE MORE",
                 "title": bundle_title,
                 "description": f"Save more when you buy more {product_name}! Data-driven tiers based on customer behavior.",
                 "valueProposition": f"Up to {volume_tiers[-1]['discount_value']}% off when you buy {volume_tiers[-1]['min_qty']}+!",
@@ -8462,6 +8468,7 @@ def _build_bayesian_bundles(
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
+                "badge": "BOUGHT TOGETHER",
                 "title": bundle_name,
                 "description": bundle_description,
                 "tagline": f"Save {discount_display}% when bought together",
@@ -8585,6 +8592,7 @@ def _build_catalog_fallback_bundles(
             },
             # ===== AI_COPY: Structured content + bundle settings =====
             "ai_copy": {
+                "badge": "BUY MORE SAVE MORE",
                 "title": f"Stock Up & Save: {product_name}",
                 "description": f"Buy 2 or more {product_name} and save up to 15%! Perfect for stocking up on your favorites.",
                 "tagline": "Buy More, Save More!",
