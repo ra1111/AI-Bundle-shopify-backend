@@ -35,11 +35,12 @@ class AICopyGenerator:
         self.temperature = self._settings.completion_temperature
         
     async def generate_bundle_copy(
-        self, 
-        products: List[Dict[str, Any]], 
-        bundle_type: str, 
+        self,
+        products: List[Dict[str, Any]],
+        bundle_type: str,
         context: str = "",
-        request_id: str = None
+        request_id: str = None,
+        currency_code: str = "USD",
     ) -> Dict[str, str]:
         """Generate marketing copy for a product bundle"""
         req_id = request_id or _generate_request_id()
@@ -67,7 +68,7 @@ class AICopyGenerator:
             # Step 2: Create prompt
             logger.info(f"[{req_id}] 📝 Creating prompt for {len(products)} products...")
             prompt_start = time.time()
-            prompt = self.create_bundle_prompt(products, bundle_type, context)
+            prompt = self.create_bundle_prompt(products, bundle_type, context, currency_code)
             prompt_duration = (time.time() - prompt_start) * 1000
             logger.info(f"[{req_id}] ✅ Prompt created in {prompt_duration:.0f}ms (length: {len(prompt)} chars)")
 
@@ -186,9 +187,12 @@ class AICopyGenerator:
         self,
         products: List[Dict[str, Any]],
         bundle_type: str,
-        context: str
+        context: str,
+        currency_code: str = "USD",
     ) -> str:
         """Create prompt for OpenAI bundle copy generation"""
+        from utils import get_currency_symbol
+        currency_symbol = get_currency_symbol(currency_code)
 
         # Extract and clean product information
         def clean_product_name(name: str) -> str:
@@ -260,7 +264,7 @@ class AICopyGenerator:
 
             line = f"  - {name}"
             if price > 0:
-                line += f" (${price:.2f})"
+                line += f" ({currency_symbol}{price:.2f})"
             if desc:
                 # Truncate long descriptions
                 short_desc = desc[:100] + "..." if len(desc) > 100 else desc
@@ -283,7 +287,7 @@ class AICopyGenerator:
 
 **CATEGORIES:** {', '.join(product_categories[:3]) if product_categories else 'Mixed'}
 **BRANDS:** {', '.join(product_brands[:3]) if product_brands else 'Various'}
-{f"**APPROXIMATE VALUE:** ${total_price:.2f}" if total_price else ""}
+{f"**APPROXIMATE VALUE:** {currency_symbol}{total_price:.2f}" if total_price else ""}
 {tags_section}
 {descriptions_section}
 

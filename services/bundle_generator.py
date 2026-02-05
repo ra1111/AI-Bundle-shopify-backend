@@ -262,6 +262,44 @@ class BundleGenerator:
             result = maximum
         return result
 
+    async def _get_currency_symbol(self, csv_upload_id: str) -> str:
+        """
+        Get the currency symbol for a CSV upload from its processing_params.
+
+        Args:
+            csv_upload_id: The CSV upload ID
+
+        Returns:
+            Currency symbol (e.g., "$", "₹", "€"). Defaults to "$" if not found.
+        """
+        from utils import get_currency_symbol
+        try:
+            upload = await storage.get_csv_upload(csv_upload_id)
+            if upload and upload.processing_params:
+                currency_code = upload.processing_params.get("currency", "USD")
+                return get_currency_symbol(currency_code)
+        except Exception as e:
+            logger.warning(f"[{csv_upload_id}] Failed to get currency symbol: {e}")
+        return "$"  # Default fallback
+
+    async def _get_currency_code(self, csv_upload_id: str) -> str:
+        """
+        Get the currency code for a CSV upload from its processing_params.
+
+        Args:
+            csv_upload_id: The CSV upload ID
+
+        Returns:
+            Currency code (e.g., "USD", "INR", "EUR"). Defaults to "USD" if not found.
+        """
+        try:
+            upload = await storage.get_csv_upload(csv_upload_id)
+            if upload and upload.processing_params:
+                return upload.processing_params.get("currency", "USD")
+        except Exception as e:
+            logger.warning(f"[{csv_upload_id}] Failed to get currency code: {e}")
+        return "USD"  # Default fallback
+
     def _extract_variant_id_list(self, recommendation: Dict[str, Any]) -> List[str]:
         """
         Normalize the products payload on a recommendation into a list of variant_ids.
@@ -1752,6 +1790,11 @@ class BundleGenerator:
         # Set aggressive deadline
         self._current_deadline = Deadline(timeout_seconds)
 
+        # Get currency info for this upload (used in savings messages and LLM prompts)
+        currency_symbol = await self._get_currency_symbol(csv_upload_id)
+        currency_code = await self._get_currency_code(csv_upload_id)
+        logger.info(f"[{csv_upload_id}] Using currency: {currency_code} ({currency_symbol})")
+
         # Clean up any orphaned partial recommendations from previous failed runs
         try:
             await storage.delete_partial_bundle_recommendations(csv_upload_id)
@@ -1939,7 +1982,8 @@ class BundleGenerator:
                         catalog=catalog,
                         product_scores=product_scores,
                         multi_item_count=multi_item_count,
-                        max_bundles=max_fbt_bundles
+                        max_bundles=max_fbt_bundles,
+                        currency_symbol=currency_symbol,  # Pass currency symbol
                     )
 
                     # LLM fallback for Tier 3 (sparse data scenarios benefit most from semantic similarity)
@@ -1967,14 +2011,16 @@ class BundleGenerator:
                         try:
                             bogo_bundles = _build_ml_bxgy_bundles(
                                 csv_upload_id, order_lines, catalog, product_scores, max_bogo_bundles, velocity_data,
-                                precomputed=precomputed  # Pass precomputed data
+                                precomputed=precomputed,  # Pass precomputed data
+                                currency_symbol=currency_symbol,  # Pass currency symbol
                             )
                             if bogo_bundles:
                                 logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} ML-BXGY bundles (cross-product)")
                             else:
                                 logger.info(f"[{csv_upload_id}] ⚠️ No ML-BXGY pairs, falling back to same-product BOGO")
                                 bogo_bundles = _build_quick_start_bogo_bundles(
-                                    csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data
+                                    csv_upload_id, catalog, product_scores, max_bogo_bundles, velocity_data,
+                                    currency_symbol=currency_symbol,  # Pass currency symbol
                                 )
                                 logger.info(f"[{csv_upload_id}] ✅ Generated {len(bogo_bundles)} fallback BOGO bundles")
                         except Exception as e:
@@ -2063,6 +2109,7 @@ class BundleGenerator:
                                             items,
                                             bundle_type,
                                             context=context,
+                                            currency_code=currency_code,
                                         ),
                                         timeout=AI_COPY_TIMEOUT_SECONDS
                                     )
@@ -2243,6 +2290,7 @@ class BundleGenerator:
                                             items,
                                             bundle_type,
                                             context=context,
+                                            currency_code=currency_code,
                                         ),
                                         timeout=AI_COPY_TIMEOUT_SECONDS
                                     )
@@ -2409,6 +2457,7 @@ class BundleGenerator:
                                 items,
                                 bundle_type,
                                 context=context,
+                                currency_code=currency_code,
                             )
 
                             # Merge AI copy with existing features metadata
@@ -2905,6 +2954,7 @@ class BundleGenerator:
                                     items,
                                     bundle_type,
                                     context=context,
+                                    currency_code=currency_code,
                                 ),
                                 timeout=AI_COPY_TIMEOUT_SECONDS
                             )
@@ -5922,6 +5972,9 @@ class BundleGenerator:
         if not stage_recommendations:
             return 0
 
+        # Get currency code for LLM prompts
+        currency_code = await self._get_currency_code(csv_upload_id)
+
         start = time.time()
         tasks_executed = 0
         for offset, recommendation in enumerate(stage_recommendations):
@@ -5950,6 +6003,7 @@ class BundleGenerator:
                     normalized_products,
                     bundle_type,
                     context=context,
+                    currency_code=currency_code,
                 )
                 recommendation["ai_copy"] = ai_copy
             except asyncio.CancelledError:
@@ -6470,7 +6524,7 @@ def _build_quick_start_fbt_bundles(
                 "description": bundle_description,
                 "tagline": f"Save {discount_display}% when bought together",
                 "cta_text": "Add Bundle to Cart",
-                "savings_message": f"Save ${savings_amount:.2f}!",
+                "savings_message": f"Save {currency_symbol}{savings_amount:.2f}!",
                 # Bundle settings (stored in ai_copy since no metadata column)
                 "is_active": True,
                 "show_on": ["product", "cart"],
@@ -6999,6 +7053,7 @@ def _build_quick_start_bogo_bundles(
     product_scores: Dict[str, float],
     max_bogo_bundles: int,
     velocity_data: Optional[Dict[str, Any]] = None,
+    currency_symbol: str = "$",  # Currency symbol for price formatting
 ) -> List[Dict[str, Any]]:
     """
     Build BOGO bundles targeting SLOW SELLERS (products that need help moving).
@@ -7231,7 +7286,7 @@ def _build_quick_start_bogo_bundles(
                 "description": bundle_description,
                 "tagline": "Buy 2, Get 1 FREE!",
                 "cta_text": "Claim Deal",
-                "savings_message": f"Save ${original_total - effective_bundle_price:.2f}!",
+                "savings_message": f"Save {currency_symbol}{original_total - effective_bundle_price:.2f}!",
                 # Bundle settings
                 "is_active": True,
                 "show_on": ["product", "cart"],
@@ -7567,6 +7622,7 @@ def _build_ml_bxgy_bundles(
     max_bundles: int,
     velocity_data: Optional[Dict[str, Any]] = None,
     precomputed: Optional[Dict[str, Any]] = None,  # NEW: Accept pre-computed data
+    currency_symbol: str = "$",  # Currency symbol for price formatting
 ) -> List[Dict[str, Any]]:
     """
     Build BXGY bundles using ML/statistical co-occurrence analysis.
@@ -7816,7 +7872,7 @@ def _build_ml_bxgy_bundles(
                 "title": bundle_title,
                 "description": f"Get {reward_name} {'FREE' if discount_type == 'free' else f'at {discount_percent}% off'} when you buy {trigger_name}!",
                 "tagline": f"{'FREE' if discount_type == 'free' else f'{discount_percent}% OFF'} {reward_name}!",
-                "valueProposition": f"Save ${reward_discount:.2f} on this perfect pairing!",
+                "valueProposition": f"Save {currency_symbol}{reward_discount:.2f} on this perfect pairing!",
                 "explanation": f"ML-detected: {pair['co_count']} customers bought these together. P(Y|X)={pair['p_y_given_x']:.3f}",
                 "is_active": True,
                 "show_on": ["product", "cart"],
@@ -8277,6 +8333,7 @@ def _build_bayesian_bundles(
     product_scores: Dict[str, float],
     multi_item_count: int,
     max_bundles: int = 10,
+    currency_symbol: str = "$",  # Currency symbol for price formatting
 ) -> List[Dict[str, Any]]:
     """
     Generate bundles using Bayesian pair scoring for sparse data (3-9 multi-item orders).
@@ -8473,7 +8530,7 @@ def _build_bayesian_bundles(
                 "description": bundle_description,
                 "tagline": f"Save {discount_display}% when bought together",
                 "cta_text": "Add Bundle to Cart",
-                "savings_message": f"Save ${savings_amount:.2f}!",
+                "savings_message": f"Save {currency_symbol}{savings_amount:.2f}!",
                 "is_active": True,
                 "show_on": ["product", "cart"],
                 # Bayesian-specific features for transparency

@@ -289,6 +289,83 @@ class CircuitBreakerOpenError(Exception):
     pass
 
 
+# Currency code to symbol mapping (ISO 4217 codes)
+CURRENCY_SYMBOLS: dict[str, str] = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "INR": "₹",
+    "JPY": "¥",
+    "CNY": "¥",
+    "AUD": "A$",
+    "CAD": "C$",
+    "CHF": "CHF",
+    "HKD": "HK$",
+    "SGD": "S$",
+    "SEK": "kr",
+    "NOK": "kr",
+    "DKK": "kr",
+    "NZD": "NZ$",
+    "ZAR": "R",
+    "MXN": "MX$",
+    "BRL": "R$",
+    "KRW": "₩",
+    "RUB": "₽",
+    "TRY": "₺",
+    "PLN": "zł",
+    "THB": "฿",
+    "MYR": "RM",
+    "IDR": "Rp",
+    "PHP": "₱",
+    "VND": "₫",
+    "AED": "د.إ",
+    "SAR": "﷼",
+    "ILS": "₪",
+    "CZK": "Kč",
+    "HUF": "Ft",
+    "CLP": "CLP$",
+    "COP": "COL$",
+    "ARS": "ARS$",
+    "PKR": "Rs",
+    "BDT": "৳",
+    "EGP": "E£",
+    "NGN": "₦",
+    "KES": "KSh",
+    "TWD": "NT$",
+}
+
+
+def get_currency_symbol(currency_code: Optional[str]) -> str:
+    """
+    Get the currency symbol for a given ISO 4217 currency code.
+
+    Args:
+        currency_code: ISO 4217 currency code (e.g., "USD", "INR", "EUR")
+
+    Returns:
+        Currency symbol (e.g., "$", "₹", "€"). Defaults to "$" if code not found.
+    """
+    if not currency_code:
+        return "$"
+    return CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code.upper())
+
+
+def format_currency(amount: float, currency_code: Optional[str] = None, decimals: int = 2) -> str:
+    """
+    Format an amount with the appropriate currency symbol.
+
+    Args:
+        amount: The monetary amount
+        currency_code: ISO 4217 currency code (e.g., "USD", "INR")
+        decimals: Number of decimal places (default: 2)
+
+    Returns:
+        Formatted string like "$10.00" or "₹500.00"
+    """
+    symbol = get_currency_symbol(currency_code)
+    return f"{symbol}{amount:.{decimals}f}"
+
+
 def sanitize_string(value: Optional[str], max_length: int = 1000, default: str = "") -> str:
     """Sanitize a string value for safe storage."""
     if value is None:

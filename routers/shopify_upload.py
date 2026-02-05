@@ -42,6 +42,7 @@ class ShopifyUploadRequest(BaseModel):
     csv_data: str = Field(..., alias="csvData", min_length=1)
     run_id: Optional[str] = Field(None, alias="runId", max_length=255)
     trigger_pipeline: bool = Field(False, alias="triggerPipeline")
+    currency: Optional[str] = Field("USD", max_length=10)  # ISO currency code (USD, INR, EUR, etc.)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -60,6 +61,7 @@ class BatchUploadRequest(BaseModel):
     variants_csv: str = Field(..., alias="variantsCsv", min_length=1)
     inventory_csv: str = Field(..., alias="inventoryCsv", min_length=1)
     orders_csv: str = Field(..., alias="ordersCsv", min_length=1)
+    currency: Optional[str] = Field("USD", max_length=10)  # ISO currency code (USD, INR, EUR, etc.)
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -184,6 +186,7 @@ async def shopify_upload(
         error_message=None,
         code_version="1.0.0",
         schema_version="1.0",
+        processing_params={"currency": request.currency or "USD"},
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -270,6 +273,9 @@ async def shopify_upload_batch(
     timestamp = datetime.utcnow()
     timestamp_str = timestamp.strftime('%Y%m%dT%H%M%SZ')
 
+    # Store currency in processing_params for all uploads in the run
+    processing_params = {"currency": request.currency or "USD"}
+
     # Create all 4 upload records
     uploads = [
         CsvUpload(
@@ -284,6 +290,7 @@ async def shopify_upload_batch(
             error_message=None,
             code_version="1.0.0",
             schema_version="1.0",
+            processing_params=processing_params,
             created_at=timestamp,
             updated_at=timestamp,
         ),
@@ -299,6 +306,7 @@ async def shopify_upload_batch(
             error_message=None,
             code_version="1.0.0",
             schema_version="1.0",
+            processing_params=processing_params,
             created_at=timestamp,
             updated_at=timestamp,
         ),
@@ -314,6 +322,7 @@ async def shopify_upload_batch(
             error_message=None,
             code_version="1.0.0",
             schema_version="1.0",
+            processing_params=processing_params,
             created_at=timestamp,
             updated_at=timestamp,
         ),
@@ -329,6 +338,7 @@ async def shopify_upload_batch(
             error_message=None,
             code_version="1.0.0",
             schema_version="1.0",
+            processing_params=processing_params,
             created_at=timestamp,
             updated_at=timestamp,
         ),
