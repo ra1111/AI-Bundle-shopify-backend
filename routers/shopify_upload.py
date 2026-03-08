@@ -494,7 +494,11 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
             logger.warning(f"Failed to check generation progress for {upload_id}: {exc}")
 
     # STALENESS CHECK: If status is "generating_bundles" but hasn't updated recently,
-    # check if generation is actually progressing. Don't mark as failed prematurely.
+    # check if generation is actually progressing.
+    # If stale for >30 minutes, the Cloud Run instance likely died (OOM/timeout/cold shutdown)
+    # without updating status. Mark as failed so the frontend can show an error and allow retry.
+    STALE_WARNING_SECONDS = 600    # 10 minutes: log warning
+    STALE_FAILURE_SECONDS = 1800   # 30 minutes: mark as failed (instance likely dead)
     if frontend_status == "generating_bundles":
         try:
             progress_stmt = select(GenerationProgress).where(
@@ -504,24 +508,49 @@ async def get_upload_status(upload_id: str, db: AsyncSession = Depends(get_db)):
             progress_record = progress_result.scalar_one_or_none()
 
             if progress_record:
-                from datetime import timezone
                 now = datetime.now(timezone.utc)
                 updated_at = progress_record.updated_at
                 if updated_at and updated_at.tzinfo is None:
                     updated_at = updated_at.replace(tzinfo=timezone.utc)
 
-                # If no update for 10 minutes and still "in_progress", it might be stuck
-                # BUT don't mark as failed - let retry mechanism handle it
                 if updated_at:
                     staleness = (now - updated_at).total_seconds()
-                    if staleness > 600:  # 10 minutes
+                    if staleness > STALE_FAILURE_SECONDS:
+                        # Instance likely crashed — mark as failed so user can retry
+                        logger.error(
+                            f"📊 STALE GENERATION FAILED: upload_id={upload_id} last_update={staleness:.0f}s ago "
+                            f"step={progress_record.step} progress={progress_record.progress}% - "
+                            f"marking as failed (exceeded {STALE_FAILURE_SECONDS}s threshold)"
+                        )
+                        try:
+                            # Update CSV upload status to failed
+                            upload.status = "bundle_generation_failed"
+                            upload.error_message = (
+                                f"Bundle generation stalled: no progress update for {int(staleness)}s. "
+                                f"The server process likely crashed. Please retry."
+                            )
+                            await db.commit()
+                            await db.refresh(upload)
+
+                            # Update progress record to failed
+                            from services.progress_tracker import update_generation_progress
+                            await update_generation_progress(
+                                upload_id,
+                                step="finalization",
+                                progress=100,
+                                status="failed",
+                                message=f"Generation stalled after {int(staleness)}s with no progress. Server process likely crashed.",
+                                bundle_count=0,
+                            )
+                            frontend_status = "failed"
+                        except Exception as fail_exc:
+                            logger.error(f"Failed to mark stale upload as failed: {fail_exc}")
+                    elif staleness > STALE_WARNING_SECONDS:
                         logger.warning(
                             f"📊 STALE PROGRESS: upload_id={upload_id} last_update={staleness:.0f}s ago "
                             f"step={progress_record.step} progress={progress_record.progress}% - "
-                            f"may need retry but NOT marking as failed"
+                            f"will auto-fail after {STALE_FAILURE_SECONDS}s"
                         )
-                        # Keep status as generating_bundles - frontend should show "taking longer than expected"
-                        # instead of "failed". The retry mechanism will handle truly stuck syncs.
         except Exception as exc:
             logger.warning(f"Staleness check failed for {upload_id}: {exc}")
 
